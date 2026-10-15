@@ -6,7 +6,7 @@ If you want the PDF version of the Build Day guide, [click here](docs/BUILD_DAY.
 
 Spend the day building with video:
 
-<p align="center"><img src="docs/images/flow.svg" alt="Day flow: Kickoff, Launch VM, Skills, Test Drive, then most of the day on Build, then Ship" width="90%"></p>
+<p align="center"><img src="docs/images/flow.svg" alt="Day flow: Kickoff, Access Infra, Skills, Test Drive, then most of the day on Build, then Ship" width="90%"></p>
 
 The infrastructure is already running, so you skip straight to the interesting part: turning hours of video into something that searches, reasons, and acts.
 
@@ -30,26 +30,29 @@ serving. You build something cool that searches and acts.
 
 > 💡 For a deeper dive, check out the <a href="ARCHITECTURE_REFERENCE.md" target="_blank" rel="noopener">Architecture Reference</a>.
 
-## 2. Launch VM
+## 2. Access Infra
 
+<!-- VM loading is no longer part of the flow.
 > 💡 We want to make sure everyone can access the environment, so VM connections per team
 > are limited: max 2 people per team can launch a VM. If two teammates already have a VM
 > running, pair with them.
+-->
 
-👉 <a href="https://community.vastdata.com/t/about-the-workshop-category/1969?utm_campaign=event26-builders-challenge" target="_blank" rel="noopener">Visit and join Cosmos</a> to ask questions and access the VM! ([view PDF guide for infra onboarding](docs/BUILDERS-CHALLENGE-INFRA-ONBOARDING.pdf))
+👉 <a href="https://community.vastdata.com/t/about-the-workshop-category/1969?utm_campaign=event26-builders-challenge" target="_blank" rel="noopener">Visit and join Cosmos</a> to ask questions and access the Infra! ([view PDF guide for infra onboarding](docs/BUILDERS-CHALLENGE-INFRA-ONBOARDING.pdf))
 
+<!-- VM desktop loading, replaced by Cursor over SSH below.
 To load the VM, click on `Open Desktop`:
 
 > 💡 We'll share the passcode during the event.
 
 <p align="center"><img src="docs/images/vm-load.png" alt="The VM link on the VAST workshop home page" width="90%"></p>
+-->
 
-**All commands run on the workshop VM via the terminal in your browser. Nothing runs on your laptop.**
+**You run Cursor on your laptop and connect to the workshop VM over SSH. Commands and files live on the VM, not your laptop.**
 
 ### Your team
-Form your team and sit together first, decide on who's launching a VM before
-selecting your assigned team number. Only two team members can access the VM, so others
-can pair, build in parallel, or swap in once a seat frees up.
+Form your team and sit together first, then select your assigned team number.
+Teammates can pair, build in parallel, or each connect to the same lab environment.
 
 > Ensure you select the assigned team (e.g. `team-1`) so all team members access
 > the same video ingestion pipeline.
@@ -59,51 +62,51 @@ can pair, build in parallel, or swap in once a seat frees up.
 You build as a team. Your team shares one video ingestion instance, one index, and one set of
 credentials, so anything a teammate ingests shows up in every team members searches.
 
-Wait for the VM to load. That's it. You're in! No setup. Nothing to install, no config to paste :) 
+<!-- Old VM load confirmation:
+Wait for the VM to load. That's it. You're in! No setup. Nothing to install, no config to paste :)
+-->
 
 ### Coding Agent
 
 > 💡 All registrants who checked in received Cursor credits. Confirm yours at <a href="https://cursor.com/dashboard/usage" target="_blank" rel="noopener">cursor.com/dashboard/usage</a>, each request should show as `Free`. Didn't sign up for Cursor? Sign up, then <a href="https://forms.gle/AVta9RRTmfdeUNX26" target="_blank" rel="noopener">request credits</a>. Need more credits or a top-up? Use the same form.
 
 Describe what you want in plain language and let the code agent build. That's how the skills are meant to be used.
-To get started, sign in using the Cursor IDE:
-[Watch how to sign in to Cursor](https://github.com/user-attachments/assets/a77e2fb2-7ad1-49a8-b824-2af4ce1a58d5)
 
+You can run Cursor locally, but the infrastructure (the repo, skills, and your credentials) lives on the VM, so you need **Cursor Remote-SSH access** to your lab VM.
+
+Follow the instructions on your lab page to log in, configure your laptop, and connect once from a terminal. Then load it in Cursor:
+
+1. Open a new Cursor window and choose **Connect via SSH**.
+2. Pick your host from the list (the `bc-<username>` name from the lab page).
+3. Open the `vast-builders-challenge` folder.
+
+<!-- Cursor sign-in tip, not needed for now.
 > 💡 If Cursor asks you to sign in, use the personal email you applied to the Builders Challenge. Expect one or two tries; that's normal.
+[Watch how to sign in to Cursor](https://github.com/user-attachments/assets/a77e2fb2-7ad1-49a8-b824-2af4ce1a58d5)
+-->
 
-Drive the day from the **Cursor Agent (CLI)**. Start Cursor in the terminal:
+> 💡 Set the model Cursor uses to **Auto** in the agent panel to save tokens.
 
-```sh
-cd ~/vast-builders-challenge    # Cursor works from the current directory
-agent                           # start an interactive session
-```
-
-Once it's running, set the model to Auto to save tokens:
-
-```sh
-/model                          # type `/model` to change model
- →  Auto Balance                # Select `Auto`
-```
-
+<!-- Launch VM walkthrough, not the current flow.
 Here is a video overview of the steps from this section:
 [Watch the Launch VM walkthrough](https://github.com/user-attachments/assets/73eace1b-c4ca-42f7-a59f-5a6e77e34a93)
 
 > 💡 **Useful VM Keybindings.**
 > - **Copy and paste.** In the terminal it's `Ctrl+Shift+C` and `Ctrl+Shift+V`
 > - **Display size.** Use `Ctrl -` to zoom out and `Ctrl 0` to zoom in.
-
+-->
 
 Before you kick off the coding agent and start using skills, head to the next section. We'll circle back to Skills very soon.
 
 > 💡 Want a guided run instead of reading ahead? Once Cursor is up, run `/build-day-quickstart` and it'll walk you through the Video Search & Summary UI, Skills, Test Drive, and Build one step at a time.
 
 ### If something looks off
-Run the health check in the [Reference](#reference) section. If it fails, or you need more help, run `/ask-cosmos` and post the result on <a href="https://community.vastdata.com/t/about-the-workshop-category/1969" target="_blank" rel="noopener">Cosmos</a>, and we'll follow up.
+Run the health check in the [Reference](#reference) section. If it fails, or you need more help, run `/ask-cosmos`. It writes the note but does not post it, so **copy it and post it on <a href="https://community.vastdata.com/t/about-the-workshop-category/1969" target="_blank" rel="noopener">Cosmos</a> yourself**, and we'll follow up.
 
 ### Video Search & Summary UI
 > 💡 This example app runs on the same API as the skills (`.cursor/skills`) you will be using. It's a built idea of what you can build today, and a quick way to check things out while building.
 
-From the same page you loaded the VM, click on Video Search & Summary:
+From the same lab page, click on Video Search & Summary:
 <p align="center"><img src="docs/images/vss-ui-load.png" alt="The VSS link on the VAST workshop home page" width="90%"></p>
 
 Try a few of the search suggestions to see ranked clips with timestamps and the description Cosmos Reason returned for each one:
@@ -245,7 +248,7 @@ If any of them didn't, run the health check in the [Reference](#reference) secti
   your video.
     - Cosmos Reason, Cosmos Embed, and YOLO run on CoreWeave GPUs; you
   don't call them directly, you query the vectors generated.
-- A **VM with Cursor** pre-loaded, including this repo and your credentials and
+- A **lab VM you reach from Cursor over SSH**, with this repo and your credentials and
   endpoints available as environment variables.
 - **Serverless LLM inference** from Weights & Biases by Coreweave for your app's own logic.
 - A set of **skills** that drive the pipeline in plain language. See the section on
@@ -309,7 +312,7 @@ The skills used by Cursor can be used by agent frameworks too. They follow the s
 
 ## 6. Demos
 
-Submissions will start around 4:30pm. Instructions here: <a href="https://tokensand.com/vastnyc" target="_blank" rel="noopener">https://tokensand.com/vastnyc</a> (click `Submit your project`).
+Submissions will start around 4:30pm. Instructions here: <a href="https://tokensand.com/vastlondon" target="_blank" rel="noopener">https://tokensand.com/vastlondon</a> (click `Submit your project`).
 
 We'll do a first round of judging with each team to walk through what you built and to hear how the day went.
 
@@ -330,7 +333,7 @@ Then ask Cursor:
 check that everything is working
 ```
 
-If it fails, or you need more help, run `/ask-cosmos`. The skill shares a snippet with relevant details, that you can add to a post on <a href="https://community.vastdata.com/t/about-the-workshop-category/1969" target="_blank" rel="noopener">Cosmos</a>, and we'll follow up.
+If it fails, or you need more help, run `/ask-cosmos`. The skill writes a note with the relevant details but **does not post it**. Copy it and post it on <a href="https://community.vastdata.com/t/about-the-workshop-category/1969" target="_blank" rel="noopener">Cosmos</a> yourself, and we'll follow up.
 
 ### Your team's values
 

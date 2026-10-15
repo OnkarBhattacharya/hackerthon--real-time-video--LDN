@@ -83,7 +83,12 @@ reply. A note that just says "search isn't working," with no error and no health
 This skill prepares the note; it does not post it anywhere. Give the team the one block
 of text above to copy, and point them to
 [community.vastdata.com/c/workshop/27](https://community.vastdata.com/c/workshop/27) to post it.
+Tell them plainly that they have to post it themselves, manually. Nothing has been sent.
 Apply the redaction in "Keep it safe to share" first.
+
+Then ask them to confirm they've posted it before going any further. You can't check
+this yourself, so take their word. Don't continue the walkthrough, retry fixes, or move
+on to the next step until they say it's posted.
 
 ## Agent instructions
 
@@ -97,3 +102,5 @@ Apply the redaction in "Keep it safe to share" first.
    <what>`, so someone reading it has enough to start from.
 5. Never post, send, or call any external service with the note. Show the draft and let
    the team decide where it goes.
+6. After handing over the note, stop and ask: "Have you posted this on Cosmos yet?"
+   Wait for a yes before proceeding with anything else.

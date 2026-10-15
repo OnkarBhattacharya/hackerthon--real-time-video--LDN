@@ -14,7 +14,7 @@
       <rect x="1075" y="43" width="110" height="44" rx="8"/>
     </g>
     <text x="100" y="70">Kickoff</text>
-    <text x="260" y="70">Launch VM</text>
+    <text x="260" y="70">Access Infra</text>
     <text x="420" y="70">Skills</text>
     <text x="580" y="70">Test Drive</text>
     <text x="1130" y="70">Ship <tspan font-size="30">🐿️</tspan></text>

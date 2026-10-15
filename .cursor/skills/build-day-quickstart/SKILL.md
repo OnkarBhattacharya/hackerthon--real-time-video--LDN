@@ -1,8 +1,8 @@
 ---
 name: build-day-quickstart
 description: >-
-  Walk a team through Build Day step by step, once they're inside the VM with Cursor
-  running. Picks up at Skills, runs the Test Drive loop with them, then hands off to
+  Walk a team through Build Day step by step, once Cursor is connected to the VM over
+  SSH. Picks up at Skills, runs the Test Drive loop with them, then hands off to
   Build. Pauses for confirmation after each step instead of dumping the whole guide.
   Use when a team says they're ready to start, asks "what's next", or wants a guided
   run instead of reading `README.md` themselves.
@@ -10,13 +10,13 @@ description: >-
 
 # Build Day Quickstart
 
-This is `README.md`, run interactively. Kickoff and Launch VM already happened — if the
-team isn't on the VM with Cursor running yet, send them to those two sections first.
+This is `README.md`, run interactively. Kickoff and Access Infra already happened — if the
+team isn't connected to the VM from Cursor yet, send them to those two sections first.
 
 ## Step 1: Video Search & Summary UI
 
-Point them to the VSS UI from the same page they loaded the VM — tell them to open it in
-their own browser, not inside the VM. Have them try a couple
+Point them to the VSS UI from the same lab page — tell them to open it in
+their own browser. Have them try a couple
 of the suggested search prompts and look at one result: the clip, timestamp, and the
 description Cosmos Reason wrote for it. This is the same API the skills call — the point
 is to see what's indexed before touching Cursor.
@@ -73,12 +73,12 @@ whether the data supports their idea.
 ## Step 5: Demos
 
 Only bring this up if they ask, or late in the day. Submissions start around 4:30pm at
-<https://tokensand.com/vastnyc> (`Submit your project`). There's a first round of judging
+<https://tokensand.com/vastlondon> (`Submit your project`). There's a first round of judging
 walking through what they built.
 
 ## Agent instructions
 
-1. Confirm they're on the VM with Cursor running before starting. If not, point to
+1. Confirm Cursor is connected to the VM over SSH before starting. If not, point to
    README.md sections 1–2 and stop.
 2. Go one step at a time. After each step, ask if it worked before moving on — don't
    dump Steps 1–4 at once.
