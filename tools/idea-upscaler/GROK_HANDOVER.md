@@ -75,7 +75,9 @@ KUBECONFIG=/config/team-41-k8s.yaml tools/idea-upscaler/deploy.sh
 
 ## Card 2
 
-LDN Video Ask stays card 2. Do not lock it. Do not change `GUEST_UPSTREAM`. It must remain `http://ldn-video-ask:80`. `deploy.sh` does not set, unset, or restore that variable.
+LDN Video Ask is card 2. Do not lock it. Do not change `GUEST_UPSTREAM`. `deploy.sh` does not set, unset, or restore that variable.
+
+Checked on the deployment before this deploy: `GUEST_UPSTREAM` was `http://near-miss-app:80`. The older note that it must be `http://ldn-video-ask:80` is not what the cluster has. Leave the live value alone.
 
 ## Card 3
 
@@ -84,7 +86,13 @@ LDN Video Ask stays card 2. Do not lock it. Do not change `GUEST_UPSTREAM`. It m
 ## Git
 
 - Shot-fix commit: `f9b19377e9e46c1038bd1d326f7ede28a3b6520d`
-- This file is committed on top of that. After both commits are pushed, `git rev-parse HEAD` on `idea-upscaler` is the tip.
+- Handover commit: `0885ba282a5ba658969dee19427efe750e518b67`
+- Push to `teamrepo` `idea-upscaler` failed. GitHub authenticated as OnkarBhattacharya, who cannot write to `ahmedm87/hackerthon--real-time-video--LDN`. The commits are local only until an account with write access pushes. Do not push `origin` to work around that.
+
+```text
+remote: Permission to ahmedm87/hackerthon--real-time-video--LDN.git denied to OnkarBhattacharya.
+fatal: unable to access 'https://github.com/ahmedm87/hackerthon--real-time-video--LDN.git/': The requested URL returned error: 403
+```
 
 ## Still broken
 
