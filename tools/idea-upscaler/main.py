@@ -2689,7 +2689,54 @@ def upload_video():
         body = {"error": (upstream.text or "")[:500], "status": upstream.status_code}
     if not isinstance(body, dict):
         body = {"result": body}
+    if upstream.status_code < 400 and isinstance(body, dict):
+        source = _upload_source_uri(body)
+        if source:
+            body["source"] = source
+            body["playback_url"] = f"{APP_PREFIX}/api/stream?source={quote(source, safe='')}"
     return jsonify(body), upstream.status_code
+
+
+def _chunks_bucket() -> str:
+    """Chunks bucket for an upload object key. Never log the value."""
+    raw = (os.environ.get("S3_CHUNKS_BUCKET") or "").strip().strip('"').strip("'")
+    if raw:
+        return raw
+    candidates = [Path(__file__).with_name("chunks-bucket")]
+    try:
+        configs = sorted(Path("/config").glob("*.config"))
+    except OSError:
+        configs = []
+    if len(configs) == 1:
+        candidates.append(configs[0])
+    for path in candidates:
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        if path.name == "chunks-bucket":
+            value = text.strip().strip('"').strip("'")
+            if value and "=" not in value.splitlines()[0]:
+                return value.splitlines()[0].strip()
+        for line in text.splitlines():
+            if line.startswith("S3_CHUNKS_BUCKET="):
+                return line.split("=", 1)[1].strip().strip('"').strip("'")
+    return ""
+
+
+def _upload_source_uri(body: dict[str, Any]) -> str:
+    """s3 URI for the file just stored, when the response or bucket tells us."""
+    for key in ("source", "original_video", "s3_uri", "uri", "preview_source"):
+        value = str(body.get(key) or "").strip()
+        if value.startswith("s3://"):
+            return value
+    object_key = str(body.get("object_key") or "").strip().lstrip("/")
+    if not object_key or ".." in object_key.split("/") or "\n" in object_key:
+        return ""
+    bucket = _chunks_bucket()
+    if not bucket or "/" in bucket or " " in bucket:
+        return ""
+    return f"s3://{bucket}/{object_key}"
 
 
 @app.get("/api/upload-seed")
@@ -2711,6 +2758,29 @@ def upload_seed():
         )
     except Exception as e:
         return jsonify({"error": str(e), "type": type(e).__name__}), 404
+
+
+@app.post("/api/expand")
+def expand_brief():
+    """One model call fills the brief. It does not search, recut, or call Commons."""
+    payload = request.get_json(force=True, silent=True) or {}
+    line = str(payload.get("metaprompt") or "").strip()[:500]
+    if not line:
+        return jsonify({"error": "type a direction first"}), 400
+    try:
+        shot_count = int(payload.get("shot_count") if payload.get("shot_count") not in (None, "") else 4)
+    except (TypeError, ValueError):
+        shot_count = 4
+    shot_count = max(2, min(5, shot_count))
+    plan, note, _engine = _expand_direction(line, shot_count, None)
+    body = {
+        "logline": plan["logline"],
+        "beats": plan["beats"],
+        "voice_lines": plan["voice_lines"],
+    }
+    if note:
+        body["expand_note"] = note
+    return jsonify(body)
 
 
 @app.post("/api/upscale")
@@ -2758,7 +2828,24 @@ def upscale():
         exclude: set[str] = set()
         plan = None
         expanded_by = None
-        if metaprompt:
+        use_form = _as_bool(payload.get("use_form_brief"))
+        form_beats = [ln.strip() for ln in beats.splitlines() if ln.strip()]
+        form_lines = [ln.strip() for ln in transcript.splitlines() if ln.strip()]
+        if metaprompt and use_form and logline and len(form_beats) >= 2 and len(form_lines) >= 2:
+            # Fill the brief already wrote these. Recut uses them and does not call the model again.
+            level_crossing = False
+            count = min(shot_count, len(form_beats), len(form_lines))
+            plan = {
+                "logline": logline[:280],
+                "beats": [beat[:240] for beat in form_beats[:count]],
+                "voice_lines": [line[:180] for line in form_lines[:count]],
+            }
+            beats_list = list(plan["beats"])
+            voice_lines = list(plan["voice_lines"])
+            beats = "\n".join(beats_list)
+            transcript = "\n".join(voice_lines)
+            expanded_by = "form"
+        elif metaprompt:
             # The typed line is the whole brief, even when the story fields are empty.
             level_crossing = False
             plan, expand_note, expanded_by = _expand_direction(
@@ -3288,6 +3375,16 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .direction-box .hint { margin: 8px 0 0; color: var(--muted); font-size: 0.88rem; }
   #expanded { margin-top: 12px; display: grid; gap: 6px; }
   #expanded p { margin: 0; line-height: 1.4; }
+  .direction-box .actions { margin-top: 10px; }
+  #userClipDetails { margin-top: 8px; }
+  #userClipDetails summary { cursor: pointer; font-weight: 600; }
+  #userClip {
+    width: 100%;
+    margin-top: 8px;
+    background: #000;
+    border-radius: 12px;
+    aspect-ratio: 16/9;
+  }
   @media (max-width: 980px) {
     .cut-controls { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   }
@@ -3372,13 +3469,17 @@ INDEX_HTML = r"""<!DOCTYPE html>
     <header>
       <p class="kicker"><a href="/app/">All apps</a></p>
       <h1>Video Recutter</h1>
-      <p class="lead">Type one line. Recut turns it into the film and finds the shots in the archive.</p>
+      <p class="lead">Type one line. Fill the brief writes the film. Recut makes the video.</p>
     </header>
 
     <div class="direction-box">
       <label for="metaprompt">Direction</label>
       <textarea id="metaprompt" rows="4" placeholder="i want a nighttime ride through nyc"></textarea>
-      <p class="hint">One line is the whole film. Length, shots, voice, and bed stay as you set them.</p>
+      <div class="actions">
+        <button id="expandBtn" type="button">Fill the brief</button>
+        <span class="status" id="expandStatus"></span>
+      </div>
+      <p class="hint">Fill the brief writes the logline, the shots, and the spoken lines. Length, shots, voice, and bed stay as you set them. Recut makes the video.</p>
       <div id="expanded" class="hidden"></div>
     </div>
 
@@ -3430,6 +3531,10 @@ INDEX_HTML = r"""<!DOCTYPE html>
         <div class="opt" id="uploadBox">
           <label for="uploadFile">Video file</label>
           <input id="uploadFile" type="file" accept=".mp4,.mov,.webm,.avi,.mkv,video/mp4,video/quicktime,video/webm,video/x-msvideo,video/x-matroska"/>
+          <details id="userClipDetails">
+            <summary>Your upload</summary>
+            <video id="userClip" controls playsinline preload="metadata"></video>
+          </details>
           <label for="uploadPublic">Visibility</label>
           <select id="uploadPublic">
             <option value="public" selected>public</option>
@@ -3539,6 +3644,8 @@ let active = 0;
 let verdict = "";
 let briefHealth = "";
 let lastBrief = null;
+let filledDirection = "";
+let userObjectUrl = "";
 
 function setProgress(steps, activeIdx) {
   const el = $("progress");
@@ -3574,9 +3681,10 @@ async function runUpscale({ seed, health }) {
     ? $("transcript").value.trim()
     : ($("transcript").value.trim() || (lastBrief && String(lastBrief.transcript || "").trim()) || "");
   const useSeed = seed || $("seed").checked;
+  const useForm = Boolean(metaprompt) && metaprompt === filledDirection && Boolean(logline && beats && transcript);
   const safetyKind = metaprompt ? "" : ((health === "level_crossing" || health === true) ? "level_crossing" : "");
   if (!metaprompt && !logline && !beats && !transcript && !lastBrief) {
-    $("status").textContent = "Type a direction or pick a brief, then click Recut.";
+    $("status").textContent = "Pick a brief or type a line, then click Recut.";
     $("status").className = "status err";
     return;
   }
@@ -3585,7 +3693,7 @@ async function runUpscale({ seed, health }) {
   const shotCount = $("shotCount").value;
   const voiceValue = $("voice").value;
   const bedValue = $("bed").value;
-  const steps = metaprompt
+  const steps = metaprompt && !useForm
     ? ["Turning your line into the film", "Searching the archive", "Cutting the shots together", "Speaking the lines"]
     : safetyKind
     ? ["Reading the level crossing brief", "Checking the archive for a real railway crossing", "Filling the beats with level crossing footage", "Timing the safety line to the captions"]
@@ -3620,6 +3728,7 @@ async function runUpscale({ seed, health }) {
         upload_tag: ($("tag").value || "my-upload").trim(),
         health_safety: safetyKind || false,
         cc_broll: $("ccbroll").checked,
+        use_form_brief: useForm,
       }),
     });
     const raw = await res.text();
@@ -3756,6 +3865,70 @@ $("lengthMode").onchange = syncCutLength;
 syncCutLength();
 $("go").onclick = () => runUpscale({ seed: false, health: briefHealth || false });
 
+if ($("expandBtn")) {
+  $("expandBtn").onclick = async () => {
+    const direction = $("metaprompt").value;
+    const line = direction.trim();
+    const status = $("expandStatus");
+    const lengthMode = $("lengthMode").value;
+    const lengthSec = $("lengthSec").value;
+    const shotCount = $("shotCount").value;
+    const voiceValue = $("voice").value;
+    const bedValue = $("bed").value;
+    if (!line) {
+      if (status) {
+        status.className = "status err";
+        status.textContent = "Type a direction first.";
+      }
+      return;
+    }
+    $("expandBtn").disabled = true;
+    if (status) {
+      status.className = "status";
+      status.textContent = "Filling the brief…";
+    }
+    try {
+      const res = await fetch("/app/api/expand", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({
+          metaprompt: line,
+          shot_count: Math.min(5, Math.max(2, parseInt(shotCount, 10) || 4)),
+        }),
+      });
+      const raw = await res.text();
+      let data;
+      try { data = JSON.parse(raw); }
+      catch (_) { throw new Error("Server returned non-JSON (HTTP " + res.status + ")."); }
+      if (!res.ok) throw new Error(data.error || res.statusText);
+      if (!data.logline || !Array.isArray(data.beats) || !Array.isArray(data.voice_lines)) {
+        throw new Error("The brief did not come back.");
+      }
+      showExpanded(data);
+      filledDirection = line;
+      $("metaprompt").value = direction;
+      $("lengthMode").value = lengthMode;
+      $("lengthSec").value = lengthSec;
+      $("shotCount").value = shotCount;
+      $("voice").value = voiceValue;
+      $("bed").value = bedValue;
+      syncCutLength();
+      if (status) {
+        status.textContent = data.expand_note
+          ? data.expand_note
+          : "Brief filled. Recut when you want the video.";
+      }
+    } catch (err) {
+      if (status) {
+        status.className = "status err";
+        status.textContent = String(err.message || err);
+      }
+    } finally {
+      $("expandBtn").disabled = false;
+    }
+  };
+}
+
 function syncUploadPrompt() {
   const custom = $("uploadPrompt") && $("uploadPrompt").value === "custom";
   if ($("uploadCustom")) $("uploadCustom").classList.toggle("hidden", !custom);
@@ -3767,6 +3940,27 @@ if ($("uploadPrompt")) {
 function archiveFilename(data) {
   const key = String((data && data.object_key) || "");
   return key.split("/").filter(Boolean).pop() || "";
+}
+function previewPickedFile(file) {
+  const vid = $("userClip");
+  if (!vid || !file) return;
+  if (userObjectUrl) URL.revokeObjectURL(userObjectUrl);
+  userObjectUrl = URL.createObjectURL(file);
+  vid.src = userObjectUrl;
+}
+function archivePlayback(data) {
+  if (!data || typeof data !== "object") return "";
+  const direct = String(data.playback_url || "");
+  if (direct) return direct;
+  const source = String(data.source || data.original_video || data.s3_uri || data.uri || "");
+  if (source.indexOf("s3://") === 0) return "/app/api/stream?source=" + encodeURIComponent(source);
+  return "";
+}
+if ($("uploadFile")) {
+  $("uploadFile").addEventListener("change", () => {
+    const file = $("uploadFile").files && $("uploadFile").files[0];
+    if (file) previewPickedFile(file);
+  });
 }
 if ($("uploadBtn")) {
   $("uploadBtn").onclick = async () => {
@@ -3811,6 +4005,15 @@ if ($("uploadBtn")) {
         throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
       }
       const stored = archiveFilename(data);
+      const playback = archivePlayback(data);
+      if (playback && $("userClip")) {
+        $("userClip").src = playback;
+        if (userObjectUrl) {
+          const oldUrl = userObjectUrl;
+          userObjectUrl = "";
+          URL.revokeObjectURL(oldUrl);
+        }
+      }
       status.className = "status";
       status.textContent = stored
         ? ("Stored " + stored + ". Indexing usually takes a minute or two. Recut when the clip is searchable.")

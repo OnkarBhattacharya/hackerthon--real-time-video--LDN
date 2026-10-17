@@ -18,9 +18,13 @@ for f in main.py apps.json requirements.txt; do
 done
 
 TOKEN_FILE=""
+BUCKET_FILE=""
 cleanup_token() {
   if [[ -n "${TOKEN_FILE}" && -f "${TOKEN_FILE}" ]]; then
     rm -f "${TOKEN_FILE}"
+  fi
+  if [[ -n "${BUCKET_FILE}" && -f "${BUCKET_FILE}" ]]; then
+    rm -f "${BUCKET_FILE}"
   fi
 }
 trap cleanup_token EXIT
@@ -38,11 +42,29 @@ for line in Path(sys.argv[1]).read_text().splitlines():
   fi
 fi
 
+# Bucket name stays out of git. The pod reads /code/chunks-bucket to stream an upload.
+if [[ -z "${S3_CHUNKS_BUCKET:-}" ]]; then
+  mapfile -t _bucket_cfgs < <(find /config -maxdepth 1 -type f -name '*.config' | sort)
+  if [[ ${#_bucket_cfgs[@]} -eq 1 ]]; then
+    S3_CHUNKS_BUCKET="$(python3 -c 'import sys; from pathlib import Path
+for line in Path(sys.argv[1]).read_text().splitlines():
+    if line.startswith("S3_CHUNKS_BUCKET="):
+        print(line.split("=", 1)[1].strip(), end="")
+        break
+' "${_bucket_cfgs[0]}")"
+  fi
+fi
+
 CM_ARGS=(--from-file="$ROOT")
 if [[ -n "${GPU_BEARER_TOKEN:-}" ]]; then
   TOKEN_FILE="$(mktemp)"
   printf '%s' "$GPU_BEARER_TOKEN" > "$TOKEN_FILE"
   CM_ARGS+=(--from-file="gpu-bearer=${TOKEN_FILE}")
+fi
+if [[ -n "${S3_CHUNKS_BUCKET:-}" ]]; then
+  BUCKET_FILE="$(mktemp)"
+  printf '%s' "$S3_CHUNKS_BUCKET" > "$BUCKET_FILE"
+  CM_ARGS+=(--from-file="chunks-bucket=${BUCKET_FILE}")
 fi
 
 kubectl -n "$NS" create configmap hackathon-app-code \
