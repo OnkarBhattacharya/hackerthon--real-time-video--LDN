@@ -2281,6 +2281,11 @@ def upscale():
                 return jsonify({"error": "cut length must be a number of seconds"}), 400
             if duration_sec < 4 or duration_sec > 90:
                 return jsonify({"error": "cut length must be between 4 and 90 seconds"}), 400
+        try:
+            shot_count = int(payload.get("shot_count") if payload.get("shot_count") not in (None, "") else 4)
+        except (TypeError, ValueError):
+            shot_count = 4
+        shot_count = max(2, min(5, shot_count))
         seed_from_upload = bool(payload.get("seed_from_upload"))
         upload_tag = (payload.get("upload_tag") or "shittyvideo").strip() or "shittyvideo"
 
@@ -2353,7 +2358,7 @@ def upscale():
             if not shots:
                 splitter = "heuristic"
                 shots = _heuristic_shots(logline, beats, transcript)
-            shots = shots[:4]
+            shots = shots[:shot_count]
 
             # Bias queries toward cinematic archive when seeding from a rough upload.
             if seed_from_upload:
@@ -2389,6 +2394,15 @@ def upscale():
             )
         except Exception:
             cosmos_reason = "fallback"
+
+        if not level_crossing and len(enriched) > shot_count:
+            enriched = enriched[:shot_count]
+            if isinstance(prebuilt, list):
+                prebuilt = prebuilt[:shot_count]
+            if isinstance(cosmos_reason, dict):
+                spoken_lines = [ln for ln in (transcript or "").split("\n") if ln.strip()]
+                if len(spoken_lines) > shot_count:
+                    transcript = "\n".join(spoken_lines[:shot_count])
 
         directors_cut = []
         ordered: list[dict[str, Any] | None] = []
@@ -2508,7 +2522,7 @@ def upscale():
                     bed,
                     duration_sec,
                     preset="ultrafast" if level_crossing else "veryfast",
-                    max_pieces=5 if level_crossing or isinstance(cosmos_reason, dict) else 4,
+                    max_pieces=5 if level_crossing else shot_count,
                     fast=level_crossing,
                 )
             except Exception as e:
@@ -2553,7 +2567,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>Idea Upscaler</title>
+<title>Video Recutter</title>
 <base href="/app/"/>
 <link rel="preconnect" href="https://fonts.googleapis.com"/>
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
@@ -2692,6 +2706,31 @@ INDEX_HTML = r"""<!DOCTYPE html>
   }
   textarea:focus, select:focus, input:focus { outline: 2px solid color-mix(in srgb, var(--accent) 55%, transparent); border-color: transparent; }
   .controls { display: grid; gap: 10px; margin-top: 14px; grid-template-columns: 1fr; }
+  .cut-controls {
+    display: grid;
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+    gap: 12px;
+    width: 100%;
+    margin: 0 0 16px;
+    padding: 14px 16px;
+    position: relative;
+    z-index: 4;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 18px;
+    visibility: visible;
+    overflow: visible;
+  }
+  .cut-controls > div { min-width: 0; }
+  #lengthMode, #lengthSec, #shotCount, #voice, #bed {
+    display: block;
+    visibility: visible;
+    position: static;
+    width: 100%;
+  }
+  @media (max-width: 980px) {
+    .cut-controls { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  }
   .actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 16px; align-items: center; }
   button {
     font: inherit; font-weight: 600; border: none; cursor: pointer;
@@ -2772,9 +2811,45 @@ INDEX_HTML = r"""<!DOCTYPE html>
   <div class="wrap">
     <header>
       <p class="kicker"><a href="/app/">All apps</a></p>
-      <h1>Idea Upscaler</h1>
+      <h1>Video Recutter</h1>
       <p class="lead">Boards and a voice line, cut from the archive. Streets and traffic are most of the footage. Indoor crowds and the synthetic warehouse are the smaller sets.</p>
     </header>
+
+    <div class="cut-controls" id="cutControls">
+      <div>
+        <label for="lengthMode">Cut length</label>
+        <select id="lengthMode">
+          <option value="auto">Automatic</option>
+          <option value="custom">Custom seconds</option>
+        </select>
+      </div>
+      <div id="lengthWrap">
+        <label for="lengthSec">Seconds (4–90)</label>
+        <input id="lengthSec" type="number" min="4" max="90" step="1" value="15" title="Editable when Custom seconds is selected."/>
+      </div>
+      <div>
+        <label for="shotCount">Shots</label>
+        <input id="shotCount" type="number" min="2" max="5" step="1" value="4"/>
+      </div>
+      <div>
+        <label for="voice">Voice</label>
+        <select id="voice">
+          <option value="en-US-JennyNeural">US female</option>
+          <option value="en-US-GuyNeural">US male</option>
+          <option value="en-GB-SoniaNeural">UK female</option>
+          <option value="en-GB-RyanNeural">UK male</option>
+          <option value="off">No voiceover</option>
+        </select>
+      </div>
+      <div>
+        <label for="bed">Footage audio under the voice</label>
+        <select id="bed">
+          <option value="0.16" selected>Quiet</option>
+          <option value="0.22">Medium</option>
+          <option value="0.65">Louder</option>
+        </select>
+      </div>
+    </div>
 
     <div class="studio" id="studio">
       <div class="side-col">
@@ -2785,37 +2860,6 @@ INDEX_HTML = r"""<!DOCTYPE html>
         <textarea id="beats" placeholder="Wide city canyon at dusk&#10;Bike lane tracking, yellow jacket ahead&#10;Crosswalk pause, phone glow&#10;Night close on helmet reflection"></textarea>
         <label for="transcript" style="margin-top:12px">Director VO / dialogue (optional)</label>
         <textarea id="transcript" placeholder="I kept the camera rolling… we were already gone before we left."></textarea>
-        <div class="controls">
-          <div>
-            <label for="voice">Voice</label>
-            <select id="voice">
-              <option value="en-US-JennyNeural">US female</option>
-              <option value="en-US-GuyNeural">US male</option>
-              <option value="en-GB-SoniaNeural">UK female</option>
-              <option value="en-GB-RyanNeural">UK male</option>
-              <option value="off">No voiceover</option>
-            </select>
-          </div>
-          <div>
-            <label for="bed">Footage audio under the voice</label>
-            <select id="bed">
-              <option value="0.16" selected>Quiet</option>
-              <option value="0.22">Medium</option>
-              <option value="0.65">Louder</option>
-            </select>
-          </div>
-          <div>
-            <label for="lengthMode">Cut length</label>
-            <select id="lengthMode">
-              <option value="auto">Automatic</option>
-              <option value="custom">Custom seconds</option>
-            </select>
-          </div>
-          <div id="lengthWrap" class="hidden">
-            <label for="lengthSec">Seconds (4–90)</label>
-            <input id="lengthSec" type="number" min="4" max="90" step="1" value="15"/>
-          </div>
-        </div>
         <div class="opt">
           <label class="row" for="seed">
             <input id="seed" type="checkbox"/>
@@ -2928,6 +2972,7 @@ async function runUpscale({ seed, health }) {
         voice: $("voice").value,
         bed: $("bed").value,
         duration_sec: $("lengthMode").value === "custom" ? Number($("lengthSec").value) : null,
+        shot_count: Math.min(5, Math.max(2, parseInt($("shotCount").value, 10) || 4)),
         seed_from_upload: useSeed,
         upload_tag: ($("tag").value || "shittyvideo").trim(),
         health_safety: safetyKind || false,
@@ -3038,9 +3083,11 @@ $("shitty").onclick = () => {
   runUpscale({ seed: true });
 };
 
-$("lengthMode").onchange = () => {
-  $("lengthWrap").classList.toggle("hidden", $("lengthMode").value !== "custom");
-};
+function syncCutLength() {
+  $("lengthSec").readOnly = $("lengthMode").value !== "custom";
+}
+$("lengthMode").onchange = syncCutLength;
+syncCutLength();
 $("go").onclick = () => runUpscale({ seed: false, health: briefHealth || false });
 
 document.querySelectorAll("#feedback [data-v]").forEach(btn => {

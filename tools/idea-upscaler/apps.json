@@ -2,7 +2,7 @@
   "apps": [
     {
       "id": "upscaler",
-      "title": "Idea Upscaler",
+      "title": "Video Recutter",
       "blurb": "Your rough clip, cut to the same length from the archive, with the voice line burned in.",
       "href": "upscaler",
       "ready": true
