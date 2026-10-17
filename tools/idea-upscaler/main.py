@@ -373,27 +373,80 @@ def _score_ok(match: dict[str, Any]) -> bool:
         return True
 
 
+_CHUNK_SUFFIX = re.compile(r"_chunk_\d+(?=\.[^.]+$)", re.IGNORECASE)
+
+
+def _video_identity(source: str, original: str = "") -> str:
+    """Parent upload. Another segment of the same file is the same video."""
+    basis = (original or "").strip()
+    if not basis.startswith("s3://"):
+        basis = (source or "").strip()
+    name = basis.rsplit("/", 1)[-1]
+    return _CHUNK_SUFFIX.sub("", name).strip().lower()
+
+
+def _blocked_videos(exclude: set[str]) -> set[str]:
+    blocked = set(exclude)
+    for item in exclude:
+        ident = _video_identity(str(item))
+        if ident:
+            blocked.add(ident)
+    return blocked
+
+
+def _match_seen(match: dict[str, Any], blocked: set[str], taken: set[str]) -> bool:
+    source = str(match.get("source") or "")
+    original = str(match.get("original_video") or "")
+    ident = _video_identity(source, original)
+    if source and source in blocked:
+        return True
+    if original and original in blocked:
+        return True
+    if ident and (ident in blocked or ident in taken):
+        return True
+    return False
+
+
 def _collect_matches(
     data: dict[str, Any],
     *,
     exclude: set[str],
     top_k: int,
 ) -> list[dict[str, Any]]:
+    """Keep hits whose parent video is not already in this cut."""
+    blocked = _blocked_videos(exclude)
+    taken: set[str] = set()
+
+    def accept(row: dict[str, Any], *, chunk: bool) -> dict[str, Any] | None:
+        match = _row_to_match(row, chunk=chunk)
+        if not match or not _score_ok(match):
+            return None
+        if _match_seen(match, blocked, taken):
+            return None
+        ident = _video_identity(str(match.get("source") or ""), str(match.get("original_video") or ""))
+        if ident:
+            taken.add(ident)
+        return match
+
     matches: list[dict[str, Any]] = []
     for row in data.get("results") or []:
-        m = _row_to_match(row)
-        if not m or m["source"] in exclude or not _score_ok(m):
+        if not isinstance(row, dict):
             continue
-        matches.append(m)
+        match = accept(row, chunk=False)
+        if not match:
+            continue
+        matches.append(match)
         if len(matches) >= top_k:
             return matches
     if matches:
         return matches
     for ch in data.get("chunk_results") or []:
-        m = _row_to_match(ch, chunk=True)
-        if not m or m["source"] in exclude or not _score_ok(m):
+        if not isinstance(ch, dict):
             continue
-        matches.append(m)
+        match = accept(ch, chunk=True)
+        if not match:
+            continue
+        matches.append(match)
         if len(matches) >= top_k:
             break
     return matches
@@ -414,10 +467,10 @@ def _search_shot(
     filters = metadata_filters if metadata_filters is not None else shot.get("metadata_filters") or None
     exclude = exclude_sources or set()
 
-    def call(filt: dict[str, Any] | None) -> dict[str, Any]:
+    def call(filt: dict[str, Any] | None, size: int) -> dict[str, Any]:
         body: dict[str, Any] = {
             "query": query[:400],
-            "top_k": top_k,
+            "top_k": max(1, min(100, int(size))),
             "llm_top_n": 1,  # API requires >= 1
             "min_similarity": MIN_SIMILARITY,
             "include_public": True,
@@ -437,10 +490,25 @@ def _search_shot(
             raise RuntimeError(f"search HTTP {r.status_code}: {r.text[:240]}")
         return r.json()
 
-    data = call(filters if filters else None)
-    matches = _collect_matches(data, exclude=exclude, top_k=top_k)
-    if not matches and filters and fallback:
-        matches = _collect_matches(call(None), exclude=exclude, top_k=top_k)
+    sizes = [max(1, int(top_k))]
+    if exclude:
+        for size in (24, 100):
+            if size > sizes[-1]:
+                sizes.append(size)
+    matches: list[dict[str, Any]] = []
+    for size in sizes:
+        data = call(filters if filters else None, size)
+        matches = _collect_matches(data, exclude=exclude, top_k=top_k)
+        returned = len(data.get("chunk_results") or []) + len(data.get("results") or [])
+        if not matches and filters and fallback:
+            bare = call(None, size)
+            matches = _collect_matches(bare, exclude=exclude, top_k=top_k)
+            returned = max(
+                returned,
+                len(bare.get("chunk_results") or []) + len(bare.get("results") or []),
+            )
+        if matches or returned < size:
+            break
     return matches
 
 
@@ -3394,7 +3462,7 @@ def upscale():
                     )
 
             enriched = []
-            used_sources = set(exclude)
+            used_sources = _blocked_videos(set(exclude))
             for shot in shots:
                 try:
                     matches = _search_shot(
@@ -3406,7 +3474,14 @@ def upscale():
                     matches = []
                     shot = {**shot, "search_error": str(e)}
                 if matches and matches[0].get("source"):
-                    used_sources.add(matches[0]["source"])
+                    chosen = matches[0]
+                    used_sources.add(str(chosen["source"]))
+                    parent = str(chosen.get("original_video") or "")
+                    if parent.startswith("s3://"):
+                        used_sources.add(parent)
+                    ident = _video_identity(str(chosen["source"]), parent)
+                    if ident:
+                        used_sources.add(ident)
                 enriched.append({**shot, "matches": matches})
 
         cosmos_reason: Any = expanded_by or "fallback"
@@ -3844,8 +3919,19 @@ INDEX_HTML = r"""<!DOCTYPE html>
   #expanded { margin-top: 12px; display: grid; gap: 6px; }
   #expanded p { margin: 0; line-height: 1.4; }
   .direction-box .actions { margin-top: 10px; }
-  #userClipDetails { margin-top: 8px; }
-  #userClipDetails summary { cursor: pointer; font-weight: 600; }
+  #uploadSettings {
+    margin-top: 12px;
+    padding: 12px 14px;
+    border-radius: 14px;
+    background: var(--panel-2);
+    border: 1px solid var(--line);
+  }
+  #uploadSettings > summary {
+    cursor: pointer;
+    font-weight: 600;
+    color: var(--ink);
+  }
+  #uploadSettings .opt { margin-top: 12px; padding: 0; background: transparent; }
   #userClip {
     width: 100%;
     margin-top: 8px;
@@ -4001,55 +4087,6 @@ INDEX_HTML = r"""<!DOCTYPE html>
         <div class="opt" id="uploadBox">
           <label for="uploadFile">Video file</label>
           <input id="uploadFile" type="file" accept=".mp4,.mov,.webm,.avi,.mkv,video/mp4,video/quicktime,video/webm,video/x-msvideo,video/x-matroska"/>
-          <details id="userClipDetails">
-            <summary>Your upload</summary>
-            <video id="userClip" controls playsinline preload="metadata"></video>
-          </details>
-          <label for="uploadPublic">Visibility</label>
-          <select id="uploadPublic">
-            <option value="public" selected>public</option>
-            <option value="private">private</option>
-          </select>
-          <label for="uploadAllowed">Allowed users</label>
-          <input id="uploadAllowed" type="text" value="" placeholder="allowed users"/>
-          <label for="scenarioPreset">Scenarios for the VAST reasoner (1–3)</label>
-          <select id="scenarioPreset">
-            <option value="" selected>Add a pipeline preset…</option>
-            <option value="People, unusual behavior, safety hazards, abandoned objects, or crowds">Incident and safety</option>
-            <option value="Vehicles, traffic flow, pedestrians, congestion, or a near-miss">Traffic</option>
-            <option value="Dashcam road scene: vehicles, cyclists, pedestrians, signs, or a hazard">Live driving</option>
-            <option value="Forklifts, workers, PPE, spills, or dock activity">Warehouse</option>
-            <option value="Customer flow, product handling, queues, or staff activity">Retail</option>
-            <option value="First-person hands, tools, and the task being done">First-person</option>
-            <option value="People, objects, and the main action in the frame">General</option>
-          </select>
-          <input id="scenario1" type="text" value="" placeholder="Scenario 1, for example a person stepping into the road"/>
-          <input id="scenario2" type="text" value="" placeholder="Scenario 2 (optional)"/>
-          <input id="scenario3" type="text" value="" placeholder="Scenario 3 (optional)"/>
-          <label for="uploadTag">Tag</label>
-          <input id="uploadTag" type="text" value="" placeholder="upload tag"/>
-          <label for="uploadLocation">Location</label>
-          <input id="uploadLocation" type="text" value="" placeholder="location"/>
-          <label for="uploadCamera">Camera</label>
-          <input id="uploadCamera" type="text" value="" placeholder="camera id"/>
-          <label for="uploadCapture">Capture type</label>
-          <select id="uploadCapture">
-            <option value="" selected>optional</option>
-            <option value="traffic">traffic</option>
-            <option value="streets">streets</option>
-            <option value="crowds">crowds</option>
-            <option value="malls">malls</option>
-            <option value="general">general</option>
-            <option value="sports">sports</option>
-            <option value="robotics">robotics</option>
-            <option value="warehouse">warehouse</option>
-            <option value="retail">retail</option>
-          </select>
-          <p class="hint">Type 1 to 3 scenarios. Upload sends them as one analysis prompt, so the reasoner describes the clip against those scenarios. If a scenario states a shot count or a length, Recut follows that instead of the Shots and Seconds controls. Indexing usually takes a minute or two. Clips already in the archive keep their old descriptions until they are uploaded or re-ingested with these scenarios.</p>
-          <div class="actions">
-            <button id="uploadBtn" type="button">Upload</button>
-            <span class="status" id="uploadStatus"></span>
-          </div>
         </div>
         <div class="opt">
           <label class="row" for="seed">
@@ -4097,6 +4134,58 @@ INDEX_HTML = r"""<!DOCTYPE html>
           <p class="status" id="cut-empty">Click Recut to cut a reel the same length as your clip, with the VO burned in.</p>
           <video id="cut-video" class="hidden" controls playsinline></video>
         </div>
+        <details id="uploadSettings">
+          <summary>Upload settings</summary>
+          <div class="opt">
+            <label for="userClip">Your upload</label>
+            <video id="userClip" controls playsinline preload="metadata"></video>
+            <label for="uploadPublic">Visibility</label>
+            <select id="uploadPublic">
+              <option value="public" selected>public</option>
+              <option value="private">private</option>
+            </select>
+            <label for="uploadAllowed">Allowed users</label>
+            <input id="uploadAllowed" type="text" value="" placeholder="allowed users"/>
+            <label for="scenarioPreset">Scenarios for the VAST reasoner (1–3)</label>
+            <select id="scenarioPreset">
+              <option value="" selected>Add a pipeline preset…</option>
+              <option value="People, unusual behavior, safety hazards, abandoned objects, or crowds">Incident and safety</option>
+              <option value="Vehicles, traffic flow, pedestrians, congestion, or a near-miss">Traffic</option>
+              <option value="Dashcam road scene: vehicles, cyclists, pedestrians, signs, or a hazard">Live driving</option>
+              <option value="Forklifts, workers, PPE, spills, or dock activity">Warehouse</option>
+              <option value="Customer flow, product handling, queues, or staff activity">Retail</option>
+              <option value="First-person hands, tools, and the task being done">First-person</option>
+              <option value="People, objects, and the main action in the frame">General</option>
+            </select>
+            <input id="scenario1" type="text" value="" placeholder="Scenario 1, for example a person stepping into the road"/>
+            <input id="scenario2" type="text" value="" placeholder="Scenario 2 (optional)"/>
+            <input id="scenario3" type="text" value="" placeholder="Scenario 3 (optional)"/>
+            <label for="uploadTag">Tag</label>
+            <input id="uploadTag" type="text" value="" placeholder="upload tag"/>
+            <label for="uploadLocation">Location</label>
+            <input id="uploadLocation" type="text" value="" placeholder="location"/>
+            <label for="uploadCamera">Camera</label>
+            <input id="uploadCamera" type="text" value="" placeholder="camera id"/>
+            <label for="uploadCapture">Capture type</label>
+            <select id="uploadCapture">
+              <option value="" selected>optional</option>
+              <option value="traffic">traffic</option>
+              <option value="streets">streets</option>
+              <option value="crowds">crowds</option>
+              <option value="malls">malls</option>
+              <option value="general">general</option>
+              <option value="sports">sports</option>
+              <option value="robotics">robotics</option>
+              <option value="warehouse">warehouse</option>
+              <option value="retail">retail</option>
+            </select>
+            <p class="hint">Type 1 to 3 scenarios. Upload sends them as one analysis prompt, so the reasoner describes the clip against those scenarios. If a scenario states a shot count or a length, Recut follows that instead of the Shots and Seconds controls. Indexing usually takes a minute or two. Clips already in the archive keep their old descriptions until they are uploaded or re-ingested with these scenarios.</p>
+            <div class="actions">
+              <button id="uploadBtn" type="button">Upload</button>
+              <span class="status" id="uploadStatus"></span>
+            </div>
+          </div>
+        </details>
         <div id="timeline" class="tl hidden"></div>
         <div id="feedback" class="fb hidden">
           <label>I like this shot, not that one</label>

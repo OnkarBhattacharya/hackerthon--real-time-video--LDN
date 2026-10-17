@@ -8,13 +8,60 @@ mode the tester picked, and the first pass does not wait on detections.
 from __future__ import annotations
 
 import os
+import re
 import threading
 import time
 from typing import Any
 from urllib.parse import quote
 
 import requests
-from flask import Flask, Response, jsonify, request, stream_with_context
+
+try:
+    from flask import Flask, Response, jsonify, request, stream_with_context
+except ImportError:  # self-check on a machine that does not have Flask
+    class _Map:
+        strict_slashes = True
+
+    class _Request:
+        method = "GET"
+        args: dict[str, str] = {}
+        headers: dict[str, str] = {}
+
+        def get_json(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+            return {}
+
+    class _Flask:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            self.url_map = _Map()
+
+        def route(self, *args: Any, **kwargs: Any):
+            def deco(fn):
+                return fn
+            return deco
+
+        def get(self, *args: Any, **kwargs: Any):
+            return self.route(*args, **kwargs)
+
+        def post(self, *args: Any, **kwargs: Any):
+            return self.route(*args, **kwargs)
+
+        def run(self, *args: Any, **kwargs: Any) -> None:
+            return None
+
+    def Flask(*args: Any, **kwargs: Any) -> _Flask:
+        return _Flask(*args, **kwargs)
+
+    class Response:  # type: ignore[no-redef]
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+    def jsonify(payload: Any) -> Any:
+        return payload
+
+    request = _Request()
+
+    def stream_with_context(fn: Any) -> Any:
+        return fn
 
 PORT = int(os.environ.get("PORT", "8080"))
 
@@ -147,7 +194,6 @@ _token: str | None = None
 _token_at = 0.0
 _clip_lock = threading.Lock()
 _clips: dict[str, dict[str, Any]] = {}
-_last_source: dict[str, str] = {}
 _det_lock = threading.Lock()
 _det_cache: dict[str, dict[str, Any] | None] = {}
 _hazard_lock = threading.Lock()
@@ -195,12 +241,12 @@ def _place(value: str) -> str:
     return text.title() if text else "Clip"
 
 
-def _search_body(query: str, filters: dict[str, str]) -> dict[str, Any]:
+def _search_body(query: str, filters: dict[str, str], top_k: int = 8) -> dict[str, Any]:
     if "\n" in query or not query.strip():
         raise ValueError("search query must be one line")
     return {
         "query": query,
-        "top_k": 8,
+        "top_k": max(1, min(100, int(top_k))),
         "llm_top_n": 1,
         "min_similarity": 0.15,
         "include_public": True,
@@ -265,36 +311,78 @@ def _rank(mode: str, chunk: dict[str, Any], row: dict[str, Any]) -> float:
     return score
 
 
+_CHUNK_SUFFIX = re.compile(r"_chunk_\d+(?=\.[^.]+$)", re.IGNORECASE)
+
+
+def _video_identity(source: str, original: str = "") -> str:
+    """Parent video, so chunk 0000 and chunk 0004 of one upload count as one clip."""
+    basis = (original or "").strip()
+    if not basis.startswith("s3://"):
+        basis = (source or "").strip()
+    name = basis.rsplit("/", 1)[-1]
+    return _CHUNK_SUFFIX.sub("", name).strip().lower()
+
+
+def _blocked_videos(avoid: set[str]) -> set[str]:
+    """Hard block. A 0.2 score penalty left the same top hit in first place."""
+    blocked: set[str] = set()
+    for source in avoid:
+        text = (source or "").strip()
+        if not text:
+            continue
+        blocked.add(text)
+        ident = _video_identity(text)
+        if ident:
+            blocked.add(ident)
+    with _clip_lock:
+        for row in _clips.values():
+            if row.get("source") in avoid or row.get("video") in avoid:
+                key = str(row.get("video_key") or "")
+                if key:
+                    blocked.add(key)
+    return blocked
+
+
+def _same_video(source: str, original: str, blocked: set[str]) -> bool:
+    if source in blocked or (original and original in blocked):
+        return True
+    ident = _video_identity(source, original)
+    return bool(ident and ident in blocked)
+
+
 def _best_chunk(
-    mode: str, payload: dict[str, Any], avoid: str
+    mode: str, payload: dict[str, Any], avoid: set[str]
 ) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    """Highest ranked chunk whose parent video has not already been played."""
     rows = {
         row.get("source"): row
         for row in (payload.get("results") or [])
         if isinstance(row, dict)
     }
+    blocked = _blocked_videos(avoid)
     best: tuple[dict[str, Any], dict[str, Any]] | None = None
     best_score = -1e9
     for chunk in payload.get("chunk_results") or []:
         if not isinstance(chunk, dict):
             continue
         source = str(chunk.get("preview_source") or "")
+        original = str(chunk.get("original_video") or "")
         if not source.startswith("s3://"):
             continue
         if not _allows(mode, chunk):
             continue
+        if _same_video(source, original, blocked):
+            continue
         row = rows.get(source) or {}
         score = _rank(mode, chunk, row)
-        if source and source == avoid:
-            score -= 0.2
         if score > best_score:
             best_score = score
             best = (chunk, row)
     return best
 
 
-def _search(query: str, filters: dict[str, str]) -> dict[str, Any]:
-    response = _vss("POST", "/api/v1/search", json=_search_body(query, filters), timeout=50)
+def _search(query: str, filters: dict[str, str], top_k: int = 8) -> dict[str, Any]:
+    response = _vss("POST", "/api/v1/search", json=_search_body(query, filters, top_k), timeout=50)
     if response.status_code >= 400:
         raise RuntimeError(f"search HTTP {response.status_code}")
     payload = response.json()
@@ -303,23 +391,72 @@ def _search(query: str, filters: dict[str, str]) -> dict[str, Any]:
     return payload
 
 
-def _load_clip(mode: str) -> dict[str, Any]:
-    """Search only. Detections wait until the second pass."""
+def _seen_sources(raw: Any) -> set[str]:
+    """Sources this browser session has already played. Repeats are excluded."""
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list):
+        return set()
+    seen: set[str] = set()
+    for item in raw[:40]:
+        text = str(item or "").strip()
+        if text.startswith("s3://"):
+            seen.add(text)
+    return seen
+
+
+def _load_clip(mode: str, seen: set[str] | None = None) -> dict[str, Any]:
+    """Search only. Detections wait until the second pass.
+
+    Played s3 sources are hard-excluded, including other segments of the same
+    parent. top_k widens while every returned hit is a video already played.
+    """
     spec = MODES[mode]
-    avoid = _last_source.get(mode, "")
+    avoid = set(seen or ())
     found: tuple[dict[str, Any], dict[str, Any]] | None = None
     used_filters: dict[str, str] | None = None
-    for filters in spec["filters"]:
-        found = _best_chunk(mode, _search(spec["query"], filters), avoid)
-        if found:
-            used_filters = filters
+    distinct: set[str] = set()
+    top_k = 8
+    while True:
+        filled = False
+        distinct = set()
+        found = None
+        used_filters = None
+        for filters in spec["filters"]:
+            payload = _search(spec["query"], filters, top_k)
+            hits = 0
+            for chunk in payload.get("chunk_results") or []:
+                if not isinstance(chunk, dict):
+                    continue
+                source = str(chunk.get("preview_source") or "")
+                if not source.startswith("s3://") or not _allows(mode, chunk):
+                    continue
+                hits += 1
+                ident = _video_identity(source, str(chunk.get("original_video") or ""))
+                if ident:
+                    distinct.add(ident)
+            if hits >= top_k:
+                filled = True
+            pick = _best_chunk(mode, payload, avoid)
+            if pick:
+                found = pick
+                used_filters = filters
+                break
+        if found or not filled or top_k >= 100:
             break
+        top_k = min(100, top_k * 4)
     if not found or used_filters is None:
+        if avoid and len(distinct) <= 1:
+            raise RuntimeError("This mode only has one eligible clip in the archive.")
+        if avoid:
+            raise RuntimeError("Every clip for this mode was already used in this session")
         if mode == "driving":
             raise RuntimeError("No street or traffic clip is indexed for this mode")
         raise RuntimeError("No warehouse3 clip is indexed for this mode")
     chunk, row = found
     source = str(chunk.get("preview_source") or "")
+    original = str(chunk.get("original_video") or "")
+    video = original if original.startswith("s3://") else source
     try:
         duration = float(row.get("duration") or 0)
     except (TypeError, ValueError):
@@ -346,11 +483,12 @@ def _load_clip(mode: str) -> dict[str, Any]:
             "camera_id": str(chunk.get("camera_id") or ""),
             "capture_type": str(chunk.get("capture_type") or ""),
             "source": source,
+            "video": video,
+            "video_key": _video_identity(source, original),
             "duration": round(max(1.5, duration), 2),
             "stream": "api/stream?source=" + quote(source, safe=""),
         }
         _clips[clip_id] = stored
-        _last_source[mode] = source
         return stored
 
 
@@ -360,6 +498,8 @@ def _public_clip(row: dict[str, Any]) -> dict[str, Any]:
         "mode": row["mode"],
         "mode_name": row["mode_name"],
         "place": row["place"],
+        "source": row["source"],
+        "video": row.get("video") or row["source"],
         "stream": row["stream"],
         "duration": row["duration"],
     }
@@ -659,6 +799,12 @@ def _score_reaction(mode: str, hazard: dict[str, Any], action: str) -> dict[str,
     }
 
 
+def _score_total(scores: list[int]) -> str:
+    """Points earned this session over 5 per scored clip, such as 8/10."""
+    earned = sum(int(points) for points in scores)
+    return f"{earned}/{5 * len(scores)}"
+
+
 def _hazard_for(row: dict[str, Any], clicks: list[float], duration: float) -> dict[str, Any]:
     duration = max(float(row.get("duration") or 0), duration, 1.5)
     key = (row["id"], tuple(round(item, 2) for item in clicks), round(duration, 1))
@@ -693,72 +839,281 @@ PAGE = """<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
 <title>Hazard perception</title>
 <base href="/app/hazard/"/>
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,700&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet"/>
 <style>
-  :root { color-scheme: dark; --bg:#14181c; --ink:#f4f1ea; --muted:#b7c0c7; --line:#2c3842; --accent:#f0b429; --panel:#1c242c; }
+  :root {
+    color-scheme: dark;
+    --bg: #121614;
+    --ink: #f3f1ea;
+    --muted: #a8b0a6;
+    --panel: #1c221e;
+    --panel-2: #242b26;
+    --line: #343c36;
+    --accent: #e7ff6a;
+    --accent-ink: #17200a;
+    --good: #b6e3a8;
+    --bad: #ffb4a8;
+  }
   * { box-sizing: border-box; }
-  body { margin:0; font-family: "IBM Plex Sans", "Segoe UI", sans-serif; background:var(--bg); color:var(--ink); }
-  .wrap { max-width: 880px; margin: 0 auto; padding: 28px 18px 64px; }
+  html, body { margin: 0; min-height: 100%; background: #121614; }
+  body {
+    font-family: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
+    color: var(--ink);
+    background:
+      radial-gradient(ellipse 70% 40% at 100% 0%, #2a3324 0%, transparent 55%),
+      var(--bg);
+  }
   a { color: var(--accent); }
-  h1 { font-family: Georgia, serif; font-weight: 500; font-size: clamp(2rem, 4vw, 2.8rem); margin: 8px 0; }
-  p.lead, .hint { color: var(--muted); max-width: 42rem; line-height: 1.45; }
-  .modes { display: grid; gap: 10px; margin: 16px 0; }
-  button.mode { text-align: left; background: var(--panel); color: var(--ink); border: 1px solid var(--line); padding: 14px; cursor: pointer; }
-  button.mode strong { display: block; font-size: 1.05rem; margin-bottom: 4px; }
-  button.mode span { color: var(--muted); }
-  button.mode:disabled { opacity: 0.55; cursor: default; }
-  #desk:focus { outline: 1px solid var(--accent); outline-offset: 4px; }
-  .stage { position: relative; background: #000; border: 1px solid var(--line); aspect-ratio: 16/9; }
-  video, #overlay { position:absolute; inset:0; width:100%; height:100%; }
-  video { object-fit: contain; background:#000; }
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 12px 16px 48px; }
+  .kicker { margin: 0; font-size: 0.75rem; letter-spacing: 0.14em; text-transform: uppercase; }
+  .kicker a { color: var(--muted); text-decoration: none; }
+  .kicker a:hover { color: var(--accent); }
+  h1 {
+    font-family: Fraunces, Georgia, serif;
+    font-weight: 500;
+    font-size: clamp(1.8rem, 3vw, 2.6rem);
+    letter-spacing: -0.03em;
+    line-height: 0.95;
+    margin: 2px 0 4px;
+  }
+  p.lead, .hint { color: var(--muted); max-width: 42rem; line-height: 1.45; margin: 8px 0 0; }
+  .hint { font-size: 0.92rem; }
+  body.in-test .lead, body.in-test .hint { display: none; }
+  .modes { display: grid; gap: 12px; margin: 16px 0; }
+  @media (min-width: 800px) { .modes { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+  button {
+    font: inherit;
+    font-weight: 600;
+    border: none;
+    cursor: pointer;
+    background: var(--accent);
+    color: var(--accent-ink);
+    padding: 11px 16px;
+    border-radius: 999px;
+  }
+  button:disabled { opacity: 0.45; cursor: default; }
+  button.ghost {
+    background: transparent;
+    color: var(--ink);
+    border: 1px solid var(--line);
+    font-weight: 500;
+    padding: 8px 12px;
+  }
+  button.ghost:hover { border-color: var(--accent); color: var(--accent); }
+  button.mode {
+    text-align: left;
+    background: var(--panel);
+    color: var(--ink);
+    border: 1px solid var(--line);
+    border-radius: 18px;
+    padding: 16px;
+    font-weight: 400;
+  }
+  button.mode:hover { border-color: var(--accent); }
+  button.mode strong {
+    display: block;
+    font-family: Fraunces, Georgia, serif;
+    font-size: 1.25rem;
+    font-weight: 500;
+    margin-bottom: 6px;
+  }
+  button.mode span { color: var(--muted); line-height: 1.4; }
+  button.pick {
+    text-align: left;
+    background: var(--panel-2);
+    color: var(--ink);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: 10px 12px;
+    font-weight: 500;
+  }
+  button.pick:hover { border-color: var(--accent); }
+  button.pick.on { border-color: var(--accent); background: #2c3324; }
+  button.pick:disabled:not(.on) { opacity: 0.45; }
+  button.pick.on:disabled { opacity: 1; cursor: default; }
+  button:focus-visible, .bar:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  #desk:focus { outline: none; }
+  #desk.review {
+    display: grid;
+    grid-template-columns: minmax(0, 1.5fr) minmax(240px, 0.72fr);
+    gap: 16px;
+    align-items: start;
+  }
+  #desk.review #ask { margin-top: 0; }
+  @media (max-width: 860px) {
+    #desk.review { grid-template-columns: 1fr; }
+    #desk.review #ask { margin-top: 14px; }
+  }
+  .stage-col { min-width: 0; }
+  .stage {
+    position: relative;
+    background: #000;
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    overflow: hidden;
+    aspect-ratio: 16/9;
+  }
+  video, #overlay { position: absolute; inset: 0; width: 100%; height: 100%; }
+  video { object-fit: contain; background: #000; display: block; }
   #overlay { pointer-events: none; }
-  #hit { position:absolute; inset:0; z-index:2; border:0; background:transparent; color:transparent; cursor:pointer; }
-  #hit.on { color:#fff; background:rgba(0,0,0,.35); font-size:1.05rem; }
-  #banner, #count { z-index:3; }
-  #banner { position:absolute; left:12px; right:12px; bottom:12px; background:rgba(20,16,8,.88); color:var(--accent); padding:8px 10px; font-weight:600; }
-  #count { position:absolute; inset:0; display:grid; place-items:center; font-size:4rem; background:rgba(0,0,0,.45); }
-  .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin:14px 0; }
-  button.act, button.go { background:var(--accent); color:#1a1404; border:0; padding:10px 14px; font-weight:600; cursor:pointer; }
-  button.ghost { background:transparent; color:var(--ink); border:1px solid var(--line); padding:10px 14px; cursor:pointer; }
-  button.pick { text-align:left; background:var(--panel); color:var(--ink); border:1px solid var(--line); padding:10px 12px; cursor:pointer; }
-  button.pick.on { border-color: var(--accent); }
-  button.pick:disabled { opacity: 0.55; cursor: default; }
-  .choices { display:grid; gap:8px; }
-  .bar { position:relative; height:22px; background:#2a343d; margin-top:8px; cursor:pointer; touch-action:none; }
-  .window { position:absolute; top:0; bottom:0; background:rgba(240,180,41,.85); pointer-events:none; }
-  .playhead { position:absolute; top:0; bottom:0; width:2px; background:#fff; pointer-events:none; }
-  .mark { position:absolute; top:0; width:8px; height:22px; margin-left:-4px; background:#7dcea0; pointer-events:none; }
-  .panel { background:var(--panel); border:1px solid var(--line); padding:14px; margin-top:14px; }
-  .status { color: var(--muted); }
-  .err { color: #ffb4a8; }
-  .hidden { display:none !important; }
+  #hit {
+    position: absolute;
+    inset: 0;
+    z-index: 2;
+    width: auto;
+    height: auto;
+    margin: 0;
+    padding: 0;
+    border: 0;
+    border-radius: 0;
+    background: transparent;
+    color: transparent;
+    display: grid;
+    place-items: center;
+    cursor: pointer;
+    font-weight: 600;
+  }
+  #hit.on { background: rgba(8, 10, 8, 0.38); color: inherit; }
+  #hit span { display: none; }
+  #hit.on span {
+    display: inline-block;
+    padding: 12px 18px;
+    border-radius: 999px;
+    background: var(--accent);
+    color: var(--accent-ink);
+  }
+  #count {
+    position: absolute;
+    inset: 0;
+    z-index: 4;
+    display: grid;
+    place-items: center;
+    font-family: Fraunces, Georgia, serif;
+    font-size: clamp(4rem, 8vw, 6rem);
+    font-weight: 500;
+    letter-spacing: -0.04em;
+    color: var(--ink);
+    background: rgba(8, 10, 8, 0.55);
+    pointer-events: none;
+    text-shadow: 0 2px 18px rgba(0, 0, 0, 0.45);
+  }
+  .caption {
+    margin: 10px 0 0;
+    padding: 8px 12px;
+    border-radius: 12px;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    color: var(--accent);
+    font-weight: 600;
+    font-size: 0.92rem;
+  }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin: 12px 0 0; }
+  .choices { display: grid; gap: 8px; }
+  .bar {
+    position: relative;
+    height: 28px;
+    background: #2a3328;
+    margin-top: 10px;
+    border-radius: 999px;
+    cursor: pointer;
+    touch-action: none;
+    overflow: hidden;
+  }
+  .window { position: absolute; top: 0; bottom: 0; background: rgba(231, 255, 106, 0.42); pointer-events: none; }
+  .playhead { position: absolute; top: 0; bottom: 0; width: 2px; background: #fff; pointer-events: none; }
+  .mark {
+    position: absolute;
+    top: 4px;
+    bottom: 4px;
+    width: 8px;
+    margin: 0;
+    border-radius: 999px;
+    background: var(--good);
+    transform: translateX(-50%);
+    pointer-events: none;
+  }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 18px;
+    padding: 16px;
+    margin-top: 14px;
+  }
+  h2 { font-family: Fraunces, Georgia, serif; font-weight: 500; font-size: 1.45rem; margin: 0 0 12px; }
+  .status { font-size: 0.92rem; color: var(--muted); min-height: 1.2em; }
+  .err { color: var(--bad); margin: 8px 0 0; }
+  #done { position: sticky; top: 12px; z-index: 6; }
+  #result {
+    position: fixed;
+    inset: 0;
+    z-index: 30;
+    display: grid;
+    place-items: center;
+    padding: 24px;
+    background:
+      radial-gradient(ellipse 80% 50% at 50% 0%, #2a3324 0%, transparent 60%),
+      rgba(12, 16, 13, 0.96);
+  }
+  #confetti {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    pointer-events: none;
+  }
+  .result-card {
+    position: relative;
+    z-index: 1;
+    text-align: center;
+    max-width: 16em;
+  }
+  .result-card h2 {
+    font-family: Fraunces, Georgia, serif;
+    font-weight: 500;
+    font-size: clamp(2.2rem, 6vw, 4.2rem);
+    line-height: 1.05;
+    letter-spacing: -0.03em;
+    margin: 0 0 28px;
+  }
+  .hidden { display: none !important; }
 </style>
 </head>
 <body>
   <div class="wrap">
-    <p><a href="/app/">All apps</a></p>
-    <h1>Hazard perception</h1>
-    <p class="lead">Pick a mode, then mark the hazard as the clip plays. The second pass boxes one main hazard and asks what you should do.</p>
-    <p class="hint" id="keys">Space marks a hazard at the current time. Drag the bar or use the arrow keys to move through the clip. 1 Slow down, 2 Brake, 3 Wait, 4 Steer away, 5 Continue. Enter opens the second pass or submits.</p>
+    <header>
+      <p class="kicker"><a href="/app/">All apps</a></p>
+      <h1>Hazard perception</h1>
+      <p class="lead" id="lead">Pick a mode, then mark the hazard as the clip plays. The second pass boxes one main hazard and asks what you should do.</p>
+      <p class="hint" id="keys">Space marks a hazard at the current time. Drag the bar or use the arrow keys to move through the clip. 1 Slow down, 2 Brake, 3 Wait, 4 Steer away, 5 Continue. Enter opens the second pass or submits.</p>
+    </header>
     <div id="modes" class="modes">
       <button class="mode" type="button" data-mode="driving"><strong>Driving</strong><span>Streets and traffic. A person, a cyclist, or a close vehicle.</span></button>
       <button class="mode" type="button" data-mode="forklift"><strong>Forklift driver</strong><span>Warehouse aisle. A person, another vehicle, or a rack the forks are approaching.</span></button>
       <button class="mode" type="button" data-mode="walk"><strong>Warehouse walk</strong><span>On foot in the warehouse. A forklift coming, or a person with a load.</span></button>
     </div>
     <p class="status" id="meta">Choose Driving, Forklift driver, or Warehouse walk.</p>
+    <div class="row">
+      <button id="done" class="hidden" type="button" disabled>Done</button>
+    </div>
+    <p id="err" class="err hidden"></p>
     <div id="desk" class="hidden" tabindex="0">
-      <div class="stage">
-        <video id="vid" playsinline preload="auto"></video>
-        <canvas id="overlay"></canvas>
-        <button id="hit" class="on" type="button">Start the clip</button>
-        <div id="banner" class="hidden"></div>
-        <div id="count" class="hidden"></div>
-      </div>
-      <div id="timeline" class="bar hidden" role="slider" aria-label="Clip time" aria-valuemin="0" aria-valuemax="0" aria-valuenow="0" aria-hidden="true" tabindex="-1"></div>
-      <div class="row">
-        <button id="hazardBtn" class="act" type="button" disabled>I see a hazard</button>
-        <button id="again" class="ghost hidden" type="button">Another clip</button>
-        <button id="change" class="ghost" type="button">Change mode</button>
-        <span class="status" id="clicks"></span>
+      <div class="stage-col">
+        <div class="stage">
+          <video id="vid" playsinline preload="auto"></video>
+          <canvas id="overlay"></canvas>
+          <button id="hit" class="on" type="button"><span id="hitLabel">Start the clip</span></button>
+          <div id="count" class="hidden"></div>
+        </div>
+        <div id="banner" class="caption hidden"></div>
+        <div id="timeline" class="bar hidden" role="slider" aria-label="Clip time" aria-valuemin="0" aria-valuemax="0" aria-valuenow="0" aria-hidden="true" tabindex="-1"></div>
+        <div class="row">
+          <button id="hazardBtn" class="act" type="button" disabled>I see a hazard</button>
+          <button id="again" class="ghost hidden" type="button">Different clip</button>
+          <button id="change" class="ghost" type="button">Change mode</button>
+          <span class="status" id="clicks"></span>
+        </div>
       </div>
       <div id="ask" class="panel hidden">
         <h2>What should you do?</h2>
@@ -772,7 +1127,13 @@ PAGE = """<!DOCTYPE html>
         <p id="rating" class="status"></p>
       </div>
     </div>
-    <p id="err" class="err hidden"></p>
+  </div>
+  <div id="result" class="hidden" role="dialog" aria-modal="true" aria-labelledby="resultLine">
+    <canvas id="confetti" aria-hidden="true"></canvas>
+    <div class="result-card">
+      <h2 id="resultLine">Congratulations you scored</h2>
+      <button id="resultModes" class="ghost" type="button">Change mode</button>
+    </div>
   </div>
 <script>
 const $ = (id) => document.getElementById(id);
@@ -791,8 +1152,148 @@ let answered = false;
 let counting = false;
 let advancing = false;
 let playToken = 0;
+let generation = 0;
 let boxPack = null;
 let seekGuard = false;
+let loadingClip = false;
+let sessionScores = [];
+let seenSources = readSeen();
+let confettiFrame = 0;
+
+function readSeen() {
+  try {
+    const raw = JSON.parse(sessionStorage.getItem("hazard-perception-seen") || "[]");
+    if (!Array.isArray(raw)) return [];
+    return raw.map((item) => String(item || "")).filter((item) => item.indexOf("s3://") === 0).slice(0, 40);
+  } catch (e) {
+    return [];
+  }
+}
+
+function rememberSeen(source) {
+  const text = String(source || "");
+  if (text.indexOf("s3://") !== 0 || seenSources.indexOf(text) >= 0) return;
+  seenSources.push(text);
+  if (seenSources.length > 40) seenSources.splice(0, seenSources.length - 40);
+  try { sessionStorage.setItem("hazard-perception-seen", JSON.stringify(seenSources)); } catch (e) {}
+}
+
+function scoreTotal(scores) {
+  let earned = 0;
+  for (const points of scores) earned += points;
+  return earned + "/" + (5 * scores.length);
+}
+
+function syncDone() {
+  const ready = sessionScores.length > 0 && $("result").classList.contains("hidden");
+  const btn = $("done");
+  btn.disabled = !ready;
+  btn.classList.toggle("hidden", !ready);
+}
+
+function stopConfetti() {
+  cancelAnimationFrame(confettiFrame);
+  confettiFrame = 0;
+  const canvas = $("confetti");
+  const pen = canvas.getContext("2d");
+  pen.clearRect(0, 0, canvas.width, canvas.height);
+}
+
+function startConfetti() {
+  const canvas = $("confetti");
+  const pen = canvas.getContext("2d");
+  const colors = ["#e7ff6a", "#b6e3a8", "#f3f1ea", "#ffb4a8", "#ffe08a", "#ffffff"];
+  function fit() {
+    const width = window.innerWidth;
+    const height = window.innerHeight;
+    if (canvas.width !== width || canvas.height !== height) {
+      canvas.width = width;
+      canvas.height = height;
+    }
+  }
+  fit();
+  const pieces = [];
+  for (let i = 0; i < 160; i += 1) {
+    const angle = -Math.PI / 2 + (Math.random() - 0.5) * 1.4;
+    const speed = 5 + Math.random() * 7;
+    pieces.push({
+      x: canvas.width * (0.2 + Math.random() * 0.6),
+      y: canvas.height * (0.18 + Math.random() * 0.22),
+      w: 6 + Math.random() * 8,
+      h: 9 + Math.random() * 10,
+      vx: Math.cos(angle) * speed,
+      vy: Math.sin(angle) * speed - 2,
+      rot: Math.random() * Math.PI,
+      vr: (Math.random() - 0.5) * 0.28,
+      color: colors[i % colors.length],
+      settled: false,
+    });
+  }
+  cancelAnimationFrame(confettiFrame);
+  const started = performance.now();
+  function frame(now) {
+    fit();
+    pen.clearRect(0, 0, canvas.width, canvas.height);
+    let moving = 0;
+    const floor = canvas.height - 10;
+    for (const piece of pieces) {
+      if (!piece.settled) {
+        piece.vy += 0.16;
+        piece.x += piece.vx;
+        piece.y += piece.vy;
+        piece.rot += piece.vr;
+        piece.vx *= 0.992;
+        if (piece.y >= floor) {
+          piece.y = floor;
+          piece.vy *= -0.28;
+          piece.vx *= 0.6;
+          piece.vr *= 0.4;
+          if (Math.abs(piece.vy) < 0.8) {
+            piece.settled = true;
+            piece.vy = 0;
+            piece.vx = 0;
+            piece.vr = 0;
+          } else {
+            moving += 1;
+          }
+        } else {
+          moving += 1;
+        }
+        if (piece.x < -20) piece.x = canvas.width + 10;
+        if (piece.x > canvas.width + 20) piece.x = -10;
+      }
+      pen.save();
+      pen.translate(piece.x, piece.y);
+      pen.rotate(piece.rot);
+      pen.fillStyle = piece.color;
+      pen.fillRect(-piece.w / 2, -piece.h / 2, piece.w, piece.h);
+      pen.restore();
+    }
+    if (moving > 0 && now - started < 9000) confettiFrame = requestAnimationFrame(frame);
+  }
+  confettiFrame = requestAnimationFrame(frame);
+}
+
+function showDone() {
+  if (!sessionScores.length) return;
+  playToken += 1;
+  generation += 1;
+  loadingClip = false;
+  counting = false;
+  advancing = false;
+  pass = 0;
+  try { vid.pause(); } catch (e) {}
+  vid.removeAttribute("src");
+  try { vid.load(); } catch (e) {}
+  desk.classList.add("hidden");
+  $("modes").classList.add("hidden");
+  document.body.classList.remove("in-test");
+  $("resultLine").textContent = "Congratulations you scored " + scoreTotal(sessionScores);
+  $("result").classList.remove("hidden");
+  $("done").classList.add("hidden");
+  startConfetti();
+  $("resultModes").focus();
+}
 
 function showError(msg) {
   $("err").textContent = msg;
@@ -804,13 +1305,28 @@ function clearError() {
   $("err").classList.add("hidden");
 }
 
-function clipFocused() {
+async function readJson(res) {
+  const text = await res.text();
+  if (!text) return {};
+  try { return JSON.parse(text); }
+  catch (e) { return {error: "Unexpected response from the server."}; }
+}
+
+function keysApply() {
+  if (desk.classList.contains("hidden")) return false;
   const el = document.activeElement;
-  return !!el && (el === desk || desk.contains(el));
+  if (!el || el === document.body || el === document.documentElement) return true;
+  return el === desk || desk.contains(el);
 }
 
 function focusClip() {
   if (!desk.classList.contains("hidden")) desk.focus({preventScroll: true});
+}
+
+function setHit(label) {
+  const hit = $("hit");
+  $("hitLabel").textContent = label || "";
+  hit.classList.toggle("on", !!label);
 }
 
 function renderClicks() {
@@ -820,20 +1336,26 @@ function renderClicks() {
 }
 
 function durationOf() {
-  const raw = vid.duration || (clipData && clipData.duration) || 0;
-  return Number.isFinite(raw) ? raw : 0;
+  const raw = Number.isFinite(vid.duration) && vid.duration > 0 ? vid.duration : ((clipData && clipData.duration) || 0);
+  return Number.isFinite(raw) && raw > 0 ? raw : 0;
 }
 
 function drawBar() {
   const bar = $("timeline");
   const dur = Math.max(0.1, durationOf() || 5);
-  const marks = clicks.map((mark) => `<i class="mark" style="left:${Math.min(100, (mark.t / dur) * 100)}%"></i>`).join("");
+  const marks = clicks.map((mark) => {
+    const left = Math.min(100, Math.max(0, (mark.t / dur) * 100));
+    return `<i class="mark" style="left:${left}%"></i>`;
+  }).join("");
   let hazard = "";
   if (pass === 2 && boxPack && Number.isFinite(boxPack.time)) {
-    const left = Math.min(98, Math.max(0, (boxPack.time / dur) * 100));
-    hazard = `<i class="window" style="left:${left}%;width:2%"></i>`;
+    const start = Math.max(0, boxPack.time - 0.75);
+    const end = Math.min(dur, boxPack.time + 1.25);
+    const left = (start / dur) * 100;
+    const width = Math.max(2, ((end - start) / dur) * 100);
+    hazard = `<i class="window" style="left:${left}%;width:${Math.min(100 - left, width)}%"></i>`;
   }
-  bar.innerHTML = `${hazard}<i class="playhead" id="head"></i>${marks}`;
+  bar.innerHTML = `${hazard}${marks}<i class="playhead" id="head"></i>`;
   bar.classList.remove("hidden");
   bar.setAttribute("aria-hidden", "false");
   bar.tabIndex = 0;
@@ -857,7 +1379,7 @@ function seekTo(seconds) {
   const t = Math.min(dur, Math.max(0, seconds));
   seekGuard = true;
   clearTimeout(seekTo.timer);
-  seekTo.timer = setTimeout(() => { seekGuard = false; }, 250);
+  seekTo.timer = setTimeout(() => { seekGuard = false; }, 800);
   try { vid.currentTime = t; } catch (e) { seekGuard = false; }
   moveHead();
   if (pass >= 1) paint();
@@ -882,46 +1404,72 @@ function boxesAt(t) {
     else break;
   }
   if (!best) return [];
+  const anchor = boxPack && Number.isFinite(boxPack.time) ? boxPack.time : best.t;
+  const gap = frames.find((frame) => frame.t > best.t + 0.01);
+  const hold = gap
+    ? Math.min(0.6, Math.max(0.2, gap.t - best.t))
+    : Math.max(0.45, anchor + 1.25 - best.t);
+  if (t > best.t + hold) return [];
   return (best.boxes || []).slice(0, 1);
+}
+
+function paintLabel(text, x, y, rect) {
+  ctx.font = "600 14px IBM Plex Sans, sans-serif";
+  const pad = 5;
+  const maxW = Math.max(40, rect.w - 8);
+  const tw = Math.min(ctx.measureText(text).width, maxW);
+  let lx = x;
+  let ly = y - 24;
+  if (ly < rect.y + 2) ly = Math.min(rect.y + rect.h - 22, y + 6);
+  if (lx + tw + pad * 2 > rect.x + rect.w) lx = rect.x + rect.w - tw - pad * 2;
+  if (lx < rect.x) lx = rect.x;
+  ctx.fillStyle = "rgba(18, 22, 20, 0.9)";
+  ctx.fillRect(lx, ly, tw + pad * 2, 20);
+  ctx.fillStyle = "#e7ff6a";
+  ctx.fillText(text, lx + pad, ly + 14, maxW);
 }
 
 function paint() {
   const rect = contentRect();
-  if (overlay.width !== Math.round(rect.rw) || overlay.height !== Math.round(rect.rh)) {
-    overlay.width = Math.max(1, Math.round(rect.rw));
-    overlay.height = Math.max(1, Math.round(rect.rh));
+  const width = Math.max(1, Math.round(rect.rw));
+  const height = Math.max(1, Math.round(rect.rh));
+  if (overlay.width !== width || overlay.height !== height) {
+    overlay.width = width;
+    overlay.height = height;
   }
   ctx.clearRect(0, 0, overlay.width, overlay.height);
   if (pass < 1) return;
   if (pass === 2) {
-  const boxes = boxesAt(vid.currentTime || 0);
-  ctx.lineWidth = 3;
-  ctx.font = "600 16px sans-serif";
-  for (const box of boxes) {
-    const x = rect.x + box.x * rect.w;
-    const y = rect.y + box.y * rect.h;
-    const w = box.w * rect.w;
-    const h = box.h * rect.h;
-    ctx.strokeStyle = "#f0b429";
-    ctx.strokeRect(x, y, w, h);
-    ctx.fillStyle = "#f0b429";
-    ctx.fillText(box.label || "", x + 4, Math.max(18, y - 6));
+    const boxes = boxesAt(vid.currentTime || 0);
+    ctx.lineWidth = 3;
+    for (const box of boxes) {
+      const x = rect.x + box.x * rect.w;
+      const y = rect.y + box.y * rect.h;
+      const w = box.w * rect.w;
+      const h = box.h * rect.h;
+      ctx.strokeStyle = "#e7ff6a";
+      ctx.strokeRect(x, y, w, h);
+      if (box.label) paintLabel(box.label, x, y, rect);
+    }
   }
-  }
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
   clicks.forEach((mark, i) => {
     const x = mark.x == null ? rect.x + rect.w * 0.5 : rect.x + mark.x * rect.w;
     const y = mark.y == null ? rect.y + rect.h * 0.82 : rect.y + mark.y * rect.h;
     ctx.beginPath();
-    ctx.arc(x, y, 9, 0, Math.PI * 2);
-    ctx.fillStyle = "rgba(125,206,160,0.95)";
+    ctx.arc(x, y, 10, 0, Math.PI * 2);
+    ctx.fillStyle = "rgba(182, 227, 168, 0.95)";
     ctx.fill();
     ctx.lineWidth = 2;
-    ctx.strokeStyle = "#ffffff";
+    ctx.strokeStyle = "#17200a";
     ctx.stroke();
-    ctx.fillStyle = "#102117";
-    ctx.font = "12px sans-serif";
-    ctx.fillText(String(i + 1), x - 3, y + 4);
+    ctx.fillStyle = "#17200a";
+    ctx.font = "600 12px IBM Plex Sans, sans-serif";
+    ctx.fillText(String(i + 1), x, y);
   });
+  ctx.textAlign = "left";
+  ctx.textBaseline = "alphabetic";
 }
 
 function resetPass() {
@@ -933,116 +1481,246 @@ function resetPass() {
   boxPack = null;
   seekGuard = false;
   renderClicks();
+  desk.classList.remove("review");
   $("ask").classList.add("hidden");
   $("rating").textContent = "";
   $("banner").classList.add("hidden");
+  $("banner").textContent = "";
   $("again").classList.add("hidden");
   $("timeline").classList.add("hidden");
   $("timeline").setAttribute("aria-hidden", "true");
   $("timeline").innerHTML = "";
-  $("hit").classList.add("on");
-  $("hit").textContent = "Start the clip";
+  $("hazardBtn").classList.remove("hidden");
   $("hazardBtn").disabled = true;
+  $("hazardBtn").textContent = "I see a hazard";
   document.querySelectorAll("#choices button").forEach((b) => {
     b.classList.remove("on");
     b.disabled = true;
   });
-  vid.pause();
+  setHit("Start the clip");
+  try { vid.pause(); } catch (e) {}
   try { vid.currentTime = 0; } catch (e) {}
   paint();
 }
 
 function showModes() {
   playToken += 1;
+  generation += 1;
+  loadingClip = false;
   counting = false;
+  advancing = false;
+  pass = 0;
   modeId = "";
   clipData = null;
+  document.body.classList.remove("in-test");
+  desk.classList.remove("review");
+  try { vid.pause(); } catch (e) {}
   vid.removeAttribute("src");
   vid.load();
   $("modes").classList.remove("hidden");
-  $("desk").classList.add("hidden");
+  desk.classList.add("hidden");
   $("meta").textContent = "Choose Driving, Forklift driver, or Warehouse walk.";
   clearError();
+  syncDone();
 }
 
 async function loadMode(mode) {
   const token = ++playToken;
+  generation += 1;
+  const gen = generation;
+  const another = seenSources.length > 0;
   modeId = mode;
   counting = false;
+  advancing = false;
+  pass = 0;
+  loadingClip = true;
   clearError();
+  try { vid.pause(); } catch (e) {}
+  $("hazardBtn").disabled = true;
   document.querySelectorAll(".mode").forEach((btn) => { btn.disabled = true; });
-  $("meta").textContent = "Finding a clip for this mode…";
+  if (another) {
+    vid.removeAttribute("src");
+    try { vid.load(); } catch (e) {}
+    $("modes").classList.add("hidden");
+    desk.classList.remove("hidden");
+    desk.classList.remove("review");
+    document.body.classList.add("in-test");
+    $("ask").classList.add("hidden");
+    $("banner").classList.add("hidden");
+    $("timeline").classList.add("hidden");
+    $("count").classList.add("hidden");
+    setHit("Different clip");
+    $("meta").textContent = "Different clip. This is not the one you just watched.";
+  } else {
+    $("meta").textContent = "Finding a clip for this mode…";
+  }
   try {
     const res = await fetch("api/clip", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({mode}),
+      body: JSON.stringify({mode, seen: seenSources}),
     });
-    const data = await res.json();
-    if (token !== playToken) return;
+    const data = await readJson(res);
+    if (token !== playToken || gen !== generation) return;
     if (!res.ok) throw new Error(data.error || "Could not load a clip");
+    const already = (data.source && seenSources.indexOf(data.source) >= 0)
+      || (data.video && seenSources.indexOf(data.video) >= 0);
+    if (already) throw new Error("This mode only has one eligible clip in the archive.");
     clipData = data;
+    rememberSeen(data.source);
+    rememberSeen(data.video);
     $("modes").classList.add("hidden");
-    $("desk").classList.remove("hidden");
+    desk.classList.remove("hidden");
+    document.body.classList.add("in-test");
     vid.src = clipData.stream;
     resetPass();
-    $("meta").textContent = clipData.mode_name + " · " + clipData.place + ". Click or press Space when you see a hazard.";
+    const place = clipData.place || "this place";
+    if (another) {
+      $("meta").textContent = "Different clip · " + clipData.mode_name + " · " + place + ". Click or press Space when you see a hazard.";
+    } else {
+      $("meta").textContent = clipData.mode_name + " · " + place + ". Click or press Space when you see a hazard.";
+    }
     focusClip();
   } catch (err) {
-    if (token !== playToken) return;
-    $("meta").textContent = "The mode did not load a clip.";
-    showError(String(err.message || err));
+    if (token !== playToken || gen !== generation) return;
+    const message = String(err.message || err);
+    if (message.indexOf("only one eligible clip") >= 0 || message.indexOf("already used in this session") >= 0) {
+      showError(message);
+      $("meta").textContent = message;
+      setHit("");
+      return;
+    }
+    showError(message);
+    if (clipData) {
+      if (clipData.stream) vid.src = clipData.stream;
+      $("meta").textContent = another
+        ? "Could not load a different clip. You can start this one again."
+        : "Could not load another clip. You can start this one again.";
+      document.body.classList.add("in-test");
+      desk.classList.remove("hidden");
+      resetPass();
+    } else {
+      document.body.classList.remove("in-test");
+      $("meta").textContent = another ? "Could not load a different clip." : "The mode did not load a clip.";
+    }
   } finally {
+    if (token === playToken) loadingClip = false;
     document.querySelectorAll(".mode").forEach((btn) => { btn.disabled = false; });
   }
+}
+
+function playFromStart() {
+  const token = playToken;
+  try { vid.pause(); } catch (e) {}
+  let started = false;
+  const begin = () => {
+    if (started || token !== playToken) return;
+    if ((vid.currentTime || 0) > 0.3) return;
+    started = true;
+    vid.removeEventListener("seeked", onSeeked);
+    seekGuard = false;
+    const playing = vid.play();
+    if (playing && playing.catch) {
+      playing.catch(() => {
+        if (token !== playToken) return;
+        setHit("Play the clip");
+        showError("The clip did not start. Click the picture to play it.");
+      });
+    }
+  };
+  const onSeeked = () => begin();
+  if ((vid.currentTime || 0) <= 0.05) {
+    begin();
+    return;
+  }
+  seekGuard = true;
+  vid.addEventListener("seeked", onSeeked);
+  try { vid.currentTime = 0; }
+  catch (e) {
+    vid.removeEventListener("seeked", onSeeked);
+    seekGuard = false;
+    started = true;
+    const playing = vid.play();
+    if (playing && playing.catch) playing.catch(() => {});
+    return;
+  }
+  setTimeout(() => {
+    if (started || token !== playToken) return;
+    if ((vid.currentTime || 0) > 0.3) {
+      try { vid.currentTime = 0; } catch (err) {}
+      setTimeout(begin, 250);
+      return;
+    }
+    begin();
+  }, 700);
 }
 
 function startPass(which) {
   if (!clipData) return;
   pass = which;
-  $("hit").classList.remove("on");
-  $("hit").textContent = "";
+  playToken += 1;
+  $("count").classList.add("hidden");
+  setHit("");
   if (which === 2) {
+    desk.classList.add("review");
     const note = (boxPack && boxPack.note) || "Second pass.";
     $("banner").textContent = note;
     $("banner").classList.remove("hidden");
     $("ask").classList.remove("hidden");
     document.querySelectorAll("#choices button").forEach((b) => {
-      b.disabled = false;
+      b.disabled = answered;
       b.classList.toggle("on", b.dataset.id === pending);
     });
     $("hazardBtn").disabled = true;
+    $("hazardBtn").classList.add("hidden");
     $("meta").textContent = "Second pass. " + note + " Press 1 to 5, then Enter.";
   } else {
+    desk.classList.remove("review");
+    $("banner").classList.add("hidden");
+    $("hazardBtn").classList.remove("hidden");
     $("hazardBtn").disabled = false;
     $("meta").textContent = clipData.mode_name + ". Space marks a hazard. Drag the bar to scrub. Enter opens the second pass.";
     fetch("api/prime?id=" + encodeURIComponent(clipData.id)).catch(() => {});
   }
-  seekGuard = false;
-  playToken += 1;
-  try { vid.currentTime = 0; } catch (e) {}
   drawBar();
   paint();
-  const playing = vid.play();
-  if (playing && playing.catch) playing.catch(() => {});
+  playFromStart();
   focusClip();
 }
 
 function countdownThen(which) {
-  if (counting || !clipData) return;
+  if (loadingClip || counting || !clipData) return;
   counting = true;
   const token = ++playToken;
+  const gen = generation;
   vid.muted = true;
-  const attempt = vid.play();
-  if (attempt && attempt.then) {
-    attempt.then(() => { if (token === playToken && counting) vid.pause(); }).catch(() => {});
-  }
+  setHit("");
+  const prime = () => {
+    if (token !== playToken || !counting) return;
+    const attempt = vid.play();
+    if (attempt && attempt.then) {
+      attempt.then(() => { if (token === playToken && counting) vid.pause(); }).catch(() => {});
+    }
+  };
+  try {
+    if ((vid.currentTime || 0) > 0.05) {
+      const onSeeked = () => {
+        vid.removeEventListener("seeked", onSeeked);
+        prime();
+      };
+      vid.addEventListener("seeked", onSeeked);
+      vid.currentTime = 0;
+    } else {
+      prime();
+    }
+  } catch (e) { prime(); }
   let n = 3;
   const el = $("count");
   el.classList.remove("hidden");
   el.textContent = String(n);
+  $("meta").textContent = "Starting in " + n + ".";
   const timer = setInterval(() => {
-    if (token !== playToken) {
+    if (token !== playToken || gen !== generation) {
       clearInterval(timer);
       el.classList.add("hidden");
       counting = false;
@@ -1057,11 +1735,12 @@ function countdownThen(which) {
       return;
     }
     el.textContent = String(n);
-  }, 700);
+    $("meta").textContent = "Starting in " + n + ".";
+  }, 1000);
 }
 
 function noteClick(ev) {
-  if (pass !== 1 || !Number.isFinite(vid.currentTime)) return;
+  if (counting || advancing || pass !== 1 || clicks.length >= 12 || !Number.isFinite(vid.currentTime)) return;
   let x = null;
   let y = null;
   if (ev && ev.clientX != null) {
@@ -1101,12 +1780,23 @@ function submitSelected() {
   choose(pending, btn);
 }
 
+function resumeIfNeeded() {
+  if (!$("hit").classList.contains("on") || !vid.paused) return false;
+  const playing = vid.play();
+  if (playing && playing.then) playing.then(() => setHit("")).catch(() => {});
+  return true;
+}
+
 $("hit").onclick = (ev) => {
+  if (loadingClip) return;
   focusClip();
+  if (counting) return;
   if (pass === 0) countdownThen(1);
+  else if (resumeIfNeeded()) return;
   else noteClick(ev);
 };
 $("hazardBtn").onclick = () => {
+  if (loadingClip || pass !== 1 || counting) return;
   noteClick(null);
   focusClip();
 };
@@ -1122,7 +1812,7 @@ document.querySelectorAll("#choices button").forEach((btn) => {
 });
 
 document.addEventListener("keydown", (ev) => {
-  if (!clipFocused()) return;
+  if (loadingClip || !keysApply()) return;
   const key = ev.key;
   const nudge = key === "ArrowLeft" ? -1 : key === "ArrowRight" ? 1 : 0;
   if (nudge) {
@@ -1136,11 +1826,15 @@ document.addEventListener("keydown", (ev) => {
   const action = KEYS[key];
   const enter = key === "Enter";
   if (!marking && !action && !enter) return;
+  const button = ev.target && ev.target.closest && ev.target.closest("button");
+  const markTarget = !!(ev.target && (ev.target.id === "hit" || ev.target.id === "hazardBtn" || (ev.target.closest && ev.target.closest("#hit"))));
+  if (button && !markTarget && (marking || enter)) return;
   ev.preventDefault();
   ev.stopPropagation();
   if (counting) return;
   if (marking) {
     if (pass === 0) countdownThen(1);
+    else if (pass === 1 && resumeIfNeeded()) return;
     else if (pass === 1) noteClick(null);
     return;
   }
@@ -1157,12 +1851,25 @@ vid.ontimeupdate = () => {
   if (pass >= 1) paint();
 };
 
+vid.addEventListener("error", () => {
+  if (!clipData || desk.classList.contains("hidden")) return;
+  if (!(vid.currentSrc || vid.src)) return;
+  counting = false;
+  pass = 0;
+  $("count").classList.add("hidden");
+  setHit("Try again");
+  $("again").classList.remove("hidden");
+  $("meta").textContent = "The clip failed to load.";
+  showError("This clip did not load. Try another clip or change mode.");
+});
+
 async function beginSecond() {
-  if (pass !== 1 || advancing || !clipData) return;
+  if (loadingClip || pass !== 1 || advancing || !clipData) return;
   advancing = true;
+  const token = playToken;
+  const gen = generation;
   $("hazardBtn").disabled = true;
   $("meta").textContent = "Loading the main hazard…";
-  const token = playToken;
   try {
     const res = await fetch("api/hazard", {
       method: "POST",
@@ -1170,15 +1877,24 @@ async function beginSecond() {
       body: JSON.stringify({
         id: clipData.id,
         clicks,
-        duration: vid.duration || clipData.duration,
+        duration: durationOf() || clipData.duration,
       }),
     });
-    const data = await res.json();
-    if (token !== playToken) return;
+    const data = await readJson(res);
+    if (token !== playToken || gen !== generation || pass !== 1) {
+      advancing = false;
+      return;
+    }
     if (!res.ok) throw new Error(data.error || data.note || "Could not read detections");
+    if (Array.isArray(data.frames)) {
+      data.frames = data.frames.slice().sort((a, b) => (a.t || 0) - (b.t || 0));
+    }
     boxPack = data;
   } catch (err) {
-    if (token !== playToken) return;
+    if (token !== playToken || gen !== generation || pass !== 1) {
+      advancing = false;
+      return;
+    }
     boxPack = {
       sidecar: false,
       frames: [],
@@ -1188,17 +1904,21 @@ async function beginSecond() {
     };
     showError(String(err.message || err));
   }
-  if (token !== playToken) return;
+  if (token !== playToken || gen !== generation || pass !== 1) {
+    advancing = false;
+    return;
+  }
   countdownThen(2);
 }
 
 vid.onended = () => {
+  if (loadingClip) return;
   if (seekGuard) {
     seekGuard = false;
     clearTimeout(seekTo.timer);
     return;
   }
-  if (pass === 1) beginSecond();
+  if (pass === 1 && !counting && !advancing) beginSecond();
 };
 
 (function bindScrub() {
@@ -1240,24 +1960,39 @@ async function choose(id, btn) {
         id: clipData.id,
         clicks,
         action: id,
-        duration: vid.duration || clipData.duration,
+        duration: durationOf() || clipData.duration,
       }),
     });
-    const data = await res.json();
+    const data = await readJson(res);
     if (!res.ok) throw new Error(data.error || "Score failed");
-    $("rating").textContent = "Score " + data.points + " out of 5. " + data.sentence;
+    const points = Number.isFinite(data.points) ? data.points : 0;
+    const line = "Score " + points + " out of 5. " + (data.sentence || "");
+    $("rating").textContent = line;
+    $("meta").textContent = line;
+    sessionScores.push(points);
+    document.querySelectorAll("#choices button").forEach((b) => { b.disabled = true; });
     $("again").classList.remove("hidden");
+    syncDone();
   } catch (err) {
     answered = false;
     $("rating").textContent = String(err.message || err);
+    showError(String(err.message || err));
   }
 }
 
 $("again").onclick = () => { if (modeId) loadMode(modeId); };
 $("change").onclick = () => showModes();
+$("done").onclick = () => showDone();
+$("resultModes").onclick = () => {
+  stopConfetti();
+  $("result").classList.add("hidden");
+  showModes();
+};
+window.addEventListener("resize", () => { if (pass >= 1) paint(); });
 </script>
 </body>
 </html>
+
 """
 
 
@@ -1279,7 +2014,7 @@ def api_clip():
     if mode not in MODES:
         return jsonify({"error": "Choose driving, forklift, or walk", "modes": [item["name"] for item in MODES.values()]}), 400
     try:
-        row = _load_clip(mode)
+        row = _load_clip(mode, _seen_sources(payload.get("seen")))
     except Exception as exc:
         return jsonify({"error": str(exc)}), 503
     return jsonify(_public_clip(row))
@@ -1329,6 +2064,14 @@ def api_review():
     return jsonify(scored)
 
 
+def _media_type(header: str | None) -> str:
+    """Browsers reject a clip whose type is binary/octet-stream."""
+    raw = (header or "").split(";", 1)[0].strip().lower()
+    if raw.startswith("video/"):
+        return raw
+    return "video/mp4"
+
+
 @app.get("/api/stream")
 def stream_clip():
     source = request.args.get("source", "")
@@ -1338,19 +2081,22 @@ def stream_clip():
         token = _login()
     except Exception as exc:
         return jsonify({"error": str(exc)}), 503
+    upstream_headers = {"Accept-Encoding": "identity"}
+    if request.headers.get("Range"):
+        upstream_headers["Range"] = request.headers["Range"]
     upstream = requests.get(
         f"{VSS_URL}/api/v1/videos/stream",
         params={"source": source, "token": token},
         stream=True,
         timeout=120,
-        headers={"Range": request.headers.get("Range", "")} if request.headers.get("Range") else {},
+        headers=upstream_headers,
     )
     if upstream.status_code >= 400:
         body = upstream.content
         upstream.close()
         return Response(body, status=upstream.status_code)
     headers = {
-        "Content-Type": upstream.headers.get("Content-Type", "video/mp4"),
+        "Content-Type": _media_type(upstream.headers.get("Content-Type")),
         "Accept-Ranges": "bytes",
         "Cache-Control": "private, max-age=300",
     }
@@ -1478,6 +2224,76 @@ def _self_check() -> None:
     assert "function seekTo" in PAGE and "bindScrub" in PAGE and "seekGuard" in PAGE
     assert "if (pass === 2)" in PAGE and "if (pass < 1) return" in PAGE
     assert "Drag the bar" in PAGE
+    assert "Different clip" in PAGE and "seen" in PAGE
+    assert "only one eligible clip" in PAGE
+    assert "Congratulations you scored" in PAGE
+    assert "seekGuard && !atEnd" not in PAGE
+    assert 'id="done"' in PAGE
+    assert "function startConfetti" in PAGE
+    assert _score_total([5, 3]) == "8/10"
+    assert _media_type("binary/octet-stream") == "video/mp4"
+    assert _media_type("video/mp4") == "video/mp4"
+    assert _media_type("video/webm; charset=binary") == "video/webm"
+    assert _media_type(None) == "video/mp4"
+    sample = {
+        "chunk_results": [
+            {
+                "preview_source": "s3://bucket/one.mp4",
+                "location": "new_york",
+                "camera_id": "nyc_streets_cam-1",
+                "capture_type": "streets",
+                "similarity_score": 0.9,
+            },
+            {
+                "preview_source": "s3://bucket/two.mp4",
+                "location": "new_york",
+                "camera_id": "nyc_streets_cam-1",
+                "capture_type": "streets",
+                "similarity_score": 0.4,
+            },
+        ]
+    }
+    kept = _best_chunk("driving", sample, {"s3://bucket/one.mp4"})
+    assert kept is not None and kept[0]["preview_source"].endswith("two.mp4")
+    assert _best_chunk("driving", sample, {"s3://bucket/one.mp4", "s3://bucket/two.mp4"}) is None
+    assert _seen_sources(["s3://bucket/one.mp4", "nope", "s3://bucket/two.mp4"]) == {
+        "s3://bucket/one.mp4",
+        "s3://bucket/two.mp4",
+    }
+    assert _video_identity("s3://bucket/ride_chunk_0000.mp4") == _video_identity(
+        "s3://bucket/ride_chunk_0004.mp4", "s3://bucket/ride.mp4"
+    )
+    parent = {
+        "chunk_results": [
+            {
+                "preview_source": "s3://bucket/ride_chunk_0000.mp4",
+                "original_video": "s3://bucket/ride.mp4",
+                "location": "new_york",
+                "camera_id": "nyc_streets_cam-1",
+                "capture_type": "streets",
+                "similarity_score": 0.95,
+            },
+            {
+                "preview_source": "s3://bucket/ride_chunk_0004.mp4",
+                "original_video": "s3://bucket/ride.mp4",
+                "location": "new_york",
+                "camera_id": "nyc_streets_cam-1",
+                "capture_type": "streets",
+                "similarity_score": 0.9,
+            },
+            {
+                "preview_source": "s3://bucket/other_street.mp4",
+                "original_video": "s3://bucket/other_street.mp4",
+                "location": "new_york",
+                "camera_id": "nyc_streets_cam-1",
+                "capture_type": "streets",
+                "similarity_score": 0.3,
+            },
+        ]
+    }
+    other = _best_chunk("driving", parent, {"s3://bucket/ride_chunk_0000.mp4"})
+    assert other is not None and other[0]["preview_source"].endswith("other_street.mp4"), other
+    assert _search_body("person crossing", {"capture_type": "streets"}, 80)["top_k"] == 80
 
 
 if __name__ == "__main__":
