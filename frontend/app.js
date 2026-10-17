@@ -324,9 +324,10 @@ async function openReport(card, hit, lang) {
   const title = lang === "de" ? "Bericht (Deutsch)" : "Report (English)";
   const filename = safeName(hit.segment_id) + "-" + lang + ".txt";
   try {
-    const response = await fetch(apiUrl("api/hits/" + encodeURIComponent(hit.segment_id) + "/report?lang=" + lang), {
-      method: "POST",
-    });
+    const response = await fetch(
+      apiUrl("api/hits/report?lang=" + encodeURIComponent(lang) + "&segment_id=" + encodeURIComponent(hit.segment_id)),
+      { method: "POST" }
+    );
     const body = await response.json();
     if (!response.ok) {
       showPanel(card, title, (body.error || "Report failed.") + "\n" + (body.hint || ""), filename, "text/plain");
@@ -342,9 +343,10 @@ async function openReport(card, hit, lang) {
 async function openTicket(card, hit) {
   const filename = safeName(hit.segment_id) + "-ticket.json";
   try {
-    const response = await fetch(apiUrl("api/hits/" + encodeURIComponent(hit.segment_id) + "/ticket"), {
-      method: "POST",
-    });
+    const response = await fetch(
+      apiUrl("api/hits/ticket?segment_id=" + encodeURIComponent(hit.segment_id)),
+      { method: "POST" }
+    );
     const body = await response.json();
     if (!response.ok) {
       showPanel(card, "Create ticket", (body.error || "Ticket failed.") + "\n" + (body.hint || ""), filename, "application/json");

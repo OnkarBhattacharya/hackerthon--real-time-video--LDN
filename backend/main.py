@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -47,10 +47,44 @@ class InvestigateBody(BaseModel):
     max_hits: int | None = Field(default=None, ge=1, le=40)
 
 
+def _health_body() -> dict:
+    """Build the health payload shared by /health and /api/health."""
+    ready = settings.use_fixture() or settings.vss_configured()
+    indexed = None
+    if ready:
+        try:
+            indexed = get_client().indexed_segment_count()
+        except Exception:
+            logger.info("health indexed count unavailable")
+            indexed = None
+    snapshot = load_snapshot()
+    body: dict = {
+        "status": "ok" if ready else "missing_config",
+        "service": "near-miss-investigation",
+        "ok": ready,
+        "features": {
+            "crop": CROP_AVAILABLE,
+            "audio": AUDIO_AVAILABLE,
+            "webhook": settings.ticket_webhook_url() is not None,
+            "fixture": settings.use_fixture(),
+        },
+        "indexed_segments": indexed,
+        "generated_at": snapshot.get("generated_at") if snapshot else None,
+    }
+    if not ready:
+        body["missing"] = settings.missing_vss()
+    return body
+
+
 def create_app() -> FastAPI:
     """Build the app. Routes stay unprefixed so an ingress can rewrite /app to /."""
     app = FastAPI(title="Near-miss investigation", version="0.2.0")
     app.include_router(_router(), prefix="/api")
+
+    @app.get("/health")
+    def health_root() -> dict:
+        """Liveness for the guest-card probe. Must stay at /health (not under /api)."""
+        return _health_body()
 
     @app.exception_handler(ApiError)
     def _api_error(_request: Request, exc: ApiError) -> JSONResponse:
@@ -99,29 +133,7 @@ def _router():
     @router.get("/health")
     def health() -> dict:
         """Return service status and which optional features are available."""
-        ready = settings.use_fixture() or settings.vss_configured()
-        indexed = None
-        if ready:
-            try:
-                indexed = get_client().indexed_segment_count()
-            except Exception:
-                logger.info("health indexed count unavailable")
-                indexed = None
-        snapshot = load_snapshot()
-        body: dict = {
-            "status": "ok" if ready else "missing_config",
-            "features": {
-                "crop": CROP_AVAILABLE,
-                "audio": AUDIO_AVAILABLE,
-                "webhook": settings.ticket_webhook_url() is not None,
-                "fixture": settings.use_fixture(),
-            },
-            "indexed_segments": indexed,
-            "generated_at": snapshot.get("generated_at") if snapshot else None,
-        }
-        if not ready:
-            body["missing"] = settings.missing_vss()
-        return body
+        return _health_body()
 
     @router.post("/investigate")
     def investigate(body: InvestigateBody) -> dict[str, str]:
@@ -150,13 +162,9 @@ def _router():
             )
         return payload
 
-    @router.get("/hits/{segment_id}")
-    def hit(segment_id: str) -> dict:
-        """Return one evidence hit."""
-        return _require_hit(segment_id)
-
-    @router.post("/hits/{segment_id}/report")
-    def report(segment_id: str, lang: str = "en") -> dict[str, str]:
+    # Prefer query ?segment_id= so s3:// URIs survive the guest proxy (path slash issues).
+    @router.post("/hits/report")
+    def report(segment_id: str = Query(...), lang: str = "en") -> dict[str, str]:
         """Return the English or German report."""
         if lang not in {"en", "de"}:
             raise ApiError(400, "Unsupported report language.", "Use lang=en or lang=de.")
@@ -166,8 +174,8 @@ def _router():
             return english.to_dict()
         return translate_report(english, hit=evidence).to_dict()
 
-    @router.post("/hits/{segment_id}/ticket")
-    def ticket(segment_id: str) -> dict:
+    @router.post("/hits/ticket")
+    def ticket(segment_id: str = Query(...)) -> dict:
         """Return the ticket payload, posting it when a webhook is configured."""
         evidence = evidence_from_dict(_require_hit(segment_id))
         try:
@@ -178,6 +186,27 @@ def _router():
                 str(exc),
                 "The ticket was not delivered. Check the webhook service and try again.",
             ) from exc
+
+    @router.get("/hits/by-id")
+    def hit(segment_id: str = Query(...)) -> dict:
+        """Return one evidence hit."""
+        return _require_hit(segment_id)
+
+    # Path forms kept for short fixture ids (no slashes).
+    @router.post("/hits/{segment_id}/report")
+    def report_path(segment_id: str, lang: str = "en") -> dict[str, str]:
+        """Path-param report for simple segment ids."""
+        return report(segment_id=segment_id, lang=lang)
+
+    @router.post("/hits/{segment_id}/ticket")
+    def ticket_path(segment_id: str) -> dict:
+        """Path-param ticket for simple segment ids."""
+        return ticket(segment_id=segment_id)
+
+    @router.get("/hits/{segment_id}")
+    def hit_path(segment_id: str) -> dict:
+        """Path-param hit for simple segment ids."""
+        return _require_hit(segment_id)
 
     @router.get("/fixture/sample.mp4")
     def fixture_clip() -> FileResponse:

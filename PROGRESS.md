@@ -42,4 +42,20 @@ The investigation API and one-page UI are implemented. Stages 1–4 are the `bac
 
 ## Stage 7
 
-Not deployed. This machine has no team kubeconfig and no `INGRESS_URL`. The app can be shown from a local server. `SUBMISSION.md` is not written yet.
+Deployed to namespace `team-41` without a registry build:
+
+- Deployment/Service: `near-miss-app` (python:3.12-slim + ConfigMap `near-miss-app-code` tarball)
+- Secret: `near-miss-app-vss-creds` with in-cluster `VSS_URL=http://video-backend-service:8000` plus login and `WANDB_API_KEY`
+- Did **not** overwrite `hackathon-app-code` or add an Ingress
+- Guest card: `kubectl -n team-41 set env deploy/hackathon-app GUEST_UPSTREAM=http://near-miss-app:80`
+
+Verified on `http://video-lab-team-41.cosmos.vastdata.com/app/guest/`:
+
+- `/health` → `"service":"near-miss-investigation"`, 612 indexed segments (not video-ask)
+- UI title “Near-miss investigation”, Investigate control present
+- Live investigate (cameras `sdg_warehouse_cam-2`, `pie_cam-3`, `sf_streets_cam-5`) job `0980a83b-32c6-471d-ba27-d6a7f309c330` succeeded with 6 hits; missing previous neighbour labelled; event clip `206` via guest `api/stream`
+- Guest English report, German report (model + disclaimer), ticket download (`posted: false`)
+
+Also fixed deploy blockers: root `/health` for the probe; report/ticket use `?segment_id=` so `s3://` ids survive the guest proxy.
+
+`README.md` and `SUBMISSION.md` updated for this guest-card deploy.

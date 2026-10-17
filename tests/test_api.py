@@ -47,11 +47,11 @@ def test_investigation_flow():
         assert body["status"] == "succeeded", body
         assert len(body["hits"]) >= 6
         segment_id = body["hits"][0]["segment_id"]
-        hit = client.get(f"/api/hits/{segment_id}")
+        hit = client.get("/api/hits/by-id", params={"segment_id": segment_id})
         assert hit.status_code == 200
-        english = client.post(f"/api/hits/{segment_id}/report?lang=en")
-        german = client.post(f"/api/hits/{segment_id}/report?lang=de")
-        ticket = client.post(f"/api/hits/{segment_id}/ticket")
+        english = client.post("/api/hits/report", params={"segment_id": segment_id, "lang": "en"})
+        german = client.post("/api/hits/report", params={"segment_id": segment_id, "lang": "de"})
+        ticket = client.post("/api/hits/ticket", params={"segment_id": segment_id})
         assert english.status_code == 200
         assert segment_id in english.json()["text"]
         assert german.status_code == 200
