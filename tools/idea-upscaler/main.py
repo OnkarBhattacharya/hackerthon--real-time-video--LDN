@@ -505,12 +505,30 @@ def _run_ffmpeg(args: list[str], cwd: Path | None = None) -> None:
         raise RuntimeError((proc.stderr or proc.stdout or "ffmpeg failed")[-500:])
 
 
+VOICES = {
+    "en-us+f3": "US female",
+    "en-us+m3": "US male",
+    "en-gb+f2": "UK female",
+    "en-gb+m3": "UK male",
+}
+
+
+def _has_audio(path: Path) -> bool:
+    proc = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries", "stream=index", "-of", "csv=p=0", str(path)],
+        capture_output=True, text=True,
+    )
+    return bool(proc.stdout.strip())
+
+
 def _render_same_length_cut(
     source_clips: list[dict[str, Any]],
     match_sources: list[str],
     transcript: str,
+    voice: str | None = "en-us+f3",
+    bed: float = 0.22,
 ) -> dict[str, Any]:
-    """Concat archive matches. Match the upload length when there is one; otherwise 4s per shot. Burn VO lines."""
+    """Concat archive matches and keep their audio. Speak the VO over a quieter bed."""
     picks: list[str] = []
     seen: set[str] = set()
     for src in match_sources:
@@ -541,12 +559,23 @@ def _render_same_length_cut(
         raw = work / f"raw_{i}.mp4"
         _download_mp4(src, raw)
         norm = work / f"norm_{i}.mp4"
-        _run_ffmpeg([
-            "ffmpeg", "-y", "-i", str(raw),
-            "-vf", "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=24",
-            "-an", "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
-            str(norm),
-        ])
+        scale = "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=24"
+        if _has_audio(raw):
+            _run_ffmpeg([
+                "ffmpeg", "-y", "-i", str(raw), "-vf", scale,
+                "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-ar", "44100", "-ac", "2",
+                str(norm),
+            ])
+        else:
+            _run_ffmpeg([
+                "ffmpeg", "-y", "-i", str(raw),
+                "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo", "-shortest",
+                "-vf", scale, "-map", "0:v", "-map", "1:a",
+                "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-ar", "44100", "-ac", "2",
+                str(norm),
+            ])
         out = work / f"trim_{i}.mp4"
         dur = _probe_duration(norm)
         cmd = ["ffmpeg", "-y"]
@@ -554,7 +583,8 @@ def _render_same_length_cut(
             cmd += ["-stream_loop", "-1"]
         cmd += [
             "-i", str(norm), "-t", f"{slice_len:.3f}",
-            "-an", "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+            "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-ar", "44100", "-ac", "2",
             str(out),
         ]
         _run_ffmpeg(cmd)
@@ -583,18 +613,43 @@ def _render_same_length_cut(
             "'FontName=DejaVu Sans,FontSize=28,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=2,Alignment=2'"
         )
 
-    _run_ffmpeg([
-        "ffmpeg", "-y", "-i", str(concat),
-        "-vf", vf, "-t", f"{target:.3f}",
-        "-an", "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
-        str(work / "cut.mp4"),
-    ], cwd=work)
+    spoken = voice in VOICES and bool(lines)
+    if spoken:
+        text = ". ".join(lines)
+        wav = work / "vo.wav"
+        proc = subprocess.run(
+            ["espeak-ng", "-v", voice, "-s", "150", "-w", str(wav), text],
+            capture_output=True, text=True,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError((proc.stderr or "espeak-ng failed")[-400:])
+        bed_v = min(0.8, max(0.05, bed))
+        _run_ffmpeg([
+            "ffmpeg", "-y", "-i", str(concat), "-i", str(wav),
+            "-filter_complex",
+            f"[0:a]volume={bed_v:.2f}[bed];[1:a]apad,volume=1.0[vo];[bed][vo]amix=inputs=2:duration=first:dropout_transition=0[a]",
+            "-map", "0:v", "-map", "[a]",
+            "-vf", vf, "-t", f"{target:.3f}",
+            "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-ar", "44100", "-ac", "2",
+            str(work / "cut.mp4"),
+        ], cwd=work)
+    else:
+        _run_ffmpeg([
+            "ffmpeg", "-y", "-i", str(concat),
+            "-vf", vf, "-t", f"{target:.3f}",
+            "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-ar", "44100", "-ac", "2",
+            str(work / "cut.mp4"),
+        ], cwd=work)
     return {
         "id": cut_id,
         "url": f"{APP_PREFIX}/api/cuts/{cut_id}",
         "target_duration_sec": round(target, 2),
         "pieces": len(trimmed),
-        "vo": bool(lines),
+        "vo": spoken,
+        "voice": voice if spoken else "off",
+        "bed": bed,
     }
 
 
@@ -636,6 +691,13 @@ def upscale():
         logline = (payload.get("logline") or "").strip()
         beats = (payload.get("beats") or "").strip()
         transcript = (payload.get("transcript") or "").strip()
+        voice = (payload.get("voice") or "en-us+f3").strip()
+        if voice != "off" and voice not in VOICES:
+            voice = "en-us+f3"
+        try:
+            bed = float(payload.get("bed") if payload.get("bed") is not None else 0.22)
+        except (TypeError, ValueError):
+            bed = 0.22
         seed_from_upload = bool(payload.get("seed_from_upload"))
         upload_tag = (payload.get("upload_tag") or "shittyvideo").strip() or "shittyvideo"
 
@@ -724,6 +786,8 @@ def upscale():
                     (source_upload or {}).get("clips") or [],
                     match_sources,
                     transcript,
+                    None if voice == "off" else voice,
+                    bed,
                 )
             except Exception as e:
                 render_error = str(e)
@@ -793,6 +857,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
     .grid.results { grid-template-columns: 260px 1fr; min-height: 420px; }
   }
   label { display: block; font-size: 0.78rem; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: var(--muted); margin-bottom: 6px; }
+  select { font: inherit; padding: 8px 10px; border: 1px solid var(--line); background: var(--panel); color: var(--ink); }
   textarea {
     width: 100%; border: 1px solid var(--line); background: var(--panel);
     border-radius: 2px; padding: 12px 14px; font: inherit; color: var(--ink);
@@ -870,6 +935,26 @@ INDEX_HTML = r"""<!DOCTYPE html>
         <textarea id="beats" placeholder="Wide city canyon at dusk&#10;Bike lane tracking, yellow jacket ahead&#10;Crosswalk pause, phone glow&#10;Night close on helmet reflection"></textarea>
         <label for="transcript" style="margin-top:12px">Director VO / dialogue (optional)</label>
         <textarea id="transcript" placeholder="I kept the camera rolling… we were already gone before we left."></textarea>
+        <div class="actions" style="margin-top:12px">
+          <div>
+            <label for="voice">Voice</label>
+            <select id="voice">
+              <option value="en-us+f3">US female</option>
+              <option value="en-us+m3">US male</option>
+              <option value="en-gb+f2">UK female</option>
+              <option value="en-gb+m3">UK male</option>
+              <option value="off">No voiceover</option>
+            </select>
+          </div>
+          <div>
+            <label for="bed">Footage audio under the voice</label>
+            <select id="bed">
+              <option value="0.22">Quiet</option>
+              <option value="0.40">Medium</option>
+              <option value="0.65">Louder</option>
+            </select>
+          </div>
+        </div>
         <div class="opt">
           <label class="row" for="seed">
             <input id="seed" type="checkbox"/>
@@ -948,6 +1033,8 @@ async function runUpscale({ seed }) {
         logline,
         beats: $("beats").value,
         transcript: $("transcript").value,
+        voice: $("voice").value,
+        bed: $("bed").value,
         seed_from_upload: useSeed,
         upload_tag: ($("tag").value || "shittyvideo").trim(),
       }),
@@ -1034,7 +1121,7 @@ function render() {
     $("cut-empty").classList.add("hidden");
     vid.classList.remove("hidden");
     vid.src = reel.url;
-    $("cut-meta").textContent = `${reel.target_duration_sec}s · ${reel.pieces} shots cut together` + (reel.vo ? " · VO burned in" : "");
+    $("cut-meta").textContent = `${reel.target_duration_sec}s · ${reel.pieces} shots` + (reel.vo ? " · voice over quieter footage audio" : " · footage audio only");
   } else {
     vid.classList.add("hidden");
     vid.removeAttribute("src");
