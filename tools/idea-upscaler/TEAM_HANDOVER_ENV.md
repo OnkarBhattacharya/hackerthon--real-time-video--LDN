@@ -36,7 +36,7 @@ Paste-ready for Discord. Companion to `TEAM_HANDOVER.md` (the app). This one is 
 | Button | What it is | When to use |
 |--------|------------|-------------|
 | **Video Search & Summary** | Stock VSS UI (Search / Explore / Dashboard) | Browse index, try suggested searches, sanity-check clips |
-| **App** | *Our* Idea Upscaler at Ingress `/app` | Demo / iterate the product |
+| **App** | Team 41 launcher at Ingress `/app` (Video Recutter, LDN Video Ask, Hazard perception) | Demo / iterate the product |
 | **Open desktop** | Full VM desktop in browser | Only if you’re *not* on Cursor Remote-SSH. Optional fallback. |
 | Dashboard | Workshop status screen | Ops / organizers view |
 
@@ -129,12 +129,13 @@ Lab VM (this repo + /config + kubectl)
 K8s namespace team-41
   ├── VSS UI + API  (Ingress host video-lab-team-41.cosmos.vastdata.com)
   │     Search / Explore / Dashboard  ← “Video Search & Summary”
-  └── hackathon-app  path /app        ← workshop “App” button (Idea Upscaler)
+  ├── hackathon-app  path /app        ← workshop “App” button (launcher + Video Recutter)
+  └── hazard-perception               ← no Ingress of its own; the launcher proxies `/app/hazard`
 ```
 
 - **Skills** in `.cursor/skills/` wrap the VSS APIs (login, search, videos, deploy-app-no-registry, …). Prefer skills over inventing curl.
 - **Do not redeploy the VSS stack** for the hackathon app. Only deploy *our* mini-app to `/app`.
-- **WANDB_*** = serverless LLM for *our* app logic (shot splitting). VSS Cosmos models are already in the ingest/search pipeline.
+- **WANDB_*** = serverless LLM for brief filling and shot splitting when Cosmos Reason does not answer. VSS Cosmos models are already in the ingest/search pipeline. Video Recutter also calls Cosmos Reason directly for the brief. Hazard perception does not.
 
 ---
 
@@ -143,7 +144,7 @@ K8s namespace team-41
 1. Lab → **Video Search & Summary** → try 2 suggested searches → play a clip  
 2. In Cursor: *what’s in the index?* (dashboard / explore)  
 3. Search for an idea → ask over a video → find a gap → re-ingest if needed  
-4. Build Idea Upscaler → deploy with `deploy-app-no-registry` → workshop **App**
+4. Build the App (Video Recutter in `tools/idea-upscaler/`, Hazard perception in `tools/hazard-perception/`) → `tools/idea-upscaler/deploy.sh` for the launcher → workshop **App**
 
 Guided version in Cursor: `/build-day-quickstart`
 
@@ -158,7 +159,7 @@ Guided version in Cursor: `/build-day-quickstart`
 | App upscale empty results | `llm_top_n: 0` invalid; or VSS URL = external host from inside pod | Fixed in app: `llm_top_n: 1`, VSS = `http://video-backend-service:8000` |
 | kubectl Forbidden from agent sandbox | Needs real cluster network / kubeconfig | `export KUBECONFIG=/config/team-41-k8s.yaml` on the VM |
 | Tempted to `python main.py` locally as deliverable | Against rules | Deliverable = K8s + Ingress `/app` only |
-| Multiple apps | One `/app` slot | Replace ConfigMap + restart; or tabs in one UI |
+| Multiple apps | One `/app` Ingress | Launcher has three cards. Recutter and the proxies share `hackathon-app`. Hazard is its own Deployment |
 
 ---
 
@@ -176,7 +177,7 @@ Guided version in Cursor: `/build-day-quickstart`
 | Role | Do this |
 |------|---------|
 | Anyone demoing | Workshop → **App** (and optionally Video Search for vibe) |
-| Anyone coding | Cursor Remote-SSH as above; edit `tools/idea-upscaler/` |
+| Anyone coding | Cursor Remote-SSH as above; edit `tools/idea-upscaler/` or `tools/hazard-perception/` |
 | Re-ingest heavy | 1–2 people only (README warning) — don’t all re-ingest hours of video |
 | Discord paste | This file = env; `TEAM_HANDOVER.md` = product |
 

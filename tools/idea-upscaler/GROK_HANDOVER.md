@@ -24,6 +24,12 @@ GIT_COMMITTER_EMAIL=samialsindi@bc-pool-233.cosmo.vastdata.com
 
 - Do not commit `/config`, kubeconfigs, credentials, or real values from config. Do not commit `data/last_run.json`.
 
+## Current product
+
+Card 1 is Video Recutter. The page, routes, and limits are in `SEED.md`. This note is the shot-count bug and the push rules. Do not treat the bug section as the whole app.
+
+Fill the brief, Cosmos Reason, spoken voiceover, upload, CC B-roll, and the five-beat level-crossing path are implemented. The old buttons **Load demo brief** and **Upscale idea** are gone. The demo chip is **Streets · NYC bike**. The action button is **Recut**.
+
 ## Config-window prompt
 
 The prompt is the three scenario lines on Video Recutter, labeled **Scenarios for the VAST reasoner (1–3)**.
@@ -73,17 +79,17 @@ KUBECONFIG=/config/team-41-k8s.yaml tools/idea-upscaler/deploy.sh
 - Live path: `/app` on the team ingress (`video-lab-team-41.cosmos.vastdata.com`). People open it from the workshop App button.
 - No docker build. `deploy.sh` updates ConfigMap `hackathon-app-code` and restarts `deploy/hackathon-app`.
 - Client-side `kubectl apply` stores the whole ConfigMap in `last-applied-configuration` and fails once `main.py` is large (`metadata.annotations: Too long: may not be more than 262144 bytes`). The script now uses `kubectl apply --server-side --force-conflicts`.
-- Last deploy with that script rolled out and `http://video-lab-team-41.cosmos.vastdata.com/app/upscaler` returned 200. The live page has scenario boxes, shot `max="12"` `value="4"`, and the hint that a stated shot count or length overrides the controls.
+- The last recorded run of that script rolled out and `http://video-lab-team-41.cosmos.vastdata.com/app/upscaler` returned 200. That HTTP check was not repeated for this doc pass. In the current page source the scenario boxes exist, shot `max="12"` `value="4"`, and the hint says a stated shot count or length overrides the Shots and Seconds controls.
 
 ## Card 2
 
 LDN Video Ask is card 2. Do not lock it. Do not change `GUEST_UPSTREAM`. `deploy.sh` does not set, unset, or restore that variable.
 
-Checked on the deployment after the recutter rollout: `GUEST_UPSTREAM` is still `http://near-miss-app:80`. The older note that it must be `http://ldn-video-ask:80` is not what the cluster has. Leave the live value alone.
+Last recorded on the deployment after the recutter rollout, and not re-checked for this doc pass: `GUEST_UPSTREAM` was `http://near-miss-app:80`. The older note that it must be `http://ldn-video-ask:80` was not what the cluster had then. The code does not set the variable. Leave the live value alone.
 
 ## Card 3
 
-`/app/hazard` is already routed. `hazard()` in `main.py` proxies `HAZARD_UPSTREAM` or `http://hazard-perception:80`. It was left in place. After the recutter rollout, `GET /app/hazard` returned 200 and `HAZARD_UPSTREAM` was still `http://hazard-perception:80`.
+`/app/hazard` is routed in code. `hazard()` in `main.py` proxies `HAZARD_UPSTREAM` or `http://hazard-perception:80`. After the recutter rollout, `GET /app/hazard` returned 200 and `HAZARD_UPSTREAM` was still `http://hazard-perception:80`. That cluster check was not repeated for this doc pass. The hazard page itself is `tools/hazard-perception/main.py`. `deploy.sh` does not roll that Deployment.
 
 ## Git
 
@@ -97,8 +103,9 @@ remote: Permission to ahmedm87/hackerthon--real-time-video--LDN.git denied to On
 fatal: unable to access 'https://github.com/ahmedm87/hackerthon--real-time-video--LDN.git/': The requested URL returned error: 403
 ```
 
-## Still broken
+## Still true limits
 
-- Level-crossing briefs still use their own five-beat storyboard.
-- If the scenario prompt names a shot count but no length, and Cut length is Automatic, the total is still the source length (or the automatic fallback), split into that many equal slices.
+- A level-crossing recut (the safety chip, no Direction typed) still renders five slices from its own five-beat storyboard. A shot count in the scenario text does not change `max_pieces`. Cosmos Reason may reorder the railway matches; a shorter list is cycled back to five. Typing a Direction and recutting leaves the level-crossing path.
+- If the scenario prompt names a shot count but no length, and Cut length is Automatic, `duration_sec` stays unset. The cut then uses the summed duration of seeded upload clips, or 4 seconds times the slice count when there is no source duration.
 - A scenario line is still also a search hint, so a line that is only "6 shots, one minute" does not describe a picture. Put the picture in the other scenario boxes or in Direction.
+- `POST /api/upscale` still returns a `pitch` string from the old boards-and-voice line. The page does not render it.

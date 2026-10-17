@@ -310,15 +310,20 @@ credits, reach out to the Weights & Biases by CoreWeave team :)
 The skills used by Cursor can be used by agent frameworks too. They follow the standard
 `SKILL.md` format, so most frameworks load them straight from `.cursor/skills/`.
 
-### Idea Upscaler (Team 41 app)
+### Team 41 apps
 
-**Open it:** [workshop.thecosmoslabs.com](https://workshop.thecosmoslabs.com) → **Builders Challenge** → **App**  
+**Open them:** [workshop.thecosmoslabs.com](https://workshop.thecosmoslabs.com) → **Builders Challenge** → **App**  
 (Ingress path `/app` on the team host — do not use localhost.)
 
-Boards + optional VO → shot list (W&B if keys present, else heuristic) → cinematic matches from the indexed VSS archive (retrieval only, no generative video). Code: `tools/idea-upscaler/`.
+The App button is a launcher with three cards. Video Recutter and the launcher live in `tools/idea-upscaler/` (the folder name is older than the product). Hazard perception lives in `tools/hazard-perception/`.
 
-**30s demo pitch:** *“We start from boards and voice, not a prompt. The archive finds the cinematic version.”*  
-Click **Load demo brief** → **Upscale idea** → pick a shot → play a clip → skim Director’s cut.
+**Video Recutter** (`/app/upscaler`). Type a direction, or pick a brief, then **Recut**. The app searches the indexed archive and ffmpeg-cuts equal slices into one reel, with a spoken voiceover and burned captions. It does not generate pictures. **Fill the brief** writes the logline, shots, and spoken lines first (Cosmos Reason, then W&B). A shot count or length written in the scenario lines overrides the Shots and Seconds controls. Optional extras that are in the page today: upload a clip, seed a recut from an indexed tag, one Creative Commons clip when a beat is missing, and a level-crossing brief that stays on its own five beats.
+
+**30s demo:** **Streets · NYC bike** → **Recut** → play Director's cut.
+
+**Hazard perception** (`/app/hazard/`). Pick Driving, Forklift driver, or Warehouse walk, mark the moment you see a hazard, then pick Slow down, Brake, Wait, Steer away, or Continue. The second pass boxes one object from the YOLO sidecar. The score is a local 0–5 table. Cosmos Reason is not called to judge the answer.
+
+**LDN Video Ask** is the middle card (`/app/guest`). If `GUEST_UPSTREAM` is set, the launcher proxies that service. If it is empty, `/guest` serves the bundled `video_ask_app.py`.
 
 ## 6. Demos
 
