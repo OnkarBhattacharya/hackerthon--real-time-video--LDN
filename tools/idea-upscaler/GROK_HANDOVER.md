@@ -89,6 +89,7 @@ Checked on the deployment after the recutter rollout: `GUEST_UPSTREAM` is still 
 
 - Shot-fix commit: `f9b19377e9e46c1038bd1d326f7ede28a3b6520d`
 - Handover commit: `0885ba282a5ba658969dee19427efe750e518b67`
+- Deploy-script commit: `637b21b7c71b18a4713bfa5538834d679c5774be` (server-side ConfigMap apply; this is what was rolled out)
 - Push to `teamrepo` `idea-upscaler` failed. GitHub authenticated as OnkarBhattacharya, who cannot write to `ahmedm87/hackerthon--real-time-video--LDN`. The commits are local only until an account with write access pushes. Do not push `origin` to work around that.
 
 ```text
