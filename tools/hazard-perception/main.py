@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Driving hazard-perception test. Proxied by hackathon-app at /hazard."""
+"""Hazard-perception test. Proxied by hackathon-app at /hazard.
+
+One main hazard is boxed on the second pass. The clip search follows the
+mode the tester picked, and the first pass does not wait on detections.
+"""
 
 from __future__ import annotations
 
@@ -14,28 +18,109 @@ from flask import Flask, Response, jsonify, request, stream_with_context
 
 PORT = int(os.environ.get("PORT", "8080"))
 
-VULNERABLE = {"person", "bicycle", "motorcycle"}
-BOX_LABELS = VULNERABLE | {"car", "bus", "truck", "traffic light"}
-
 ACTIONS = [
-    {"id": "slow", "label": "Slow down"},
-    {"id": "brake", "label": "Brake"},
-    {"id": "wait", "label": "Wait"},
-    {"id": "steer", "label": "Steer away"},
-    {"id": "continue", "label": "Continue"},
+    {"id": "slow", "key": "1", "label": "Slow down"},
+    {"id": "brake", "key": "2", "label": "Brake"},
+    {"id": "wait", "key": "3", "label": "Wait"},
+    {"id": "steer", "key": "4", "label": "Steer away"},
+    {"id": "continue", "key": "5", "label": "Continue"},
 ]
 ACTION_LABELS = {row["id"]: row["label"] for row in ACTIONS}
 
-SPECS = [
-    {
-        "id": "street",
-        "query": "driving along a busy city street with cars buses and people walking near the traffic",
+# One-line queries. Driving never uses the warehouse camera, and the
+# warehouse modes never use a street or traffic filter.
+MODES: dict[str, dict[str, Any]] = {
+    "driving": {
+        "name": "Driving",
+        "query": "person or cyclist stepping out near cars in street traffic",
+        "filters": (
+            {"capture_type": "streets"},
+            {"capture_type": "traffic"},
+        ),
     },
-    {
-        "id": "junction",
-        "query": "city intersection with pedestrians near the crosswalk and vehicles in the traffic",
+    "forklift": {
+        "name": "Forklift driver",
+        "query": "forklift driver approaching a person or a rack in the aisle",
+        "filters": (
+            {
+                "location": "warehouse3",
+                "camera_id": "sdg_warehouse_cam-2",
+                "capture_type": "warehouse",
+            },
+        ),
     },
-]
+    "walk": {
+        "name": "Warehouse walk",
+        "query": "person on foot with a load while a forklift comes toward them",
+        "filters": (
+            {
+                "location": "warehouse3",
+                "camera_id": "sdg_warehouse_cam-2",
+                "capture_type": "warehouse",
+            },
+        ),
+    },
+}
+
+WAREHOUSE_FILTER = {
+    "location": "warehouse3",
+    "camera_id": "sdg_warehouse_cam-2",
+    "capture_type": "warehouse",
+}
+
+# Score for the chosen reaction against the one hazard we boxed.
+# Cosmos Reason is not called live; this table is the judge.
+RULES: dict[str, tuple[dict[str, int], str]] = {
+    "person stepping out": (
+        {"brake": 5, "slow": 3, "wait": 2, "steer": 1, "continue": 0},
+        "A person is stepping into your path, so brake.",
+    ),
+    "cyclist": (
+        {"brake": 5, "slow": 4, "steer": 3, "wait": 2, "continue": 0},
+        "A cyclist is close, so brake or slow down.",
+    ),
+    "motorcycle": (
+        {"brake": 5, "slow": 4, "steer": 3, "wait": 2, "continue": 0},
+        "A motorcycle is close, so brake or slow down.",
+    ),
+    "close car": (
+        {"slow": 5, "brake": 4, "steer": 2, "wait": 1, "continue": 0},
+        "A car is close, so slow down.",
+    ),
+    "close truck": (
+        {"slow": 5, "brake": 4, "steer": 2, "wait": 1, "continue": 0},
+        "A truck is close, so slow down.",
+    ),
+    "bus": (
+        {"slow": 5, "brake": 4, "wait": 2, "steer": 1, "continue": 0},
+        "A bus is close, so slow down.",
+    ),
+    "person in the aisle": (
+        {"brake": 5, "wait": 4, "slow": 3, "steer": 1, "continue": 0},
+        "A person is in the aisle, so brake and let them clear.",
+    ),
+    "another vehicle": (
+        {"slow": 5, "brake": 4, "wait": 3, "steer": 2, "continue": 0},
+        "Another vehicle is close, so slow down.",
+    ),
+    "rack ahead": (
+        {"slow": 5, "brake": 4, "steer": 3, "wait": 2, "continue": 0},
+        "The forks are approaching a rack, so slow down.",
+    ),
+    "forklift": (
+        {"wait": 5, "steer": 4, "slow": 2, "brake": 1, "continue": 0},
+        "A forklift is coming, so wait and let it pass.",
+    ),
+    "person with a load": (
+        {"wait": 5, "slow": 4, "steer": 3, "brake": 1, "continue": 0},
+        "A person is carrying a load, so wait and give them room.",
+    ),
+}
+
+VEHICLES = {"car", "bus", "truck"}
+BIKES = {"bicycle", "motorcycle"}
+RACKS = {"refrigerator", "dining table"}
+EARLY_SEC = 1.0
 
 
 def _resolve_vss_url() -> str:
@@ -61,9 +146,13 @@ _token_lock = threading.Lock()
 _token: str | None = None
 _token_at = 0.0
 _clip_lock = threading.Lock()
-_clip_cache: dict[str, Any] = {"at": 0.0, "clips": []}
+_clips: dict[str, dict[str, Any]] = {}
+_last_source: dict[str, str] = {}
 _det_lock = threading.Lock()
 _det_cache: dict[str, dict[str, Any] | None] = {}
+_hazard_lock = threading.Lock()
+_hazard_cache: dict[tuple[Any, ...], dict[str, Any]] = {}
+_seq = 0
 
 
 def _login(force: bool = False) -> str:
@@ -86,7 +175,7 @@ def _login(force: bool = False) -> str:
 
 def _vss(method: str, path: str, **kwargs: Any) -> requests.Response:
     token = _login()
-    headers = kwargs.pop("headers", {})
+    headers = dict(kwargs.pop("headers", {}))
     headers["Authorization"] = f"Bearer {token}"
     timeout = kwargs.pop("timeout", 40)
     response = requests.request(
@@ -103,19 +192,189 @@ def _vss(method: str, path: str, **kwargs: Any) -> requests.Response:
 
 def _place(value: str) -> str:
     text = (value or "").replace("_", " ").strip()
-    return text.title() if text else "Street"
+    return text.title() if text else "Clip"
+
+
+def _search_body(query: str, filters: dict[str, str]) -> dict[str, Any]:
+    if "\n" in query or not query.strip():
+        raise ValueError("search query must be one line")
+    return {
+        "query": query,
+        "top_k": 8,
+        "llm_top_n": 1,
+        "min_similarity": 0.15,
+        "include_public": True,
+        "time_filter": "all",
+        "metadata_filters": filters,
+    }
+
+
+def _allows(mode: str, chunk: dict[str, Any]) -> bool:
+    """Keep a driving clip off the forklift camera, and the reverse."""
+    loc = str(chunk.get("location") or "")
+    cam = str(chunk.get("camera_id") or "")
+    cap = str(chunk.get("capture_type") or "")
+    if mode == "driving":
+        if loc == "warehouse3" or cam == "sdg_warehouse_cam-2" or cap == "warehouse":
+            return False
+        if cap not in {"streets", "traffic"}:
+            return False
+        # Helmet-cam riding is not a driving test.
+        if cam == "nyc_bike_gopro-1":
+            return False
+        return True
+    return loc == "warehouse3" and cam == "sdg_warehouse_cam-2" and cap == "warehouse"
+
+
+def _rank(mode: str, chunk: dict[str, Any], row: dict[str, Any]) -> float:
+    score = float(chunk.get("similarity_score") or 0)
+    text = str(chunk.get("reasoning_content") or "").lower()
+    filename = str(chunk.get("preview_source") or "").lower()
+    classes = str(row.get("object_classes") or "")
+    if mode == "driving":
+        if any(name in classes for name in ("person", "bicycle", "motorcycle")):
+            score += 0.12
+        if chunk.get("capture_type") == "streets":
+            score += 0.04
+        if any(word in text for word in ("crosswalk", "pedestrian", "stepping", "cyclist")):
+            score += 0.03
+        return score
+    if mode == "forklift":
+        if any(word in text for word in ("aisle", "rack", "shelf", "forks", "fork")):
+            score += 0.1
+        if "walks away" in text or "walking away" in text:
+            score -= 0.15
+        if ".eye_" in filename:
+            score += 0.05
+        if "ceiling" in filename:
+            score -= 0.06
+        return score
+    if any(word in text for word in ("walk", "walking", "on foot")):
+        score += 0.1
+    if any(word in text for word in ("load", "carrying", "suitcase", "pallet")):
+        score += 0.06
+    counts = str(row.get("object_counts") or "")
+    if "suitcase" in counts or "backpack" in counts:
+        score += 0.05
+    if any(word in text for word in ("toward", "comes", "approaches", "moving")):
+        score += 0.03
+    if "ceiling" in filename:
+        score += 0.04
+    if ".eye_" in filename and "forks" in text:
+        score -= 0.08
+    return score
+
+
+def _best_chunk(
+    mode: str, payload: dict[str, Any], avoid: str
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    rows = {
+        row.get("source"): row
+        for row in (payload.get("results") or [])
+        if isinstance(row, dict)
+    }
+    best: tuple[dict[str, Any], dict[str, Any]] | None = None
+    best_score = -1e9
+    for chunk in payload.get("chunk_results") or []:
+        if not isinstance(chunk, dict):
+            continue
+        source = str(chunk.get("preview_source") or "")
+        if not source.startswith("s3://"):
+            continue
+        if not _allows(mode, chunk):
+            continue
+        row = rows.get(source) or {}
+        score = _rank(mode, chunk, row)
+        if source and source == avoid:
+            score -= 0.2
+        if score > best_score:
+            best_score = score
+            best = (chunk, row)
+    return best
+
+
+def _search(query: str, filters: dict[str, str]) -> dict[str, Any]:
+    response = _vss("POST", "/api/v1/search", json=_search_body(query, filters), timeout=50)
+    if response.status_code >= 400:
+        raise RuntimeError(f"search HTTP {response.status_code}")
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise RuntimeError("search returned an unexpected payload")
+    return payload
+
+
+def _load_clip(mode: str) -> dict[str, Any]:
+    """Search only. Detections wait until the second pass."""
+    spec = MODES[mode]
+    avoid = _last_source.get(mode, "")
+    found: tuple[dict[str, Any], dict[str, Any]] | None = None
+    used_filters: dict[str, str] | None = None
+    for filters in spec["filters"]:
+        found = _best_chunk(mode, _search(spec["query"], filters), avoid)
+        if found:
+            used_filters = filters
+            break
+    if not found or used_filters is None:
+        if mode == "driving":
+            raise RuntimeError("No street or traffic clip is indexed for this mode")
+        raise RuntimeError("No warehouse3 clip is indexed for this mode")
+    chunk, row = found
+    source = str(chunk.get("preview_source") or "")
+    try:
+        duration = float(row.get("duration") or 0)
+    except (TypeError, ValueError):
+        duration = 0.0
+    if duration <= 0:
+        try:
+            start = float(chunk.get("best_match_start_sec") or 0)
+            end = float(chunk.get("best_match_end_sec") or 0)
+        except (TypeError, ValueError):
+            start, end = 0.0, 0.0
+        duration = end - start if end > start else 5.0
+    global _seq
+    with _clip_lock:
+        _seq += 1
+        clip_id = f"{mode}-{_seq}"
+        stored = {
+            "id": clip_id,
+            "mode": mode,
+            "mode_name": spec["name"],
+            "query": spec["query"],
+            "filters": used_filters,
+            "place": _place(str(chunk.get("location") or "")),
+            "location": str(chunk.get("location") or ""),
+            "camera_id": str(chunk.get("camera_id") or ""),
+            "capture_type": str(chunk.get("capture_type") or ""),
+            "source": source,
+            "duration": round(max(1.5, duration), 2),
+            "stream": "api/stream?source=" + quote(source, safe=""),
+        }
+        _clips[clip_id] = stored
+        _last_source[mode] = source
+        return stored
+
+
+def _public_clip(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "mode": row["mode"],
+        "mode_name": row["mode_name"],
+        "place": row["place"],
+        "stream": row["stream"],
+        "duration": row["duration"],
+    }
 
 
 def _detections(source: str) -> dict[str, Any] | None:
+    """Return the YOLO sidecar, or None when the segment has no sidecar."""
     with _det_lock:
         if source in _det_cache:
             return _det_cache[source]
     response = _vss("GET", "/api/v1/videos/detections", params={"source": source}, timeout=60)
-    data: dict[str, Any] | None
     if response.status_code == 404:
-        data = None
+        data: dict[str, Any] | None = None
     elif response.status_code >= 400:
-        data = None
+        raise RuntimeError(f"detections HTTP {response.status_code}")
     else:
         payload = response.json()
         data = payload if isinstance(payload, dict) else None
@@ -124,233 +383,307 @@ def _detections(source: str) -> dict[str, Any] | None:
     return data
 
 
-def _decide(data: dict[str, Any] | None, duration: float) -> dict[str, Any]:
-    """Pick the response and the click window from YOLO boxes when they exist."""
-    duration = max(1.5, duration)
-    if not data:
-        return {
-            "action": "slow",
-            "hazard": "Traffic ahead on the street",
-            "why": "You are in moving traffic. Slow down until the hazard is clear.",
-            "window_start": 0.4,
-            "window_end": round(max(1.2, duration - 0.3), 2),
-            "boxes": False,
-        }
-    frames = data.get("frames") or []
-    if frames:
-        fps = float(data.get("fps") or 30) or 30
-        duration = max(duration, float(frames[-1].get("time_sec") or 0) + 1.0 / fps)
-    center: list[float] = []
-    left: list[float] = []
-    right: list[float] = []
-    side_h = 0.0
-    for frame in frames:
-        shape = frame.get("shape") or data.get("video_shape") or [1080, 1920]
-        height, width = float(shape[0]), float(shape[1])
-        if width <= 0 or height <= 0:
-            continue
-        moment = float(frame.get("time_sec") or 0)
-        for det in frame.get("detections") or []:
-            if det.get("confidence", 0) < 0.45 or det.get("label") not in VULNERABLE:
-                continue
-            x1, _y1, x2, y2 = det["bbox"]
-            cx = ((float(x1) + float(x2)) / 2) / width
-            box_h = (float(y2) - float(_y1)) / height
-            if box_h < 0.12:
-                continue
-            if 0.32 <= cx <= 0.68 and box_h >= 0.22:
-                center.append(moment)
-            elif cx < 0.32:
-                left.append(moment)
-                side_h = max(side_h, box_h)
-            elif cx > 0.68:
-                right.append(moment)
-                side_h = max(side_h, box_h)
-    if center:
-        start = max(0.0, min(center) - 0.2)
-        end = min(duration, max(center) + 0.35)
-        return {
-            "action": "brake",
-            "hazard": "Someone is in your path",
-            "why": "A person or rider is close and ahead of you. Brake.",
-            "window_start": round(start, 2),
-            "window_end": round(max(start + 0.8, end), 2),
-            "boxes": True,
-        }
-    side_times = left + right
-    if side_times:
-        start = max(0.0, min(side_times) - 0.15)
-        end = min(duration, max(side_times) + 0.3)
-        one_side = bool(left) != bool(right)
-        if one_side and side_h < 0.34:
-            return {
-                "action": "steer",
-                "hazard": "Hazard off to one side",
-                "why": "The hazard is to one side and not in your path. Steer away.",
-                "window_start": round(start, 2),
-                "window_end": round(max(start + 0.8, end), 2),
-                "boxes": True,
-            }
-        return {
-            "action": "slow",
-            "hazard": "People near the traffic",
-            "why": "People are close to the moving traffic. Slow down.",
-            "window_start": round(start, 2),
-            "window_end": round(max(start + 0.8, end), 2),
-            "boxes": True,
-        }
-    return {
-        "action": "continue",
-        "hazard": "Street traffic is clear of your path",
-        "why": "Nothing vulnerable is in your path. Continue.",
-        "window_start": 0.4,
-        "window_end": round(max(1.2, duration - 0.3), 2),
-        "boxes": bool(frames),
-    }
-
-
-def _thin_boxes(data: dict[str, Any] | None) -> dict[str, Any]:
-    if not data or not data.get("frames"):
-        return {"available": False, "frames": []}
-    frames_out: list[dict[str, Any]] = []
-    for frame in data.get("frames") or []:
-        if int(frame.get("frame_index") or 0) % 3:
-            continue
-        shape = frame.get("shape") or data.get("video_shape") or [1080, 1920]
-        height, width = float(shape[0]), float(shape[1])
-        if width <= 0 or height <= 0:
-            continue
-        ranked = sorted(
-            frame.get("detections") or [],
-            key=lambda det: float(det.get("confidence") or 0),
-            reverse=True,
-        )
-        boxes = []
-        for det in ranked:
-            if det.get("label") not in BOX_LABELS or float(det.get("confidence") or 0) < 0.45:
-                continue
-            x1, y1, x2, y2 = [float(v) for v in det["bbox"]]
-            boxes.append(
-                {
-                    "label": det["label"],
-                    "x": round(x1 / width, 4),
-                    "y": round(y1 / height, 4),
-                    "w": round(max(0.0, x2 - x1) / width, 4),
-                    "h": round(max(0.0, y2 - y1) / height, 4),
-                }
-            )
-            if len(boxes) >= 8:
-                break
-        if boxes:
-            frames_out.append({"t": round(float(frame.get("time_sec") or 0), 3), "boxes": boxes})
-    return {"available": bool(frames_out), "frames": frames_out}
-
-
-def _search_spec(spec: dict[str, str]) -> dict[str, Any] | None:
-    response = _vss(
-        "POST",
-        "/api/v1/search",
-        json={
-            "query": spec["query"],
-            "top_k": 4,
-            "llm_top_n": 1,
-            "min_similarity": 0.15,
-            "include_public": True,
-            "time_filter": "all",
-        },
-    )
-    if response.status_code >= 400:
-        raise RuntimeError(f"search HTTP {response.status_code}")
-    chunk = (response.json().get("chunk_results") or [None])[0]
-    if not chunk:
-        return None
-    source = chunk.get("preview_source") or ""
-    if not source:
+def _norm_box(
+    det: dict[str, Any], width: float, height: float
+) -> tuple[float, float, float, float] | None:
+    raw = det.get("bbox")
+    if not isinstance(raw, (list, tuple)) or len(raw) != 4:
         return None
     try:
-        start = float(chunk.get("best_match_start_sec") or 0)
-        end = float(chunk.get("best_match_end_sec") or 0)
+        x1, y1, x2, y2 = (float(raw[0]), float(raw[1]), float(raw[2]), float(raw[3]))
+        conf = float(det.get("confidence") or 0)
     except (TypeError, ValueError):
-        start, end = 0.0, 0.0
-    span = end - start if end > start else 5.0
-    detections = _detections(source)
-    decision = _decide(detections, span if span >= 1 else 5.0)
-    return {
-        "id": spec["id"],
-        "place": _place(str(chunk.get("location") or "")),
-        "hazard": decision["hazard"],
-        "why": decision["why"],
-        "action": decision["action"],
-        "stream": "api/stream?source=" + quote(source, safe=""),
-        "window_start": decision["window_start"],
-        "window_end": decision["window_end"],
-        "duration": round(max(span, decision["window_end"]), 2),
-        "source": source,
-        "boxes": decision["boxes"],
-    }
+        return None
+    if conf < 0.45 or width <= 0 or height <= 0:
+        return None
+    x = x1 / width
+    y = y1 / height
+    w = (x2 - x1) / width
+    h = (y2 - y1) / height
+    if w <= 0.005 or h <= 0.005:
+        return None
+    return x, y, w, h
 
 
-def _clips() -> list[dict[str, Any]]:
-    with _clip_lock:
-        if _clip_cache["clips"] and (time.time() - _clip_cache["at"]) < 600:
-            return _clip_cache["clips"]
+def _classify(mode: str, label: str, box: tuple[float, float, float, float]) -> tuple[int, str] | None:
+    """Priority: person in the path, then a bicycle or motorcycle, then a close vehicle.
+
+    Distant cars, traffic lights, benches, and clocks never qualify.
+    """
+    x, y, w, h = box
+    cx = x + w / 2
+    cy = y + h / 2
+    path_x = (0.28, 0.72) if mode == "driving" else (0.18, 0.82)
+    in_path = path_x[0] <= cx <= path_x[1] and cy >= 0.36 and h >= 0.10
+    close_vehicle = h >= 0.15 or (h >= 0.12 and w >= 0.12)
+    distant_vehicle = label in VEHICLES and h < 0.12 and w < 0.10
+    if distant_vehicle:
+        return None
+    if mode == "driving":
+        if label == "person" and in_path:
+            return 0, "person stepping out"
+        if label == "bicycle" and (h >= 0.06 or w >= 0.07):
+            return 1, "cyclist"
+        if label == "motorcycle" and (h >= 0.06 or w >= 0.07):
+            return 1, "motorcycle"
+        if label in VEHICLES and close_vehicle:
+            return 2, {"car": "close car", "truck": "close truck", "bus": "bus"}[label]
+        return None
+    if mode == "forklift":
+        if label == "person" and (in_path or (h >= 0.12 and path_x[0] <= cx <= path_x[1])):
+            return 0, "person in the aisle"
+        if label in BIKES and (h >= 0.06 or w >= 0.07):
+            return 1, "cyclist" if label == "bicycle" else "motorcycle"
+        if label in VEHICLES and close_vehicle:
+            return 2, "another vehicle"
+        if label in RACKS and h >= 0.10 and path_x[0] <= cx <= path_x[1]:
+            return 3, "rack ahead"
+        return None
+    if label == "person" and (in_path or (h >= 0.12 and path_x[0] <= cx <= path_x[1])):
+        return 0, "person with a load"
+    if label in BIKES and (h >= 0.06 or w >= 0.07):
+        return 1, "cyclist" if label == "bicycle" else "motorcycle"
+    if label in VEHICLES and close_vehicle:
+        return 2, "forklift"
+    if label in RACKS and (h >= 0.12 or w >= 0.12):
+        return 2, "forklift"
+    return None
+
+
+def _frame_shape(frame: dict[str, Any], data: dict[str, Any]) -> tuple[float, float]:
+    shape = frame.get("shape") or data.get("video_shape") or [1080, 1920]
+    try:
+        height, width = float(shape[0]), float(shape[1])
+    except (TypeError, ValueError, IndexError):
+        return 0.0, 0.0
+    return height, width
+
+
+def _candidates(
+    mode: str, data: dict[str, Any], t0: float, t1: float
+) -> list[dict[str, Any]]:
     found: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for spec in SPECS:
-        row = _search_spec(spec)
-        if not row or row["source"] in seen:
+    for frame in data.get("frames") or []:
+        try:
+            moment = float(frame.get("time_sec") or 0)
+        except (TypeError, ValueError):
             continue
-        seen.add(row["source"])
-        found.append(row)
-    if not found:
-        raise RuntimeError("No street or traffic clips are indexed yet")
-    with _clip_lock:
-        _clip_cache["clips"] = found
-        _clip_cache["at"] = time.time()
-        return found
+        if moment < t0 or moment > t1:
+            continue
+        height, width = _frame_shape(frame, data)
+        if width <= 0 or height <= 0:
+            continue
+        for det in frame.get("detections") or []:
+            if not isinstance(det, dict):
+                continue
+            label = str(det.get("label") or "")
+            box = _norm_box(det, width, height)
+            if box is None:
+                continue
+            ranked = _classify(mode, label, box)
+            if ranked is None:
+                continue
+            tier, display = ranked
+            x, y, w, h = box
+            try:
+                conf = float(det.get("confidence") or 0)
+            except (TypeError, ValueError):
+                conf = 0.0
+            found.append(
+                {
+                    "tier": tier,
+                    "label": display,
+                    "raw": label,
+                    "t": moment,
+                    "h": h,
+                    "conf": conf,
+                    "cx": x + w / 2,
+                    "cy": y + h / 2,
+                    "box": {
+                        "label": display,
+                        "x": round(x, 4),
+                        "y": round(y, 4),
+                        "w": round(w, 4),
+                        "h": round(h, 4),
+                    },
+                }
+            )
+    return found
 
 
-def _public_clip(row: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "id": row["id"],
-        "place": row["place"],
-        "hazard": row["hazard"],
-        "stream": row["stream"],
-        "window_start": row["window_start"],
-        "window_end": row["window_end"],
-        "duration": row["duration"],
-        "boxes": row["boxes"],
-    }
+def _pick_winner(cands: list[dict[str, Any]]) -> dict[str, Any] | None:
+    if not cands:
+        return None
+    return min(cands, key=lambda row: (row["tier"], -row["h"], -row["conf"], row["t"]))
 
 
-def _score(clicks: list[float], start: float, end: float) -> tuple[int, str]:
-    inside = [t for t in clicks if start - 0.05 <= t <= end + 0.15]
-    if not inside:
-        return 0, "Missed. No click landed while the hazard was developing."
-    earliest = min(inside)
-    span = max(0.4, end - start)
-    frac = min(1.0, max(0.0, (earliest - start) / span))
-    if frac < 0.2:
-        return 5, "Early. You clicked as the hazard developed."
-    if frac < 0.4:
-        return 4, "Good reaction. Your click is in the early part of the window."
-    if frac < 0.6:
-        return 3, "In the window, a little late."
-    if frac < 0.8:
-        return 2, "Late reaction."
-    return 1, "Late reaction. The window was almost over."
+def _track(mode: str, data: dict[str, Any], winner: dict[str, Any]) -> list[dict[str, Any]]:
+    """Follow that one object and emit a single box per frame."""
+    t_win = float(winner["t"])
+    frames_out: list[dict[str, Any]] = []
+    last_t = -1.0
+    for frame in data.get("frames") or []:
+        try:
+            moment = float(frame.get("time_sec") or 0)
+        except (TypeError, ValueError):
+            continue
+        if abs(moment - t_win) > 1.25:
+            continue
+        height, width = _frame_shape(frame, data)
+        if width <= 0 or height <= 0:
+            continue
+        best: tuple[float, dict[str, Any]] | None = None
+        for det in frame.get("detections") or []:
+            if not isinstance(det, dict) or str(det.get("label") or "") != winner["raw"]:
+                continue
+            box = _norm_box(det, width, height)
+            if box is None:
+                continue
+            x, y, w, h = box
+            dist = abs((x + w / 2) - winner["cx"]) + abs((y + h / 2) - winner["cy"])
+            if dist > 0.28:
+                continue
+            ranked = _classify(mode, winner["raw"], box)
+            if ranked is None:
+                continue
+            if best is None or dist < best[0]:
+                best = (
+                    dist,
+                    {
+                        "label": winner["label"],
+                        "x": round(x, 4),
+                        "y": round(y, 4),
+                        "w": round(w, 4),
+                        "h": round(h, 4),
+                    },
+                )
+        if best is None or moment - last_t < 0.08:
+            continue
+        last_t = moment
+        frames_out.append({"t": round(moment, 3), "boxes": [best[1]]})
+    if not frames_out:
+        frames_out.append({"t": round(t_win, 3), "boxes": [winner["box"]]})
+    return frames_out
 
 
-def _click_times(payload: dict[str, Any]) -> list[float]:
+def _click_times(payload: dict[str, Any], duration: float) -> list[float]:
     times: list[float] = []
     for raw in payload.get("clicks") or []:
         if isinstance(raw, dict):
             raw = raw.get("t")
         try:
-            times.append(float(raw))
+            moment = float(raw)
         except (TypeError, ValueError):
             continue
+        if moment < 0 or moment > duration + 1.5:
+            continue
+        times.append(moment)
+        if len(times) >= 12:
+            break
     return times
+
+
+def _main_hazard(
+    mode: str,
+    data: dict[str, Any] | None,
+    clicks: list[float],
+    duration: float,
+) -> dict[str, Any]:
+    duration = max(1.5, duration)
+    if not data or not isinstance(data.get("frames"), list):
+        return {
+            "sidecar": False,
+            "label": None,
+            "time": None,
+            "frames": [],
+            "note": "YOLO had no sidecar for this clip.",
+        }
+    latest = clicks[-1] if clicks else None
+    early = latest is None or latest <= EARLY_SEC or latest <= 0.2 * duration
+    if early:
+        pool = _candidates(mode, data, 0.0, duration + 0.5)
+    else:
+        pool = _candidates(mode, data, latest - 0.75, latest + 1.25)
+        if not pool:
+            pool = _candidates(mode, data, 0.0, duration + 0.5)
+    winner = _pick_winner(pool)
+    if winner is None:
+        return {
+            "sidecar": True,
+            "label": None,
+            "time": None,
+            "frames": [],
+            "note": "The sidecar has no person, cyclist, or close vehicle to mark.",
+        }
+    return {
+        "sidecar": True,
+        "label": winner["label"],
+        "time": round(float(winner["t"]), 2),
+        "frames": _track(mode, data, winner),
+        "note": f"Main hazard: {winner['label']}.",
+    }
+
+
+def _score_reaction(mode: str, hazard: dict[str, Any], action: str) -> dict[str, Any]:
+    label = hazard.get("label")
+    sidecar = bool(hazard.get("sidecar"))
+    if not sidecar:
+        if mode == "walk":
+            scores = {"wait": 5, "steer": 4, "slow": 3, "brake": 2, "continue": 0}
+            sentence = "YOLO had no sidecar for this clip, so wait until the way is clear."
+        else:
+            scores = {"slow": 5, "brake": 4, "wait": 3, "steer": 2, "continue": 0}
+            sentence = "YOLO had no sidecar for this clip, so slow down until the way is clear."
+        return {
+            "points": int(scores.get(action, 0)),
+            "sentence": sentence,
+            "hazard": None,
+            "sidecar": False,
+        }
+    if not label or label not in RULES:
+        scores = {"slow": 5, "wait": 4, "brake": 3, "steer": 2, "continue": 1}
+        return {
+            "points": int(scores.get(action, 0)),
+            "sentence": "The sidecar has no close hazard in your path, so slow down and look again.",
+            "hazard": None,
+            "sidecar": True,
+        }
+    scores, sentence = RULES[label]
+    if mode == "walk" and label == "person with a load":
+        sentence = "A person is carrying a load, so wait and give them room."
+    return {
+        "points": int(scores.get(action, 0)),
+        "sentence": sentence,
+        "hazard": label,
+        "sidecar": True,
+    }
+
+
+def _hazard_for(row: dict[str, Any], clicks: list[float], duration: float) -> dict[str, Any]:
+    duration = max(float(row.get("duration") or 0), duration, 1.5)
+    key = (row["id"], tuple(round(item, 2) for item in clicks), round(duration, 1))
+    with _hazard_lock:
+        cached = _hazard_cache.get(key)
+    if cached is not None:
+        return cached
+    hazard = _main_hazard(row["mode"], _detections(row["source"]), clicks, duration)
+    with _hazard_lock:
+        _hazard_cache[key] = hazard
+    return hazard
+
+
+def _clip_by_id(clip_id: str) -> dict[str, Any] | None:
+    with _clip_lock:
+        row = _clips.get(clip_id)
+        return dict(row) if row else None
+
+
+def _duration_of(payload: dict[str, Any], row: dict[str, Any]) -> float:
+    try:
+        client = float(payload.get("duration") or 0)
+    except (TypeError, ValueError):
+        client = 0.0
+    return max(client, float(row.get("duration") or 0), 1.5)
 
 
 PAGE = """<!DOCTYPE html>
@@ -367,7 +700,13 @@ PAGE = """<!DOCTYPE html>
   .wrap { max-width: 880px; margin: 0 auto; padding: 28px 18px 64px; }
   a { color: var(--accent); }
   h1 { font-family: Georgia, serif; font-weight: 500; font-size: clamp(2rem, 4vw, 2.8rem); margin: 8px 0; }
-  p.lead { color: var(--muted); max-width: 40rem; line-height: 1.45; }
+  p.lead, .hint { color: var(--muted); max-width: 42rem; line-height: 1.45; }
+  .modes { display: grid; gap: 10px; margin: 16px 0; }
+  button.mode { text-align: left; background: var(--panel); color: var(--ink); border: 1px solid var(--line); padding: 14px; cursor: pointer; }
+  button.mode strong { display: block; font-size: 1.05rem; margin-bottom: 4px; }
+  button.mode span { color: var(--muted); }
+  button.mode:disabled { opacity: 0.55; cursor: default; }
+  #desk:focus { outline: 1px solid var(--accent); outline-offset: 4px; }
   .stage { position: relative; background: #000; border: 1px solid var(--line); aspect-ratio: 16/9; }
   video, #overlay { position:absolute; inset:0; width:100%; height:100%; }
   video { object-fit: contain; background:#000; }
@@ -385,7 +724,7 @@ PAGE = """<!DOCTYPE html>
   button.pick:disabled { opacity: 0.55; cursor: default; }
   .choices { display:grid; gap:8px; }
   .bar { position:relative; height:14px; background:#2a343d; margin-top:8px; }
-  .window { position:absolute; top:0; bottom:0; background:rgba(240,180,41,.55); }
+  .window { position:absolute; top:0; bottom:0; background:rgba(240,180,41,.85); }
   .playhead { position:absolute; top:-3px; bottom:-3px; width:2px; background:#fff; }
   .mark { position:absolute; top:-4px; width:8px; height:22px; margin-left:-4px; background:#7dcea0; }
   .panel { background:var(--panel); border:1px solid var(--line); padding:14px; margin-top:14px; }
@@ -398,31 +737,40 @@ PAGE = """<!DOCTYPE html>
   <div class="wrap">
     <p><a href="/app/">All apps</a></p>
     <h1>Hazard perception</h1>
-    <p class="lead">Play a street clip. Click when you see a hazard. The second pass shows your click marks and YOLO boxes, then asks what you should do.</p>
-    <p class="status" id="meta">Loading a street clip…</p>
-    <div class="stage">
-      <video id="vid" playsinline preload="auto"></video>
-      <canvas id="overlay"></canvas>
-      <button id="hit" class="on" type="button">Start the clip</button>
-      <div id="banner" class="hidden"></div>
-      <div id="count" class="hidden"></div>
+    <p class="lead">Pick a mode, then mark the hazard as the clip plays. The second pass boxes one main hazard and asks what you should do.</p>
+    <p class="hint" id="keys">Space marks a hazard at the current time. 1 Slow down, 2 Brake, 3 Wait, 4 Steer away, 5 Continue. Enter opens the second pass or submits.</p>
+    <div id="modes" class="modes">
+      <button class="mode" type="button" data-mode="driving"><strong>Driving</strong><span>Streets and traffic. A person, a cyclist, or a close vehicle.</span></button>
+      <button class="mode" type="button" data-mode="forklift"><strong>Forklift driver</strong><span>Warehouse aisle. A person, another vehicle, or a rack the forks are approaching.</span></button>
+      <button class="mode" type="button" data-mode="walk"><strong>Warehouse walk</strong><span>On foot in the warehouse. A forklift coming, or a person with a load.</span></button>
     </div>
-    <div id="timeline" class="bar hidden" aria-hidden="true"></div>
-    <div class="row">
-      <button id="hazardBtn" class="act" type="button" disabled>I see a hazard</button>
-      <button id="next" class="ghost hidden" type="button">Next clip</button>
-      <span class="status" id="clicks"></span>
-    </div>
-    <div id="ask" class="panel hidden">
-      <h2>What should you do?</h2>
-      <div id="choices" class="choices">
-        <button type="button" class="pick" data-id="slow">Slow down</button>
-        <button type="button" class="pick" data-id="brake">Brake</button>
-        <button type="button" class="pick" data-id="wait">Wait</button>
-        <button type="button" class="pick" data-id="steer">Steer away</button>
-        <button type="button" class="pick" data-id="continue">Continue</button>
+    <p class="status" id="meta">Choose Driving, Forklift driver, or Warehouse walk.</p>
+    <div id="desk" class="hidden" tabindex="0">
+      <div class="stage">
+        <video id="vid" playsinline preload="auto"></video>
+        <canvas id="overlay"></canvas>
+        <button id="hit" class="on" type="button">Start the clip</button>
+        <div id="banner" class="hidden"></div>
+        <div id="count" class="hidden"></div>
       </div>
-      <p id="rating" class="status"></p>
+      <div id="timeline" class="bar hidden" aria-hidden="true"></div>
+      <div class="row">
+        <button id="hazardBtn" class="act" type="button" disabled>I see a hazard</button>
+        <button id="again" class="ghost hidden" type="button">Another clip</button>
+        <button id="change" class="ghost" type="button">Change mode</button>
+        <span class="status" id="clicks"></span>
+      </div>
+      <div id="ask" class="panel hidden">
+        <h2>What should you do?</h2>
+        <div id="choices" class="choices">
+          <button type="button" class="pick" data-id="slow">1 Slow down</button>
+          <button type="button" class="pick" data-id="brake">2 Brake</button>
+          <button type="button" class="pick" data-id="wait">3 Wait</button>
+          <button type="button" class="pick" data-id="steer">4 Steer away</button>
+          <button type="button" class="pick" data-id="continue">5 Continue</button>
+        </div>
+        <p id="rating" class="status"></p>
+      </div>
     </div>
     <p id="err" class="err hidden"></p>
   </div>
@@ -430,35 +778,56 @@ PAGE = """<!DOCTYPE html>
 const $ = (id) => document.getElementById(id);
 const vid = $("vid");
 const overlay = $("overlay");
+const desk = $("desk");
 const ctx = overlay.getContext("2d");
-let pack = null;
-let index = 0;
+const KEYS = {1: "slow", 2: "brake", 3: "wait", 4: "steer", 5: "continue"};
+const NAMES = {slow: "Slow down", brake: "Brake", wait: "Wait", steer: "Steer away", continue: "Continue"};
+let clipData = null;
+let modeId = "";
 let pass = 0;
 let clicks = [];
+let pending = null;
 let answered = false;
 let counting = false;
+let advancing = false;
 let playToken = 0;
 let boxPack = null;
-
-function clip() { return pack.clips[index]; }
 
 function showError(msg) {
   $("err").textContent = msg;
   $("err").classList.remove("hidden");
 }
 
+function clearError() {
+  $("err").textContent = "";
+  $("err").classList.add("hidden");
+}
+
+function clipFocused() {
+  const el = document.activeElement;
+  return !!el && (el === desk || desk.contains(el));
+}
+
+function focusClip() {
+  if (!desk.classList.contains("hidden")) desk.focus({preventScroll: true});
+}
+
 function renderClicks() {
-  $("clicks").textContent = clicks.length ? (clicks.length + " click" + (clicks.length === 1 ? "" : "s")) : "";
+  const count = clicks.length ? (clicks.length + " mark" + (clicks.length === 1 ? "" : "s")) : "No marks yet";
+  const choice = pending ? (" · " + NAMES[pending] + " for the latest mark") : "";
+  $("clicks").textContent = count + choice;
 }
 
 function drawBar() {
   const bar = $("timeline");
-  const c = clip();
-  const dur = Math.max(0.1, vid.duration || c.duration || 5);
-  const left = (c.window_start / dur) * 100;
-  const width = Math.max(2, ((c.window_end - c.window_start) / dur) * 100);
+  const dur = Math.max(0.1, vid.duration || (clipData && clipData.duration) || 5);
   const marks = clicks.map((mark) => `<i class="mark" style="left:${Math.min(100, (mark.t / dur) * 100)}%"></i>`).join("");
-  bar.innerHTML = `<i class="window" style="left:${left}%;width:${width}%"></i><i class="playhead" id="head"></i>${marks}`;
+  let hazard = "";
+  if (boxPack && Number.isFinite(boxPack.time)) {
+    const left = Math.min(98, Math.max(0, (boxPack.time / dur) * 100));
+    hazard = `<i class="window" style="left:${left}%;width:2%"></i>`;
+  }
+  bar.innerHTML = `${hazard}<i class="playhead" id="head"></i>${marks}`;
   bar.classList.remove("hidden");
 }
 
@@ -477,10 +846,11 @@ function boxesAt(t) {
   const frames = (boxPack && boxPack.frames) || [];
   let best = null;
   for (const frame of frames) {
-    if (frame.t <= t + 0.08) best = frame;
+    if (frame.t <= t + 0.12) best = frame;
     else break;
   }
-  return best ? best.boxes : [];
+  if (!best) return [];
+  return (best.boxes || []).slice(0, 1);
 }
 
 function paint() {
@@ -491,9 +861,10 @@ function paint() {
   }
   ctx.clearRect(0, 0, overlay.width, overlay.height);
   if (pass !== 2) return;
-  ctx.lineWidth = 2;
-  ctx.font = "13px sans-serif";
-  for (const box of boxesAt(vid.currentTime || 0)) {
+  const boxes = boxesAt(vid.currentTime || 0);
+  ctx.lineWidth = 3;
+  ctx.font = "600 16px sans-serif";
+  for (const box of boxes) {
     const x = rect.x + box.x * rect.w;
     const y = rect.y + box.y * rect.h;
     const w = box.w * rect.w;
@@ -501,7 +872,7 @@ function paint() {
     ctx.strokeStyle = "#f0b429";
     ctx.strokeRect(x, y, w, h);
     ctx.fillStyle = "#f0b429";
-    ctx.fillText(box.label, x + 3, Math.max(14, y + 14));
+    ctx.fillText(box.label || "", x + 4, Math.max(18, y - 6));
   }
   clicks.forEach((mark, i) => {
     const x = mark.x == null ? rect.x + rect.w * 0.5 : rect.x + mark.x * rect.w;
@@ -519,71 +890,107 @@ function paint() {
   });
 }
 
-function arm(which) {
-  const c = clip();
-  pass = which;
+function resetPass() {
+  pass = 0;
+  clicks = [];
+  pending = null;
   answered = false;
+  advancing = false;
   boxPack = null;
+  renderClicks();
   $("ask").classList.add("hidden");
   $("rating").textContent = "";
   $("banner").classList.add("hidden");
-  $("next").classList.add("hidden");
+  $("again").classList.add("hidden");
+  $("timeline").classList.add("hidden");
+  $("hit").classList.add("on");
+  $("hit").textContent = "Start the clip";
+  $("hazardBtn").disabled = true;
   document.querySelectorAll("#choices button").forEach((b) => {
     b.classList.remove("on");
     b.disabled = true;
   });
-  if (which === 0) {
-    clicks = [];
-    renderClicks();
-    $("timeline").classList.add("hidden");
-    $("hit").classList.add("on");
-    $("hit").textContent = "Start the clip";
-    $("hazardBtn").disabled = true;
-    $("meta").textContent = `Clip ${index + 1} of ${pack.clips.length} · ${c.place}. Click as soon as you see a hazard.`;
-    vid.pause();
-    try { vid.currentTime = 0; } catch (e) {}
-  }
+  vid.pause();
+  try { vid.currentTime = 0; } catch (e) {}
   paint();
 }
 
-async function load() {
-  const res = await fetch("api/clip");
-  const data = await res.json();
-  if (!res.ok) throw new Error(data.error || "Could not load a clip");
-  pack = data;
-  document.querySelectorAll("#choices button").forEach((btn) => {
-    btn.onclick = () => choose(btn.dataset.id, btn);
-  });
-  vid.src = clip().stream;
-  arm(0);
+function showModes() {
+  playToken += 1;
+  counting = false;
+  modeId = "";
+  clipData = null;
+  vid.removeAttribute("src");
+  vid.load();
+  $("modes").classList.remove("hidden");
+  $("desk").classList.add("hidden");
+  $("meta").textContent = "Choose Driving, Forklift driver, or Warehouse walk.";
+  clearError();
+}
+
+async function loadMode(mode) {
+  const token = ++playToken;
+  modeId = mode;
+  counting = false;
+  clearError();
+  document.querySelectorAll(".mode").forEach((btn) => { btn.disabled = true; });
+  $("meta").textContent = "Finding a clip for this mode…";
+  try {
+    const res = await fetch("api/clip", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({mode}),
+    });
+    const data = await res.json();
+    if (token !== playToken) return;
+    if (!res.ok) throw new Error(data.error || "Could not load a clip");
+    clipData = data;
+    $("modes").classList.add("hidden");
+    $("desk").classList.remove("hidden");
+    vid.src = clipData.stream;
+    resetPass();
+    $("meta").textContent = clipData.mode_name + " · " + clipData.place + ". Click or press Space when you see a hazard.";
+    focusClip();
+  } catch (err) {
+    if (token !== playToken) return;
+    $("meta").textContent = "The mode did not load a clip.";
+    showError(String(err.message || err));
+  } finally {
+    document.querySelectorAll(".mode").forEach((btn) => { btn.disabled = false; });
+  }
 }
 
 function startPass(which) {
+  if (!clipData) return;
   pass = which;
-  const c = clip();
   $("hit").classList.remove("on");
   $("hit").textContent = "";
   if (which === 2) {
-    $("banner").textContent = "Second pass · " + c.hazard;
+    const note = (boxPack && boxPack.note) || "Second pass.";
+    $("banner").textContent = note;
     $("banner").classList.remove("hidden");
     $("ask").classList.remove("hidden");
-    document.querySelectorAll("#choices button").forEach((b) => { b.disabled = false; });
+    document.querySelectorAll("#choices button").forEach((b) => {
+      b.disabled = false;
+      b.classList.toggle("on", b.dataset.id === pending);
+    });
     $("hazardBtn").disabled = true;
     drawBar();
-    const boxesNote = (boxPack && boxPack.available) ? "YOLO boxes are on the picture." : "This clip has no detection sidecar, so only your click marks are shown.";
-    $("meta").textContent = "Second pass. " + boxesNote + " Then choose what you should do.";
+    $("meta").textContent = "Second pass. " + note + " Press 1 to 5, then Enter.";
   } else {
     $("hazardBtn").disabled = false;
-    $("meta").textContent = "Click the picture, or the button, the moment you see a hazard.";
+    $("meta").textContent = clipData.mode_name + ". Space marks a hazard. Enter opens the second pass.";
+    fetch("api/prime?id=" + encodeURIComponent(clipData.id)).catch(() => {});
   }
   playToken += 1;
   try { vid.currentTime = 0; } catch (e) {}
   const playing = vid.play();
   if (playing && playing.catch) playing.catch(() => {});
+  focusClip();
 }
 
 function countdownThen(which) {
-  if (counting) return;
+  if (counting || !clipData) return;
   counting = true;
   const token = ++playToken;
   vid.muted = true;
@@ -596,6 +1003,12 @@ function countdownThen(which) {
   el.classList.remove("hidden");
   el.textContent = String(n);
   const timer = setInterval(() => {
+    if (token !== playToken) {
+      clearInterval(timer);
+      el.classList.add("hidden");
+      counting = false;
+      return;
+    }
     n -= 1;
     if (n <= 0) {
       clearInterval(timer);
@@ -628,11 +1041,67 @@ function noteClick(ev) {
   renderClicks();
 }
 
+function selectAction(id) {
+  if (!clipData || pass < 1 || answered || !NAMES[id]) return;
+  pending = id;
+  document.querySelectorAll("#choices button").forEach((b) => {
+    b.classList.toggle("on", b.dataset.id === id);
+  });
+  renderClicks();
+}
+
+function submitSelected() {
+  if (pass < 2 || answered) return;
+  if (!pending) {
+    $("rating").textContent = "Press 1 to 5 for the latest mark, then Enter.";
+    return;
+  }
+  const btn = document.querySelector('#choices button[data-id="' + pending + '"]');
+  choose(pending, btn);
+}
+
 $("hit").onclick = (ev) => {
+  focusClip();
   if (pass === 0) countdownThen(1);
   else noteClick(ev);
 };
-$("hazardBtn").onclick = () => noteClick(null);
+$("hazardBtn").onclick = () => {
+  noteClick(null);
+  focusClip();
+};
+document.querySelectorAll(".mode").forEach((btn) => {
+  btn.onclick = () => loadMode(btn.dataset.mode);
+});
+document.querySelectorAll("#choices button").forEach((btn) => {
+  btn.onclick = () => {
+    if (pass < 2 || answered) return;
+    selectAction(btn.dataset.id);
+    submitSelected();
+  };
+});
+
+document.addEventListener("keydown", (ev) => {
+  if (!clipFocused()) return;
+  const key = ev.key;
+  const marking = key === " " || key === "Spacebar";
+  const action = KEYS[key];
+  const enter = key === "Enter";
+  if (!marking && !action && !enter) return;
+  ev.preventDefault();
+  ev.stopPropagation();
+  if (counting) return;
+  if (marking) {
+    if (pass === 0) countdownThen(1);
+    else if (pass === 1) noteClick(null);
+    return;
+  }
+  if (action) {
+    selectAction(action);
+    return;
+  }
+  if (pass === 1) beginSecond();
+  else if (pass === 2) submitSelected();
+}, true);
 
 vid.ontimeupdate = () => {
   const head = document.getElementById("head");
@@ -641,15 +1110,37 @@ vid.ontimeupdate = () => {
 };
 
 async function beginSecond() {
-  pass = 2;
+  if (pass !== 1 || advancing || !clipData) return;
+  advancing = true;
   $("hazardBtn").disabled = true;
-  $("meta").textContent = "Loading click marks and YOLO boxes…";
+  $("meta").textContent = "Loading the main hazard…";
+  const token = playToken;
   try {
-    const res = await fetch("api/boxes?id=" + encodeURIComponent(clip().id));
-    boxPack = await res.json();
+    const res = await fetch("api/hazard", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({
+        id: clipData.id,
+        clicks,
+        duration: vid.duration || clipData.duration,
+      }),
+    });
+    const data = await res.json();
+    if (token !== playToken) return;
+    if (!res.ok) throw new Error(data.error || data.note || "Could not read detections");
+    boxPack = data;
   } catch (err) {
-    boxPack = {available: false, frames: []};
+    if (token !== playToken) return;
+    boxPack = {
+      sidecar: false,
+      frames: [],
+      label: null,
+      time: null,
+      note: "The detection sidecar could not be read.",
+    };
+    showError(String(err.message || err));
   }
+  if (token !== playToken) return;
   countdownThen(2);
 }
 
@@ -658,39 +1149,35 @@ vid.onended = () => {
 };
 
 async function choose(id, btn) {
-  if (pass < 2 || answered) return;
+  if (pass < 2 || answered || !clipData) return;
   answered = true;
-  document.querySelectorAll("#choices button").forEach((b) => b.classList.toggle("on", b === btn));
+  document.querySelectorAll("#choices button").forEach((b) => {
+    b.classList.toggle("on", b === btn || b.dataset.id === id);
+  });
   $("rating").textContent = "Scoring…";
   try {
     const res = await fetch("api/review", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({id: clip().id, clicks, action: id}),
+      body: JSON.stringify({
+        id: clipData.id,
+        clicks,
+        action: id,
+        duration: vid.duration || clipData.duration,
+      }),
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || "Score failed");
-    const verdict = data.action_ok
-      ? "That is the response to take."
-      : ("What you should do: " + data.expected + ".");
-    $("rating").textContent = "Score " + data.points + " out of 5. " + data.timing + " " + verdict + " " + data.why;
-    if (index < pack.clips.length - 1) $("next").classList.remove("hidden");
+    $("rating").textContent = "Score " + data.points + " out of 5. " + data.sentence;
+    $("again").classList.remove("hidden");
   } catch (err) {
     answered = false;
     $("rating").textContent = String(err.message || err);
   }
 }
 
-$("next").onclick = () => {
-  index += 1;
-  vid.src = clip().stream;
-  arm(0);
-};
-
-load().catch((err) => {
-  $("meta").textContent = "The test page is up, but the clip did not load.";
-  showError(String(err.message || err));
-});
+$("again").onclick = () => { if (modeId) loadMode(modeId); };
+$("change").onclick = () => showModes();
 </script>
 </body>
 </html>
@@ -704,53 +1191,65 @@ def health():
 
 @app.get("/")
 def index():
-    return Response(PAGE, mimetype="text/html")
+    return Response(PAGE, mimetype="text/html", headers={"Cache-Control": "no-store"})
 
 
-@app.get("/api/clip")
+@app.route("/api/clip", methods=["GET", "POST"])
 def api_clip():
+    payload = request.get_json(silent=True) if request.method == "POST" else {}
+    payload = payload or {}
+    mode = str(payload.get("mode") or request.args.get("mode") or "").strip().lower()
+    if mode not in MODES:
+        return jsonify({"error": "Choose driving, forklift, or walk", "modes": [item["name"] for item in MODES.values()]}), 400
     try:
-        rows = _clips()
+        row = _load_clip(mode)
     except Exception as exc:
         return jsonify({"error": str(exc)}), 503
-    return jsonify({"clips": [_public_clip(row) for row in rows], "actions": ACTIONS})
+    return jsonify(_public_clip(row))
 
 
-@app.get("/api/boxes")
-def api_boxes():
-    clip_id = request.args.get("id", "")
-    try:
-        rows = _clips()
-    except Exception as exc:
-        return jsonify({"available": False, "frames": [], "error": str(exc)})
-    row = next((item for item in rows if item["id"] == clip_id), None)
+@app.get("/api/prime")
+def api_prime():
+    row = _clip_by_id(request.args.get("id", ""))
     if row is None:
-        return jsonify({"available": False, "frames": [], "error": "unknown clip"}), 404
-    return jsonify(_thin_boxes(_detections(row["source"])))
+        return jsonify({"ok": False, "error": "unknown clip"}), 404
+    try:
+        _detections(row["source"])
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 503
+    return jsonify({"ok": True})
+
+
+@app.post("/api/hazard")
+def api_hazard():
+    payload = request.get_json(force=True, silent=True) or {}
+    row = _clip_by_id(str(payload.get("id") or ""))
+    if row is None:
+        return jsonify({"sidecar": False, "frames": [], "note": "YOLO had no sidecar for this clip.", "error": "unknown clip"}), 404
+    duration = _duration_of(payload, row)
+    try:
+        hazard = _hazard_for(row, _click_times(payload, duration), duration)
+    except Exception as exc:
+        return jsonify({"sidecar": False, "frames": [], "label": None, "time": None, "note": str(exc), "error": str(exc)}), 503
+    return jsonify(hazard)
 
 
 @app.post("/api/review")
 def api_review():
     payload = request.get_json(force=True, silent=True) or {}
-    try:
-        rows = _clips()
-    except Exception as exc:
-        return jsonify({"error": str(exc)}), 503
-    row = next((item for item in rows if item["id"] == payload.get("id")), None)
+    row = _clip_by_id(str(payload.get("id") or ""))
     if row is None:
         return jsonify({"error": "unknown clip"}), 404
-    points, timing = _score(_click_times(payload), float(row["window_start"]), float(row["window_end"]))
-    chosen = str(payload.get("action") or "")
-    return jsonify(
-        {
-            "points": points,
-            "timing": timing,
-            "action_ok": chosen == row["action"],
-            "expected": ACTION_LABELS.get(row["action"], ""),
-            "why": row["why"],
-            "hazard": row["hazard"],
-        }
-    )
+    duration = _duration_of(payload, row)
+    action = str(payload.get("action") or "")
+    if action not in ACTION_LABELS:
+        return jsonify({"error": "Choose slow, brake, wait, steer, or continue"}), 400
+    try:
+        hazard = _hazard_for(row, _click_times(payload, duration), duration)
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 503
+    scored = _score_reaction(row["mode"], hazard, action)
+    return jsonify(scored)
 
 
 @app.get("/api/stream")
@@ -794,14 +1293,111 @@ def stream_clip():
     return Response(stream_with_context(generate()), status=upstream.status_code, headers=headers)
 
 
-def _warm() -> None:
-    try:
-        _clips()
-    except Exception:
-        pass
+def _self_check() -> None:
+    shape = (1080, 1920)
 
+    def det(label: str, conf: float, x: float, y: float, w: float, h: float) -> dict[str, Any]:
+        height, width = shape
+        return {
+            "label": label,
+            "confidence": conf,
+            "bbox": [x * width, y * height, (x + w) * width, (y + h) * height],
+        }
 
-threading.Thread(target=_warm, name="hazard-warm", daemon=True).start()
+    def frames_of(*rows: tuple[float, list[dict[str, Any]]]) -> dict[str, Any]:
+        return {
+            "video_shape": list(shape),
+            "frames": [
+                {"time_sec": moment, "shape": list(shape), "detections": dets}
+                for moment, dets in rows
+            ],
+        }
+
+    person = det("person", 0.9, 0.42, 0.42, 0.14, 0.36)
+    bike = det("bicycle", 0.88, 0.40, 0.50, 0.16, 0.18)
+    close_car = det("car", 0.9, 0.40, 0.48, 0.22, 0.22)
+    distant = det("car", 0.92, 0.70, 0.20, 0.05, 0.05)
+    light = det("traffic light", 0.95, 0.10, 0.05, 0.08, 0.16)
+    bench = det("bench", 0.95, 0.30, 0.60, 0.30, 0.20)
+    clock = det("clock", 0.99, 0.45, 0.45, 0.20, 0.30)
+    truck = det("truck", 0.9, 0.35, 0.40, 0.28, 0.30)
+    fridge = det("refrigerator", 0.8, 0.40, 0.45, 0.18, 0.22)
+
+    mixed = frames_of(
+        (2.0, [distant, light, bench, clock, close_car, bike, person]),
+    )
+    picked = _main_hazard("driving", mixed, [2.0], 5)
+    assert picked["label"] == "person stepping out", picked
+    assert picked["sidecar"] is True
+    assert all(len(frame["boxes"]) == 1 for frame in picked["frames"])
+    assert picked["frames"][0]["boxes"][0]["label"] == "person stepping out"
+
+    cyclist = _main_hazard(
+        "driving",
+        frames_of((3.0, [bike, close_car, distant, light])),
+        [3.0],
+        5,
+    )
+    assert cyclist["label"] == "cyclist", cyclist
+
+    nothing = _main_hazard(
+        "driving",
+        frames_of((1.5, [distant, light, bench, clock])),
+        [1.5],
+        5,
+    )
+    assert nothing["sidecar"] is True and nothing["label"] is None, nothing
+
+    missing = _main_hazard("driving", None, [1.0], 5)
+    assert missing["sidecar"] is False
+    assert "no sidecar" in missing["note"]
+
+    early = _main_hazard(
+        "driving",
+        frames_of((0.2, [clock]), (3.6, [person])),
+        [0.2],
+        5,
+    )
+    assert early["label"] == "person stepping out", early
+
+    local = _main_hazard(
+        "driving",
+        frames_of((0.4, [person]), (3.0, [bike])),
+        [3.0],
+        5,
+    )
+    assert local["label"] == "cyclist", local
+
+    walk_person = _main_hazard("walk", frames_of((2.0, [person, truck])), [2.0], 5)
+    assert walk_person["label"] == "person with a load", walk_person
+
+    walk_truck = _main_hazard("walk", frames_of((2.0, [truck, distant, bench])), [2.0], 5)
+    assert walk_truck["label"] == "forklift", walk_truck
+
+    aisle = _main_hazard("forklift", frames_of((2.0, [person, fridge, bench, clock])), [2.0], 5)
+    assert aisle["label"] == "person in the aisle", aisle
+
+    rack = _main_hazard("forklift", frames_of((2.2, [fridge, bench, light])), [2.2], 5)
+    assert rack["label"] == "rack ahead", rack
+
+    scored = _score_reaction("driving", picked, "brake")
+    assert scored["points"] == 5 and scored["sentence"].endswith(".")
+    assert _score_reaction("driving", picked, "continue")["points"] == 0
+    bare = _score_reaction("driving", missing, "slow")
+    assert bare["points"] == 5 and "no sidecar" in bare["sentence"]
+
+    for spec in MODES.values():
+        assert "\n" not in spec["query"]
+        for filters in spec["filters"]:
+            body = _search_body(spec["query"], filters)
+            assert body["llm_top_n"] >= 1
+            assert body["metadata_filters"] == filters
+    assert MODES["driving"]["filters"][0] == {"capture_type": "streets"}
+    assert WAREHOUSE_FILTER in MODES["forklift"]["filters"]
+    assert WAREHOUSE_FILTER in MODES["walk"]["filters"]
+    assert _allows("driving", {"location": "warehouse3", "camera_id": "sdg_warehouse_cam-2", "capture_type": "warehouse"}) is False
+    assert _allows("forklift", {"location": "new_york", "camera_id": "nyc_streets_cam-1", "capture_type": "streets"}) is False
+    assert "Driving" in PAGE and "Forklift" in PAGE and "Space" in PAGE
 
 
 if __name__ == "__main__":
