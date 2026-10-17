@@ -5,7 +5,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 TOKEN="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
-REMOTE="${GITHUB_REMOTE:-github}"
+REMOTE="${GITHUB_REMOTE:-origin}"
 BRANCH="${1:-main}"
 
 if [[ -n "$TOKEN" ]]; then

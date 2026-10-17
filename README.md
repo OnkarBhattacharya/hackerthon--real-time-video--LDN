@@ -1,5 +1,12 @@
 # Hackerthon — Real-Time Video (LDN)
 
+**Repository:** [github.com/ahmedm87/hackerthon--real-time-video--LDN](https://github.com/ahmedm87/hackerthon--real-time-video--LDN)
+
+```bash
+git clone https://github.com/ahmedm87/hackerthon--real-time-video--LDN.git
+cd hackerthon--real-time-video--LDN
+```
+
 Browser UI (**Vite + TypeScript → `web/dist/`**, served by FastAPI) over a video ingest, indexing, agent, and localization pipeline.
 
 ## Architecture
