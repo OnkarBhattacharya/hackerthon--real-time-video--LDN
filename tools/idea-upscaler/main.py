@@ -1054,10 +1054,11 @@ INDEX_HTML = r"""<!DOCTYPE html>
         <ol class="progress hidden" id="progress"></ol>
         <div class="actions">
           <button id="go" type="button">Upscale idea</button>
-          <button id="demo" class="ghost" type="button">Load demo brief</button>
+          <button id="demo" class="ghost" type="button">Dusk bike ride</button>
           <button id="shitty" class="ghost" type="button">Upscale shittyvideo</button>
           <span class="status" id="status"></span>
         </div>
+        <div class="actions" id="briefs"></div>
       </div>
       <div class="panel cut" id="cut-panel">
         <h2>Director's cut</h2>
@@ -1168,12 +1169,63 @@ async function runUpscale({ seed }) {
   }
 }
 
-$("demo").onclick = () => {
+const BRIEFS = [
+  {
+    label: "Dusk bike ride",
+    logline: "Dusk ride through the city. A cyclist in the bike lane, then a quiet stop.",
+    beats: "Wide city street at dusk\nCyclist riding in the marked bike lane\nPedestrians at a crosswalk\nCyclist paused on the sidewalk",
+    transcript: "We told ourselves it was just another night ride.\nBut the city already knew we were leaving.",
+    seconds: 12,
+  },
+  {
+    label: "Warehouse forklift",
+    logline: "A forklift moves down a warehouse aisle and slows near the racks.",
+    beats: "Wide view of the warehouse aisle\nForklift driving between the shelves\nIt slows beside stacked goods",
+    transcript: "The aisle is clear.\nThen the forklift takes the lane.",
+    seconds: 12,
+  },
+  {
+    label: "SF crosswalk",
+    logline: "People cross a San Francisco street while the cars wait.",
+    beats: "Wide city intersection\nTwo people walking in the crosswalk\nCars held at the crossing",
+    transcript: "They step off the curb.\nThe street lets them through.",
+    seconds: 12,
+  },
+  {
+    label: "Highway lanes",
+    logline: "Overhead highway. Traffic flows both ways, with a truck among the lanes.",
+    beats: "Wide multi-lane highway\nTraffic moving in both directions\nA truck holding its lane",
+    transcript: "The lanes keep moving.\nNobody brakes.",
+    seconds: 12,
+  },
+  {
+    label: "Indoor hall",
+    logline: "People walk across a bright indoor hall.",
+    beats: "Open indoor floor and white walls\nPeople crossing the space\nThey pass toward the far side",
+    transcript: "The room is already busy.\nSomeone crosses through.",
+    seconds: 12,
+  },
+];
+
+function applyBrief(b, run) {
   $("seed").checked = false;
-  $("logline").value = "Dusk ride through the city — freedom framed as motion, then a quiet stop that feels like goodbye.";
-  $("beats").value = "Wide establishing: canyon of buildings, fading light\nTracking medium: cyclist in yellow jacket in the bike lane\nCrosswalk beat: pedestrians and green light\nClose: cyclist paused on sidewalk with phone";
-  $("transcript").value = "We told ourselves it was just another night ride.\nBut the city already knew we were leaving.";
-};
+  $("logline").value = b.logline;
+  $("beats").value = b.beats;
+  $("transcript").value = b.transcript;
+  $("lengthMode").value = "custom";
+  $("lengthSec").value = String(b.seconds || 12);
+  $("lengthWrap").classList.remove("hidden");
+  if (run) runUpscale({ seed: false });
+}
+
+$("briefs").innerHTML = BRIEFS.slice(1).map((b, i) =>
+  `<button type="button" class="ghost" data-brief="${i + 1}">${b.label}</button>`
+).join("");
+$("briefs").querySelectorAll("button").forEach(btn => {
+  btn.onclick = () => applyBrief(BRIEFS[Number(btn.dataset.brief)], true);
+});
+
+$("demo").onclick = () => applyBrief(BRIEFS[0], true);
 
 $("shitty").onclick = () => {
   $("seed").checked = true;
