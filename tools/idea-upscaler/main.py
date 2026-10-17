@@ -2877,7 +2877,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
         </div>
         <ol class="progress hidden" id="progress"></ol>
         <div class="actions">
-          <button id="go" type="button">Upscale idea</button>
+          <button id="go" type="button">Recut</button>
           <button id="demo" class="chip" type="button">Streets · NYC bike</button>
           <button id="shitty" class="chip" type="button">My upload</button>
           <span class="status" id="status"></span>
@@ -2903,7 +2903,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
       <section class="panel cut stage" id="cut-panel">
         <h2>Director's cut</h2>
         <div class="video-frame">
-          <p class="status" id="cut-empty">Upscale shittyvideo to cut a reel the same length as your clip, with the VO burned in.</p>
+          <p class="status" id="cut-empty">Click Recut to cut a reel the same length as your clip, with the VO burned in.</p>
           <video id="cut-video" class="hidden" controls playsinline></video>
         </div>
         <div id="timeline" class="tl hidden"></div>
@@ -2929,6 +2929,7 @@ let state = null;
 let active = 0;
 let verdict = "";
 let briefHealth = "";
+let lastBrief = null;
 
 function setProgress(steps, activeIdx) {
   const el = $("progress");
@@ -2937,11 +2938,13 @@ function setProgress(steps, activeIdx) {
 }
 
 async function runUpscale({ seed, health }) {
-  const logline = $("logline").value.trim();
+  const logline = $("logline").value.trim() || (lastBrief && String(lastBrief.logline || "").trim()) || "";
+  const beats = $("beats").value.trim() || (lastBrief && String(lastBrief.beats || "").trim()) || "";
+  const transcript = $("transcript").value.trim() || (lastBrief && String(lastBrief.transcript || "").trim()) || "";
   const useSeed = seed || $("seed").checked;
   const safetyKind = (health === "level_crossing" || health === true) ? "level_crossing" : "";
-  if (!logline && !useSeed && !safetyKind) {
-    $("status").textContent = "Logline is required, or use Upscale shittyvideo.";
+  if (!logline && !beats && !transcript && !lastBrief) {
+    $("status").textContent = "Pick a brief or type a logline, then click Upscale idea.";
     $("status").className = "status err";
     return;
   }
@@ -2967,8 +2970,8 @@ async function runUpscale({ seed, health }) {
       headers: {"Content-Type": "application/json"},
       body: JSON.stringify({
         logline,
-        beats: $("beats").value,
-        transcript: $("transcript").value,
+        beats,
+        transcript,
         voice: $("voice").value,
         bed: $("bed").value,
         duration_sec: $("lengthMode").value === "custom" ? Number($("lengthSec").value) : null,
@@ -3060,6 +3063,7 @@ function applyBrief(b) {
   $("logline").value = b.logline;
   $("beats").value = b.beats;
   $("transcript").value = b.transcript;
+  lastBrief = b;
   briefHealth = b.health === "level_crossing" ? "level_crossing" : "";
   if (b.health === "level_crossing") $("ccbroll").checked = true;
 }
