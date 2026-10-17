@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import html
 import json
 import os
@@ -584,6 +585,32 @@ class LevelCrossingFootageError(RuntimeError):
     """Commons could not supply a real railway clip. Do not substitute a crosswalk."""
 
 
+# Set only while a level-crossing brief is gathering footage. A slow Commons
+# download must stop inside this budget so the POST can still return JSON.
+_FOOTAGE_DEADLINE: contextvars.ContextVar[float | None] = contextvars.ContextVar(
+    "footage_deadline", default=None
+)
+LEVEL_CROSSING_BUDGET_SEC = 80.0
+
+
+def _raise_if_footage_late() -> None:
+    end = _FOOTAGE_DEADLINE.get()
+    if end is not None and time.monotonic() >= end:
+        raise LevelCrossingFootageError(
+            "Level crossing film stopped: Wikimedia Commons took too long. "
+            "No street crosswalk or warehouse clip was used."
+        )
+
+
+def _footage_timeout(cap: float) -> float:
+    """Socket timeout that cannot outlive the level-crossing footage budget."""
+    _raise_if_footage_late()
+    end = _FOOTAGE_DEADLINE.get()
+    if end is None:
+        return cap
+    return max(1.0, min(cap, end - time.monotonic()))
+
+
 # A city crosswalk, highway, or warehouse is not a level crossing.
 _NON_RAIL_CAPTURE = {"streets", "street", "highway", "indoor", "warehouse"}
 _NON_RAIL_PLACE = (
@@ -830,17 +857,19 @@ def _commons_api(params: dict[str, Any]) -> dict[str, Any]:
                 COMMONS_API,
                 params={"format": "json", "formatversion": "2", **params},
                 headers={"User-Agent": COMMONS_UA},
-                timeout=25,
+                timeout=_footage_timeout(25),
             )
             if resp.status_code == 429:
-                time.sleep(1.2 * (attempt + 1))
+                time.sleep(min(1.2 * (attempt + 1), _footage_timeout(3)))
                 last = RuntimeError("Commons rate limited")
                 continue
             resp.raise_for_status()
             return resp.json()
+        except LevelCrossingFootageError:
+            raise
         except requests.RequestException as exc:
             last = exc
-            time.sleep(0.8 * (attempt + 1))
+            time.sleep(min(0.8 * (attempt + 1), _footage_timeout(2)))
     raise LevelCrossingFootageError(
         "Level crossing film stopped: Wikimedia Commons is unreachable "
         f"({type(last).__name__ if last else 'error'}). "
@@ -1048,11 +1077,14 @@ def _pick_level_crossing_clips(shots: list[dict[str, Any]]) -> list[dict[str, An
             if record["title"] in reserved and (not chosen[i] or record["title"] != chosen[i]["title"]):
                 continue
             try:
+                _raise_if_footage_late()
                 got = _download_commons_record(record, dest_dir)
                 break
+            except LevelCrossingFootageError:
+                raise
             except Exception as exc:
                 last_err = f"{type(exc).__name__}: {exc}"[:220]
-                time.sleep(2)
+                time.sleep(min(2.0, _footage_timeout(2)))
         if not got:
             raise LevelCrossingFootageError(
                 "Level crossing film stopped: could not download a real railway clip for "
@@ -1267,15 +1299,18 @@ def _download_capped(url: str, dest: Path) -> None:
     last_err: Exception | None = None
     for attempt in range(2):
         try:
-            with requests.get(url, stream=True, timeout=45, headers={"User-Agent": COMMONS_UA}) as resp:
+            with requests.get(
+                url, stream=True, timeout=_footage_timeout(45), headers={"User-Agent": COMMONS_UA}
+            ) as resp:
                 if resp.status_code == 429:
-                    time.sleep(1.5)
+                    time.sleep(min(1.5, _footage_timeout(2)))
                     last_err = RuntimeError("Commons rate limited")
                     continue
                 resp.raise_for_status()
                 total = 0
                 with dest.open("wb") as fh:
                     for chunk in resp.iter_content(64 * 1024):
+                        _raise_if_footage_late()
                         if not chunk:
                             continue
                         total += len(chunk)
@@ -1283,11 +1318,14 @@ def _download_capped(url: str, dest: Path) -> None:
                             raise RuntimeError("over 40MB")
                         fh.write(chunk)
             return
+        except LevelCrossingFootageError:
+            dest.unlink(missing_ok=True)
+            raise
         except requests.RequestException as exc:
             dest.unlink(missing_ok=True)
             last_err = exc
             if attempt < 1:
-                time.sleep(1.5)
+                time.sleep(min(1.5, _footage_timeout(2)))
                 continue
             raise
     dest.unlink(missing_ok=True)
@@ -1860,16 +1898,21 @@ def upscale():
         prebuilt: list[dict[str, Any]] | None = None
         if level_crossing:
             splitter = "level_crossing"
+            deadline = _FOOTAGE_DEADLINE.set(time.monotonic() + LEVEL_CROSSING_BUDGET_SEC)
             try:
-                enriched, prebuilt = _assemble_level_crossing()
-            except LevelCrossingFootageError as e:
-                return jsonify(
-                    {
-                        "error": str(e),
-                        "health_safety": "level_crossing",
-                        "splitter": "level_crossing",
-                    }
-                ), 502
+                try:
+                    enriched, prebuilt = _assemble_level_crossing()
+                except LevelCrossingFootageError as e:
+                    # Status 502 is replaced by an HTML error page in front of this app.
+                    return jsonify(
+                        {
+                            "error": str(e),
+                            "health_safety": "level_crossing",
+                            "splitter": "level_crossing",
+                        }
+                    ), 500
+            finally:
+                _FOOTAGE_DEADLINE.reset(deadline)
         else:
             splitter = "wandb"
             shots = _wandb_shots(logline, beats, transcript)
