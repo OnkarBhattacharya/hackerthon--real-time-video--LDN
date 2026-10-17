@@ -95,9 +95,11 @@ if [[ -n "${WANDB_PROJECT:-}" ]]; then
   CM_ARGS+=(--from-file="wandb-project=${WANDB_PROJECT_FILE}")
 fi
 
+# Server-side apply: client-side apply stores the whole ConfigMap in
+# last-applied-configuration, which exceeds the annotation size limit.
 kubectl -n "$NS" create configmap hackathon-app-code \
   "${CM_ARGS[@]}" \
-  --dry-run=client -o yaml | kubectl apply -f -
+  --dry-run=client -o yaml | kubectl apply --server-side --force-conflicts -f -
 
 kubectl -n "$NS" rollout restart deploy/hackathon-app
 kubectl -n "$NS" rollout status deploy/hackathon-app --timeout=240s

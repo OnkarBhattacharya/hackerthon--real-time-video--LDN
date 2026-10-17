@@ -72,16 +72,18 @@ KUBECONFIG=/config/team-41-k8s.yaml tools/idea-upscaler/deploy.sh
 - Kubeconfig: `/config/team-41-k8s.yaml`
 - Live path: `/app` on the team ingress (`video-lab-team-41.cosmos.vastdata.com`). People open it from the workshop App button.
 - No docker build. `deploy.sh` updates ConfigMap `hackathon-app-code` and restarts `deploy/hackathon-app`.
+- Client-side `kubectl apply` stores the whole ConfigMap in `last-applied-configuration` and fails once `main.py` is large (`metadata.annotations: Too long: may not be more than 262144 bytes`). The script now uses `kubectl apply --server-side --force-conflicts`.
+- Last deploy with that script rolled out and `http://video-lab-team-41.cosmos.vastdata.com/app/upscaler` returned 200. The live page has scenario boxes, shot `max="12"` `value="4"`, and the hint that a stated shot count or length overrides the controls.
 
 ## Card 2
 
 LDN Video Ask is card 2. Do not lock it. Do not change `GUEST_UPSTREAM`. `deploy.sh` does not set, unset, or restore that variable.
 
-Checked on the deployment before this deploy: `GUEST_UPSTREAM` was `http://near-miss-app:80`. The older note that it must be `http://ldn-video-ask:80` is not what the cluster has. Leave the live value alone.
+Checked on the deployment after the recutter rollout: `GUEST_UPSTREAM` is still `http://near-miss-app:80`. The older note that it must be `http://ldn-video-ask:80` is not what the cluster has. Leave the live value alone.
 
 ## Card 3
 
-`/app/hazard` is already routed. `hazard()` in `main.py` proxies `HAZARD_UPSTREAM` or `http://hazard-perception:80`. It was left in place.
+`/app/hazard` is already routed. `hazard()` in `main.py` proxies `HAZARD_UPSTREAM` or `http://hazard-perception:80`. It was left in place. After the recutter rollout, `GET /app/hazard` returned 200 and `HAZARD_UPSTREAM` was still `http://hazard-perception:80`.
 
 ## Git
 
