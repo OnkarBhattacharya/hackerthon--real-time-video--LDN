@@ -52,6 +52,7 @@ WANDB_MODEL = os.environ.get("WANDB_MODEL", "meta-llama/Llama-3.1-8B-Instruct")
 APP_PREFIX = "/app"
 
 app = Flask(__name__)
+app.url_map.strict_slashes = False
 
 
 @app.errorhandler(Exception)
@@ -61,6 +62,20 @@ def _json_errors(err: Exception):
 
     if isinstance(err, HTTPException):
         return jsonify({"error": err.description, "type": type(err).__name__}), err.code or 500
+    if type(err).__name__ == "LevelCrossingFootageError":
+        text = str(err)
+        return jsonify(
+            {
+                "splitter": "level_crossing",
+                "cosmos_reason": "fallback",
+                "health_safety": "level_crossing",
+                "shots": [],
+                "directors_cut": [],
+                "rendered_cut": None,
+                "render_error": text,
+                "error": text,
+            }
+        ), 200
     return jsonify({"error": str(err), "type": type(err).__name__}), 500
 
 _token_lock = threading.Lock()
@@ -653,6 +668,12 @@ LEVEL_CROSSING_LINES = [
 MAX_RAIL_CC_SECONDS = 180.0
 
 
+def _as_bool(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
 def _is_level_crossing_request(payload: dict[str, Any]) -> bool:
     brief = str(payload.get("brief") or "").strip().lower().replace("-", "_").replace(" ", "_")
     if brief in {"level_crossing", "safety_level_crossing"}:
@@ -1060,26 +1081,45 @@ def _download_commons_record(record: dict[str, Any], dest_dir: Path) -> dict[str
     }
 
 
-def _pick_level_crossing_clips(shots: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """One distinct real level-crossing clip per beat. Never a street crosswalk."""
+def _mentions_rate_limit(err: object) -> bool:
+    return "rate limit" in str(err).lower()
+
+
+def _footage_ran_out(err: object) -> bool:
+    return "took too long" in str(err).lower()
+
+
+def _pick_level_crossing_clips(
+    shots: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any] | None], bool]:
+    """One real railway clip per beat, or None when that beat could not be downloaded.
+
+    A rate-limited file is retried 3 times (2s, 5s, 10s) inside the downloader,
+    then the next railway candidate. A missed beat does not discard beats that
+    already downloaded, and this never substitutes a street crosswalk.
+    """
     titles: list[str] = []
     for shot in shots:
         for name in shot.get("commons_files") or []:
             if name not in titles:
                 titles.append(name)
+    saw_rate_limit = False
+    catalog: dict[str, dict[str, Any]] = {}
     try:
         catalog = _commons_lookup_titles(titles)
-    except LevelCrossingFootageError:
-        raise
+    except LevelCrossingFootageError as exc:
+        saw_rate_limit = _mentions_rate_limit(exc)
+        if _footage_ran_out(exc):
+            return [None] * len(shots), saw_rate_limit
     except Exception as exc:
-        raise LevelCrossingFootageError(
-            "Level crossing film stopped: Wikimedia Commons failed "
-            f"({type(exc).__name__}). No street crosswalk or warehouse clip was used."
-        ) from exc
+        saw_rate_limit = _mentions_rate_limit(exc)
 
     chosen: list[dict[str, Any] | None] = [None] * len(shots)
     used: set[str] = set()
+    stop = False
     for i, shot in enumerate(shots):
+        if stop:
+            break
         for name in shot.get("commons_files") or []:
             record = catalog.get(name)
             if not record or record["title"] in used:
@@ -1087,33 +1127,32 @@ def _pick_level_crossing_clips(shots: list[dict[str, Any]]) -> list[dict[str, An
             chosen[i] = record
             used.add(record["title"])
             break
-    for i, shot in enumerate(shots):
         if chosen[i]:
             continue
-        last_err = "no railway clip in the first search"
         for query in shot.get("commons_queries") or []:
             try:
+                _raise_if_footage_late()
                 record = _commons_search_railway(query, used)
-            except LevelCrossingFootageError:
-                raise
+            except LevelCrossingFootageError as exc:
+                saw_rate_limit = saw_rate_limit or _mentions_rate_limit(exc)
+                if _footage_ran_out(exc):
+                    stop = True
+                    break
+                continue
             except Exception as exc:
-                last_err = f"Commons search failed ({type(exc).__name__})"
+                saw_rate_limit = saw_rate_limit or _mentions_rate_limit(exc)
                 continue
             if record:
                 chosen[i] = record
                 used.add(record["title"])
                 break
-            last_err = f"tighter search “{query}” returned no railway clip"
-        if not chosen[i]:
-            raise LevelCrossingFootageError(
-                "Level crossing film stopped: Commons had no real railway clip for "
-                f"“{shot.get('title') or 'a beat'}” ({last_err}). "
-                "A city crosswalk was not used."
-            )
 
     dest_dir = CUTS_DIR / "cc-incoming"
-    clips = []
+    clips: list[dict[str, Any] | None] = []
     for i, shot in enumerate(shots):
+        if stop:
+            clips.append(None)
+            continue
         options: list[dict[str, Any]] = []
         for name in shot.get("commons_files") or []:
             record = catalog.get(name)
@@ -1126,13 +1165,12 @@ def _pick_level_crossing_clips(shots: list[dict[str, Any]]) -> list[dict[str, An
             for j in range(i + 1, len(shots))
             if chosen[j]
         }
-        got = None
+        got: dict[str, Any] | None = None
         last_err = "no downloadable railway clip"
-        saw_rate_limit = False
 
         def _take(record: dict[str, Any]) -> bool:
-            nonlocal got, last_err, saw_rate_limit
-            if any(record["title"] == clip["title"] for clip in clips):
+            nonlocal got, last_err, saw_rate_limit, stop
+            if any(clip and record["title"] == clip["title"] for clip in clips):
                 return False
             if record["title"] in reserved and (not chosen[i] or record["title"] != chosen[i]["title"]):
                 return False
@@ -1140,79 +1178,113 @@ def _pick_level_crossing_clips(shots: list[dict[str, Any]]) -> list[dict[str, An
                 _raise_if_footage_late()
                 got = _download_commons_record(record, dest_dir)
                 return True
-            except LevelCrossingFootageError:
-                raise
+            except LevelCrossingFootageError as exc:
+                last_err = str(exc)[:220]
+                if _mentions_rate_limit(exc):
+                    saw_rate_limit = True
+                if _footage_ran_out(exc):
+                    stop = True
+                return False
             except Exception as exc:
                 last_err = f"{type(exc).__name__}: {exc}"[:220]
-                if "rate limit" in last_err.lower():
+                if _mentions_rate_limit(exc):
                     saw_rate_limit = True
                 return False
 
         for record in options:
-            if _take(record):
+            if stop or _take(record):
                 break
-        if not got:
-            used_now = {clip["title"] for clip in clips}
+        if not got and not stop:
+            used_now = {clip["title"] for clip in clips if clip}
             for query in shot.get("commons_queries") or []:
                 try:
                     _raise_if_footage_late()
                     record = _commons_search_railway(query, used_now)
-                except LevelCrossingFootageError:
-                    raise
+                except LevelCrossingFootageError as exc:
+                    last_err = str(exc)[:220]
+                    if _mentions_rate_limit(exc):
+                        saw_rate_limit = True
+                    if _footage_ran_out(exc):
+                        stop = True
+                        break
+                    continue
                 except Exception as exc:
                     last_err = f"Commons search failed ({type(exc).__name__})"
-                    if "rate limit" in str(exc).lower():
+                    if _mentions_rate_limit(exc):
                         saw_rate_limit = True
                     continue
                 if not record:
                     last_err = f"tighter search “{query}” returned no railway clip"
                     continue
                 used_now.add(record["title"])
-                if _take(record):
+                if _take(record) or stop:
                     break
-        if not got:
-            beat = shot.get("title") or "a beat"
-            if saw_rate_limit or "rate limit" in last_err.lower():
-                raise LevelCrossingFootageError(
-                    "Level crossing film stopped: Commons is rate limited and no real railway clip "
-                    f"could be downloaded for “{beat}”. No street crosswalk was used."
-                )
-            raise LevelCrossingFootageError(
-                "Level crossing film stopped: could not download a real railway clip for "
-                f"“{beat}” ({last_err}). "
-                "No street crosswalk was substituted."
-            )
+        if not got and _mentions_rate_limit(last_err):
+            saw_rate_limit = True
         clips.append(got)
-    if len(clips) != len(shots):
-        raise LevelCrossingFootageError(
-            "Level crossing film stopped: a beat was left without railway footage."
-        )
-    return clips
+    return clips, saw_rate_limit
 
 
 ARCHIVE_RAIL_NOTE = (
-    "No level crossing in the archive. Tick CC B-roll to add Commons footage."
+    "No level crossing in the archive. Tick CC B-roll if you want Commons footage."
+)
+COMMONS_RATE_LIMIT_NOTE = (
+    "Level crossing film stopped: Commons is rate limited and no real railway clip "
+    "could be downloaded. No street crosswalk was used."
 )
 
 
-def _assemble_level_crossing(*, cc_broll: bool) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def _public_level_shot(shot: dict[str, Any]) -> dict[str, Any]:
+    return {k: v for k, v in shot.items() if k not in {"commons_files", "commons_queries"}}
+
+
+def _empty_level_storyboard() -> list[dict[str, Any]]:
+    return [
+        {**_public_level_shot(shot), "matches": [], "footage": "none"}
+        for shot in _level_crossing_shots()
+    ]
+
+
+def _shot_is_not_rail(item: dict[str, Any]) -> bool:
+    capture = str(item.get("capture_type") or "").lower()
+    place = f"{item.get('location') or ''} {item.get('camera_id') or ''} {item.get('filename') or ''}".lower()
+    if capture in _NON_RAIL_CAPTURE:
+        return True
+    return any(tok in place for tok in ("warehouse", "forklift", "crosswalk", "san_francisco", "highway"))
+
+
+def _assemble_level_crossing(
+    *,
+    cc_broll: bool,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str | None]:
+    """Archive first. Wikimedia runs only when CC B-roll is ticked.
+
+    The third value is a fatal render_error when nothing can be cut, or a
+    missing-beat note when some real railway clips are ready to render.
+    """
     shots = _level_crossing_shots()
-    archive = _search_level_crossing_archive()
-    archive = [m for m in archive if _archive_is_level_crossing(m)]
-    # Commons runs only when the user ticked CC B-roll. An unticked box never
-    # calls Wikimedia, even when the archive has no railway clip.
-    if not cc_broll:
-        if not archive:
-            raise LevelCrossingFootageError(ARCHIVE_RAIL_NOTE)
-        shots = shots[: len(archive)]
-        cc_clips: list[dict[str, Any]] = []
-    else:
-        cc_needed = shots[len(archive):]
-        cc_clips = _pick_level_crossing_clips(cc_needed) if cc_needed else []
+    archive = [m for m in _search_level_crossing_archive() if _archive_is_level_crossing(m)]
+    if not cc_broll and not archive:
+        return _empty_level_storyboard(), [], ARCHIVE_RAIL_NOTE
+
+    cc_aligned: list[dict[str, Any] | None] = [None] * len(shots)
+    missing: list[str] = []
+    saw_rate_limit = False
+    if cc_broll:
+        need = list(range(len(archive), len(shots)))
+        if need:
+            picked, saw_rate_limit = _pick_level_crossing_clips([shots[i] for i in need])
+            for offset, idx in enumerate(need):
+                clip = picked[offset] if offset < len(picked) else None
+                if clip:
+                    cc_aligned[idx] = clip
+                else:
+                    missing.append(str(shots[idx].get("title") or "a beat"))
+
     enriched: list[dict[str, Any]] = []
     ordered: list[dict[str, Any]] = []
     for i, shot in enumerate(shots):
-        clean = {k: v for k, v in shot.items() if k not in {"commons_files", "commons_queries"}}
+        clean = _public_level_shot(shot)
         if i < len(archive):
             match = archive[i]
             enriched.append({**clean, "matches": [match], "footage": "archive"})
@@ -1226,14 +1298,17 @@ def _assemble_level_crossing(*, cc_broll: bool) -> tuple[list[dict[str, Any]], l
                 "origin": "archive",
             })
             continue
-        clip = cc_clips[i - len(archive)]
+        clip = cc_aligned[i]
+        if not clip:
+            enriched.append({**clean, "matches": [], "footage": "none"})
+            continue
         credit = {
             "title": clip["title"],
             "author": clip["author"],
             "license": clip["license"],
             "license_url": clip["license_url"],
         }
-        note = (
+        credit_line = (
             f"CC B-roll: {credit['title']} · {credit['author']} · {credit['license']} · {credit['license_url']}"
         )
         synthetic = {
@@ -1242,7 +1317,7 @@ def _assemble_level_crossing(*, cc_broll: bool) -> tuple[list[dict[str, Any]], l
             "location": "wikimedia-commons",
             "camera_id": "",
             "capture_type": "level_crossing",
-            "reasoning": note,
+            "reasoning": credit_line,
             "similarity_score": None,
             "playback_url": "",
             "cc": credit,
@@ -1259,15 +1334,39 @@ def _assemble_level_crossing(*, cc_broll: bool) -> tuple[list[dict[str, Any]], l
             "origin": "commons",
             "cc": credit,
         })
+
+    safe_ordered: list[dict[str, Any]] = []
     for item in ordered:
-        capture = str(item.get("capture_type") or "").lower()
-        place = f"{item.get('location') or ''} {item.get('camera_id') or ''} {item.get('filename') or ''}".lower()
-        if capture in _NON_RAIL_CAPTURE or any(tok in place for tok in ("warehouse", "forklift", "crosswalk", "san_francisco")):
-            raise LevelCrossingFootageError(
-                "Level crossing film stopped: a shot was not a railway crossing "
-                f"({item.get('title')}: {item.get('filename')}). No crosswalk cut was rendered."
+        if _shot_is_not_rail(item):
+            title = str(item.get("title") or "a beat")
+            if title not in missing:
+                missing.append(title)
+            continue
+        safe_ordered.append(item)
+    ordered = safe_ordered
+
+    if not ordered:
+        if not cc_broll:
+            return enriched or _empty_level_storyboard(), [], ARCHIVE_RAIL_NOTE
+        if saw_rate_limit:
+            return enriched, [], COMMONS_RATE_LIMIT_NOTE
+        return enriched, [], (
+            "Level crossing film stopped: no real railway clip could be downloaded. "
+            "No street crosswalk was used."
+        )
+
+    note = None
+    if missing and cc_broll:
+        label = "Missing beat" if len(missing) == 1 else "Missing beats"
+        names = ", ".join(missing)
+        if saw_rate_limit:
+            note = (
+                f"{label}: {names}. Commons was rate limited for that clip. "
+                "No street crosswalk was used."
             )
-    return enriched, ordered
+        else:
+            note = f"{label}: {names}. No street crosswalk was used."
+    return enriched, ordered, note
 
 
 # Cosmos3-Reason chat. The skill builds this URL when COSMOS3_REASON_URL is unset.
@@ -2269,6 +2368,9 @@ def upload_seed():
 
 @app.post("/api/upscale")
 def upscale():
+    level_crossing = False
+    cc_broll = False
+    logline = ""
     try:
         payload = request.get_json(force=True, silent=True) or {}
         logline = (payload.get("logline") or "").strip()
@@ -2283,7 +2385,7 @@ def upscale():
         level_crossing = _is_level_crossing_request(payload)
         if level_crossing and not (payload.get("voice") or "").strip():
             voice = "en-GB-SoniaNeural"
-        cc_broll = bool(payload.get("cc_broll"))
+        cc_broll = _as_bool(payload.get("cc_broll"))
         duration_sec = None
         if payload.get("duration_sec") not in (None, "", 0, "0"):
             try:
@@ -2346,28 +2448,33 @@ def upscale():
             ), 400
 
         prebuilt: list[dict[str, Any]] | None = None
+        footage_note: str | None = None
         if level_crossing:
             splitter = "level_crossing"
             deadline = _FOOTAGE_DEADLINE.set(time.monotonic() + LEVEL_CROSSING_BUDGET_SEC)
             try:
                 try:
-                    enriched, prebuilt = _assemble_level_crossing(cc_broll=cc_broll)
-                except LevelCrossingFootageError as e:
-                    # Status 502 is replaced by an HTML error page in front of this app.
-                    # The empty-archive note is a normal JSON result: no Commons call was made.
-                    note = str(e)
-                    status = 200 if note == ARCHIVE_RAIL_NOTE else 500
-                    return jsonify(
-                        {
-                            "error": note,
-                            "render_error": note,
-                            "health_safety": "level_crossing",
-                            "splitter": "level_crossing",
-                            "cc_broll": cc_broll,
-                            "shots": [],
-                            "rendered_cut": None,
-                        }
-                    ), status
+                    enriched, prebuilt, footage_note = _assemble_level_crossing(cc_broll=cc_broll)
+                except LevelCrossingFootageError as exc:
+                    enriched = _empty_level_storyboard()
+                    prebuilt = []
+                    footage_note = (
+                        ARCHIVE_RAIL_NOTE if not cc_broll
+                        else COMMONS_RATE_LIMIT_NOTE if _mentions_rate_limit(exc)
+                        else str(exc)
+                    )
+                except Exception as exc:
+                    enriched = _empty_level_storyboard()
+                    prebuilt = []
+                    text = str(exc)
+                    if not cc_broll and (
+                        _mentions_rate_limit(exc) or "commons" in text.lower() or "wikimedia" in text.lower()
+                    ):
+                        footage_note = ARCHIVE_RAIL_NOTE
+                    elif cc_broll and _mentions_rate_limit(exc):
+                        footage_note = COMMONS_RATE_LIMIT_NOTE
+                    else:
+                        footage_note = text
             finally:
                 _FOOTAGE_DEADLINE.reset(deadline)
         else:
@@ -2530,7 +2637,13 @@ def upscale():
 
         rendered = None
         render_error = None
-        if match_sources:
+        missing_note = None
+        if level_crossing and footage_note:
+            if prebuilt:
+                missing_note = footage_note
+            else:
+                render_error = footage_note
+        if match_sources and render_error is None:
             try:
                 rendered = _render_same_length_cut(
                     (source_upload or {}).get("clips") or [],
@@ -2545,8 +2658,10 @@ def upscale():
                 )
             except Exception as e:
                 render_error = str(e)
+                if level_crossing and not cc_broll and _mentions_rate_limit(render_error):
+                    render_error = ARCHIVE_RAIL_NOTE
         if rendered is not None:
-            bits = [rendered.get("voice_note"), cc_note]
+            bits = [rendered.get("voice_note"), cc_note, missing_note]
             merged = " ".join(bit for bit in bits if bit)
             if merged:
                 rendered["note"] = merged
@@ -2577,7 +2692,34 @@ def upscale():
             }
         )
     except Exception as e:
-        return jsonify({"error": str(e), "type": type(e).__name__}), 500
+        # A 5xx here is replaced by an nginx HTML 502. Always return JSON.
+        note = str(e)
+        if level_crossing and not cc_broll and (
+            _mentions_rate_limit(e) or "commons" in note.lower() or "wikimedia" in note.lower()
+        ):
+            note = ARCHIVE_RAIL_NOTE
+        elif level_crossing and cc_broll and _mentions_rate_limit(e):
+            note = COMMONS_RATE_LIMIT_NOTE
+        return jsonify(
+            {
+                "splitter": "level_crossing" if level_crossing else "error",
+                "cosmos_reason": "fallback",
+                "health_safety": "level_crossing" if level_crossing else False,
+                "cc_broll": cc_broll,
+                "logline": logline,
+                "seed_from_upload": False,
+                "upload_tag": None,
+                "source_upload": None,
+                "vss_url_host": VSS_URL.split("://")[-1].split("/")[0],
+                "shots": [],
+                "directors_cut": [],
+                "rendered_cut": None,
+                "render_error": note,
+                "error": note,
+                "type": type(e).__name__,
+                "pitch": "We start from boards and voice, not a prompt. The archive finds the cinematic version.",
+            }
+        ), 200
 
 
 INDEX_HTML = r"""<!DOCTYPE html>
@@ -3335,20 +3477,51 @@ function escapeHtml(s) {
 
 
 def _catalog() -> list[dict[str, Any]]:
-    """Buttons on the launcher. A teammate claims the guest slot via apps.json + GUEST_UPSTREAM."""
+    """Three launcher cards. Hazard stays third even if apps.json drops it."""
     path = Path(__file__).with_name("apps.json")
     raw = json.loads(path.read_text(encoding="utf-8"))
     guest_upstream = (os.environ.get("GUEST_UPSTREAM") or "").strip().rstrip("/")
-    apps = []
+    defaults = {
+        "upscaler": {
+            "blurb": "Your rough clip, cut to the same length from the archive, with the voice line burned in.",
+        },
+        "guest": {
+            "blurb": "Ask the archive in plain language. Get a grounded answer and jump to the matching clips.",
+        },
+        "hazard": {
+            "blurb": "Click a street clip when you see a hazard. The second pass shows your click marks and YOLO boxes, then asks what you should do.",
+        },
+    }
+    fixed = {
+        "upscaler": ("Video Recutter", "upscaler"),
+        "guest": ("LDN Video Ask", "guest"),
+        "hazard": ("Hazard perception", "hazard"),
+    }
+    by_id: dict[str, dict[str, Any]] = {}
+    extras: list[dict[str, Any]] = []
     for item in raw.get("apps") or []:
         row = dict(item)
-        if row.get("id") == "guest" and guest_upstream:
+        ident = row.get("id")
+        if ident in fixed:
+            by_id[str(ident)] = row
+        else:
+            extras.append(row)
+    apps = []
+    for ident in ("upscaler", "guest", "hazard"):
+        row = by_id.get(ident) or {}
+        title, href = fixed[ident]
+        row["id"] = ident
+        row["title"] = title
+        row["href"] = href
+        row["blurb"] = row.get("blurb") or defaults[ident]["blurb"]
+        if ident == "guest" and guest_upstream:
             row["ready"] = True
             if row.get("live_blurb"):
                 row["blurb"] = row["live_blurb"]
         else:
-            row["ready"] = bool(row.get("ready", True))
+            row["ready"] = True if ident == "hazard" else bool(row.get("ready", True))
         apps.append(row)
+    apps.extend(extras)
     return apps
 
 
@@ -3509,7 +3682,10 @@ def guest(subpath: str):
 def hazard(subpath: str):
     """Proxy the driving test. /hazard and /hazard/ both stay on this route."""
     upstream = (os.environ.get("HAZARD_UPSTREAM") or "http://hazard-perception:80").strip().rstrip("/")
-    return _proxy_upstream(upstream, subpath or "")
+    try:
+        return _proxy_upstream(upstream, subpath or "")
+    except requests.RequestException:
+        return Response("Hazard perception is not reachable", status=502, mimetype="text/plain")
 
 
 def _mount_bundled_guest() -> None:
