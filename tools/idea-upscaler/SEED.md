@@ -18,7 +18,7 @@ The lab page has one **App** button. Ingress sends `/app` to this process and st
 Idea Upscaler:
 
 1. Reads a logline, optional beats, optional VO lines.
-2. Optional: loads an upload by tag (the demo tag is `shittyvideo`).
+2. Optional: loads an upload by tag (the tagged upload).
 3. Splits that into a few shots (W&B serverless chat if `WANDB_API_KEY` is set, otherwise a line split).
 4. Searches `POST /api/v1/search` once per shot.
 5. If the request was seeded from an upload, downloads the source clip and the best matches, then ffmpeg-cuts one mp4 of the **same duration** as the source. VO lines are burned in as subtitles, split evenly across that duration.
@@ -116,7 +116,7 @@ The page hardcodes `/app/api/...` and `<base href="/app/">`. A relative `api/ups
   "beats": "optional, one beat per line",
   "transcript": "optional, one VO line per line",
   "seed_from_upload": true,
-  "upload_tag": "shittyvideo"
+  "upload_tag": "my-upload"
 }
 ```
 
@@ -143,7 +143,7 @@ Response fields that matter: `shots[]`, `directors_cut[]`, `source_upload`, `ren
 
 `llm_top_n` must be at least 1. `0` is a 422 and looks like an empty index. Hits are read from `results[]`, then `chunk_results[]`. Each hit's `playback_url` is `/app/api/stream?source=...`.
 
-**Upload seed.** Tags are filters, not captions. Querying the word `shittyvideo` returns nothing. `_load_upload_seed` searches with the tag filter and visual queries (`hands holding a small toy figure`, then broader ones). If those are empty it searches the last day without the tag and keeps rows whose tags or filename contain the tag. The indexed object for the demo upload is `20261017_100245_8d0e1f47.mp4`, not the name the upload form showed.
+**Upload seed.** Tags are filters, not captions. Querying the tag string itself returns nothing. `_load_upload_seed` searches with the tag filter and visual queries (`hands holding a small toy figure`, then broader ones). If those are empty it searches the last day without the tag and keeps rows whose tags or filename contain the tag. The indexed object for the demo upload is `20261017_100245_8d0e1f47.mp4`, not the name the upload form showed.
 
 **Cut.** `_render_same_length_cut`:
 
@@ -191,7 +191,7 @@ Seeded upscale (slow: search plus ffmpeg):
 ```bash
 curl -sS -m 180 -X POST http://video-lab-team-41.cosmos.vastdata.com/app/api/upscale \
   -H 'Content-Type: application/json' \
-  -d '{"logline":"Edit the hand out.","transcript":"Line one.\nLine two.","seed_from_upload":true,"upload_tag":"shittyvideo"}'
+  -d '{"logline":"Edit the hand out.","transcript":"Line one.\nLine two.","seed_from_upload":true,"upload_tag":"my-upload"}'
 ```
 
 Expect `rendered_cut.target_duration_sec` near the upload length, `vo: true`, and `GET` of `rendered_cut.url` returning `video/mp4`.
@@ -209,7 +209,7 @@ Expect `rendered_cut.target_duration_sec` near the upload length, `vo: true`, an
 
 ## Archive this build was written against
 
-Team 41, namespace `team-41`. Mostly streets, traffic, a warehouse, and an indoor crowd camera. The rough demo upload is tag `shittyvideo`: a hand moving a small white toy. Search stand-ins come from that corpus (street and bike footage), not from a generated scene.
+Team 41, namespace `team-41`. Mostly streets, traffic, a warehouse, and an indoor crowd camera. The rough demo upload is the tagged upload: a hand moving a small white toy. Search stand-ins come from that corpus (street and bike footage), not from a generated scene.
 
 ## Using this as a seed
 

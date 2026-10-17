@@ -377,11 +377,11 @@ def _search_shot(
 
 
 def _load_upload_seed(tag: str) -> dict[str, Any]:
-    """Pull indexed segments for an upload tag (e.g. shittyvideo) to seed upscale."""
+    """Pull indexed segments for an upload tag (the tagged upload) to seed upscale."""
     tag = (tag or "").strip()
     if not tag:
         raise ValueError("upload tag is required")
-    # Tag name is a bad visual query ("shittyvideo" matches nothing). Search the
+    # Tag name is a bad visual query (the tag string matches nothing). Search the
     # caption, then fall back without the tag and filter client-side.
     queries = [
         "hands holding a small toy figure",
@@ -2347,8 +2347,8 @@ def serve_cut(cut_id: str):
 
 @app.get("/api/upload-seed")
 def upload_seed():
-    """Preview an indexed upload by tag (default: shittyvideo)."""
-    tag = (request.args.get("tag") or "shittyvideo").strip()
+    """Preview an indexed upload by tag (fallback: my-upload)."""
+    tag = (request.args.get("tag") or "my-upload").strip() or "my-upload"
     try:
         seed = _load_upload_seed(tag)
         return jsonify(
@@ -2400,7 +2400,7 @@ def upscale():
             shot_count = 4
         shot_count = max(2, min(5, shot_count))
         seed_from_upload = bool(payload.get("seed_from_upload"))
-        upload_tag = (payload.get("upload_tag") or "shittyvideo").strip() or "shittyvideo"
+        upload_tag = (payload.get("upload_tag") or "my-upload").strip() or "my-upload"
 
         source_upload = None
         exclude: set[str] = set()
@@ -2424,7 +2424,7 @@ def upscale():
                 "clips": seed["clips"],
             }
             exclude = set(seed["exclude_sources"])
-            # Seed brief from Cosmos captions on the shitty upload
+            # Seed brief from Cosmos captions on the tagged upload
             if not logline:
                 logline = (
                     f"Cinematic upscale of my rough clip ({seed['filename']}): "
@@ -2443,7 +2443,7 @@ def upscale():
             return jsonify(
                 {
                     "error": "logline / scene intent is required "
-                    "(or enable Upscale my upload so we can read your clip)"
+                    "(or check Use my upload so we can read your clip)"
                 }
             ), 400
 
@@ -3023,10 +3023,10 @@ INDEX_HTML = r"""<!DOCTYPE html>
         <div class="opt">
           <label class="row" for="seed">
             <input id="seed" type="checkbox"/>
-            Upscale my upload (tag)
+            Use my upload
           </label>
-          <p class="hint">Reads your indexed clip (default tag <code>shittyvideo</code>) and searches the archive for a cinematic match. Mars/fantasy only works if similar footage is already indexed.</p>
-          <input id="tag" type="text" value="shittyvideo" placeholder="tag"/>
+          <p class="hint">Reads your indexed clip (the tag in the box) and searches the archive for a cinematic match. Mars/fantasy only works if similar footage is already indexed.</p>
+          <input id="tag" type="text" value="" placeholder="upload tag"/>
         </div>
         <div class="opt">
           <label class="row" for="ccbroll">
@@ -3104,7 +3104,7 @@ async function runUpscale({ seed, health }) {
   const useSeed = seed || $("seed").checked;
   const safetyKind = (health === "level_crossing" || health === true) ? "level_crossing" : "";
   if (!logline && !beats && !transcript && !lastBrief) {
-    $("status").textContent = "Pick a brief or type a logline, then click Upscale idea.";
+    $("status").textContent = "Pick a brief or type a line, then click Recut.";
     $("status").className = "status err";
     return;
   }
@@ -3137,7 +3137,7 @@ async function runUpscale({ seed, health }) {
         duration_sec: $("lengthMode").value === "custom" ? Number($("lengthSec").value) : null,
         shot_count: Math.min(5, Math.max(2, parseInt($("shotCount").value, 10) || 4)),
         seed_from_upload: useSeed,
-        upload_tag: ($("tag").value || "shittyvideo").trim(),
+        upload_tag: ($("tag").value || "my-upload").trim(),
         health_safety: safetyKind || false,
         cc_broll: $("ccbroll").checked,
       }),
@@ -3239,7 +3239,7 @@ $("demo").onclick = () => applyBrief(BRIEFS[0]);
 $("shitty").onclick = () => {
   briefHealth = "";
   $("seed").checked = true;
-  $("tag").value = "shittyvideo";
+  if (!$("tag").value.trim()) $("tag").value = "my-upload";
   $("logline").value = "Edit the hand out. Make this rough toy clip feel cinematic — close on the figure, then a wider world around it.";
   $("beats").value = "Close on hands and the small white toy\nPull back to the space around the figure\nMatch the gesture with a cleaner cinematic shot";
   $("transcript").value = "It started as a mess on the table.\nThen the shot found the story.";
