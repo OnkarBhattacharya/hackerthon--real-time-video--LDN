@@ -318,19 +318,57 @@ def _load_upload_seed(tag: str) -> dict[str, Any]:
     tag = (tag or "").strip()
     if not tag:
         raise ValueError("upload tag is required")
-    body = {
-        "query": f"{tag} uploaded clip scene",
-        "top_k": 20,
-        "llm_top_n": 1,
-        "min_similarity": 0.0,
-        "tags": [tag],
-        "include_public": True,
-        "time_filter": "all",
-    }
-    r = _vss("POST", "/api/v1/search", json=body)
-    if r.status_code >= 400:
-        raise RuntimeError(f"seed search HTTP {r.status_code}: {r.text[:240]}")
-    data = r.json()
+    # Tag name is a bad visual query ("shittyvideo" matches nothing). Search the
+    # caption, then fall back without the tag and filter client-side.
+    queries = [
+        "hands holding a small toy figure",
+        "person close-up object on a table",
+        "a person moving in frame",
+    ]
+    data: dict[str, Any] = {}
+    last_err = ""
+    for q in queries:
+        body = {
+            "query": q,
+            "top_k": 20,
+            "llm_top_n": 1,
+            "min_similarity": 0.0,
+            "tags": [tag],
+            "include_public": True,
+            "time_filter": "all",
+        }
+        r = _vss("POST", "/api/v1/search", json=body)
+        if r.status_code >= 400:
+            last_err = f"seed search HTTP {r.status_code}: {r.text[:240]}"
+            continue
+        data = r.json()
+        if data.get("results") or data.get("chunk_results"):
+            break
+    else:
+        body = {
+            "query": "hands toy figure person",
+            "top_k": 30,
+            "llm_top_n": 1,
+            "min_similarity": 0.0,
+            "include_public": True,
+            "time_filter": "24h",
+        }
+        r = _vss("POST", "/api/v1/search", json=body)
+        if r.status_code >= 400:
+            raise RuntimeError(last_err or f"seed search HTTP {r.status_code}: {r.text[:240]}")
+        data = r.json()
+        want = tag.lower()
+        data["results"] = [
+            row for row in (data.get("results") or [])
+            if want in [str(t).lower() for t in (row.get("tags") or [])]
+            or want in str(row.get("filename") or "").lower()
+            or want in str(row.get("source") or "").lower()
+        ]
+        data["chunk_results"] = [
+            row for row in (data.get("chunk_results") or [])
+            if want in [str(t).lower() for t in (row.get("tags") or [])]
+            or want in str(row.get("filename") or "").lower()
+        ]
     clips: list[dict[str, Any]] = []
     reasons: list[str] = []
     seen: set[str] = set()
