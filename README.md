@@ -310,6 +310,16 @@ credits, reach out to the Weights & Biases by CoreWeave team :)
 The skills used by Cursor can be used by agent frameworks too. They follow the standard
 `SKILL.md` format, so most frameworks load them straight from `.cursor/skills/`.
 
+### Idea Upscaler (Team 41 app)
+
+**Open it:** [workshop.thecosmoslabs.com](https://workshop.thecosmoslabs.com) → **Builders Challenge** → **App**  
+(Ingress path `/app` on the team host — do not use localhost.)
+
+Boards + optional VO → shot list (W&B if keys present, else heuristic) → cinematic matches from the indexed VSS archive (retrieval only, no generative video). Code: `tools/idea-upscaler/`.
+
+**30s demo pitch:** *“We start from boards and voice, not a prompt. The archive finds the cinematic version.”*  
+Click **Load demo brief** → **Upscale idea** → pick a shot → play a clip → skim Director’s cut.
+
 ## 6. Demos
 
 Submissions will start around 4:30pm. Instructions here: <a href="https://tokensand.com/vastlondon" target="_blank" rel="noopener">https://tokensand.com/vastlondon</a> (click `Submit your project`).
