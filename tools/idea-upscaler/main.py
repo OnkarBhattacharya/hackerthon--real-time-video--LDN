@@ -622,6 +622,19 @@ LEVEL_CROSSING_LINES = [
 MAX_RAIL_CC_SECONDS = 180.0
 
 
+def _is_level_crossing_request(payload: dict[str, Any]) -> bool:
+    brief = str(payload.get("brief") or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if brief in {"level_crossing", "safety_level_crossing"}:
+        return True
+    raw = payload.get("health_safety")
+    if raw is True or raw in (1, "1", "true", "yes"):
+        return True
+    if isinstance(raw, str):
+        key = raw.strip().lower().replace("-", "_").replace(" ", "_")
+        return key in {"level_crossing", "levelcrossing", "railway"}
+    return False
+
+
 def _level_crossing_shots() -> list[dict[str, Any]]:
     """Five beats in the order of a level-crossing safety film. One subject only."""
     specs = [
@@ -707,8 +720,8 @@ def _level_crossing_shots() -> list[dict[str, Any]]:
             "dialogue_beat": LEVEL_CROSSING_LINES[4],
             "search_query": "railway crossing warning lights and barrier fully raised before anyone crosses",
             "commons_files": [
-                "File:Malfunctioning railway crossing warning lights.ogv",
                 "File:Gevaarlijke overweg-520537.ogv",
+                "File:Malfunctioning railway crossing warning lights.ogv",
                 "File:Gillingham Level Crossing barriers going down.webm",
             ],
             "commons_queries": [
@@ -740,10 +753,12 @@ def _archive_is_level_crossing(match: dict[str, Any]) -> bool:
     camera = str(match.get("camera_id") or "").strip().lower()
     if capture in _NON_RAIL_CAPTURE:
         return False
-    place = f"{location} {camera}"
+    place = f"{location} {camera} {str(match.get('filename') or '').lower()}"
     if any(token in place for token in _NON_RAIL_PLACE):
         return False
-    if any(token in place for token in ("street", "highway", "indoor")):
+    if any(token in place for token in ("street", "highway", "indoor", "london", "crosswalk", "forklift")):
+        return False
+    if _RAIL_BAD_RE.search(place):
         return False
     return _text_is_railway(
         capture,
@@ -776,7 +791,7 @@ def _search_level_crossing_archive() -> list[dict[str, Any]]:
                     "include_public": True,
                     "time_filter": "all",
                 },
-                timeout=12,
+                timeout=5,
             )
             if r.status_code >= 400:
                 return []
@@ -1011,22 +1026,40 @@ def _pick_level_crossing_clips(shots: list[dict[str, Any]]) -> list[dict[str, An
             )
 
     dest_dir = CUTS_DIR / "cc-incoming"
-
-    def fetch(record: dict[str, Any]) -> dict[str, Any]:
-        return _download_commons_record(record, dest_dir)
-
-    clips: list[dict[str, Any]] = []
-    with ThreadPoolExecutor(max_workers=5) as pool:
-        futures = [pool.submit(fetch, record) for record in chosen if record]
-        for shot, record, future in zip(shots, chosen, futures):
+    clips = []
+    for i, shot in enumerate(shots):
+        options: list[dict[str, Any]] = []
+        for name in shot.get("commons_files") or []:
+            record = catalog.get(name)
+            if record and all(record["title"] != item["title"] for item in options):
+                options.append(record)
+        if chosen[i] and all(chosen[i]["title"] != item["title"] for item in options):
+            options.insert(0, chosen[i])
+        reserved = {
+            chosen[j]["title"]
+            for j in range(i + 1, len(shots))
+            if chosen[j]
+        }
+        got = None
+        last_err = "no downloadable railway clip"
+        for record in options:
+            if any(record["title"] == clip["title"] for clip in clips):
+                continue
+            if record["title"] in reserved and (not chosen[i] or record["title"] != chosen[i]["title"]):
+                continue
             try:
-                clips.append(future.result())
+                got = _download_commons_record(record, dest_dir)
+                break
             except Exception as exc:
-                raise LevelCrossingFootageError(
-                    "Level crossing film stopped: could not download the Commons clip "
-                    f"“{(record or {}).get('title') or shot.get('title')}” ({exc}). "
-                    "No street crosswalk was substituted."
-                ) from exc
+                last_err = f"{type(exc).__name__}: {exc}"[:220]
+                time.sleep(2)
+        if not got:
+            raise LevelCrossingFootageError(
+                "Level crossing film stopped: could not download a real railway clip for "
+                f"“{shot.get('title') or 'a beat'}” ({last_err}). "
+                "No street crosswalk was substituted."
+            )
+        clips.append(got)
     if len(clips) != len(shots):
         raise LevelCrossingFootageError(
             "Level crossing film stopped: a beat was left without railway footage."
@@ -1092,6 +1125,14 @@ def _assemble_level_crossing() -> tuple[list[dict[str, Any]], list[dict[str, Any
             "origin": "commons",
             "cc": credit,
         })
+    for item in ordered:
+        capture = str(item.get("capture_type") or "").lower()
+        place = f"{item.get('location') or ''} {item.get('camera_id') or ''} {item.get('filename') or ''}".lower()
+        if capture in _NON_RAIL_CAPTURE or any(tok in place for tok in ("warehouse", "forklift", "crosswalk", "san_francisco")):
+            raise LevelCrossingFootageError(
+                "Level crossing film stopped: a shot was not a railway crossing "
+                f"({item.get('title')}: {item.get('filename')}). No crosswalk cut was rendered."
+            )
     return enriched, ordered
 
 
@@ -1223,17 +1264,34 @@ def _extmeta(meta: dict[str, Any], key: str) -> str:
 
 
 def _download_capped(url: str, dest: Path) -> None:
-    with requests.get(url, stream=True, timeout=60, headers={"User-Agent": COMMONS_UA}) as resp:
-        resp.raise_for_status()
-        total = 0
-        with dest.open("wb") as fh:
-            for chunk in resp.iter_content(64 * 1024):
-                if not chunk:
+    last_err: Exception | None = None
+    for attempt in range(2):
+        try:
+            with requests.get(url, stream=True, timeout=45, headers={"User-Agent": COMMONS_UA}) as resp:
+                if resp.status_code == 429:
+                    time.sleep(1.5)
+                    last_err = RuntimeError("Commons rate limited")
                     continue
-                total += len(chunk)
-                if total > MAX_CC_BYTES:
-                    raise RuntimeError("over 40MB")
-                fh.write(chunk)
+                resp.raise_for_status()
+                total = 0
+                with dest.open("wb") as fh:
+                    for chunk in resp.iter_content(64 * 1024):
+                        if not chunk:
+                            continue
+                        total += len(chunk)
+                        if total > MAX_CC_BYTES:
+                            raise RuntimeError("over 40MB")
+                        fh.write(chunk)
+            return
+        except requests.RequestException as exc:
+            dest.unlink(missing_ok=True)
+            last_err = exc
+            if attempt < 1:
+                time.sleep(1.5)
+                continue
+            raise
+    dest.unlink(missing_ok=True)
+    raise RuntimeError(f"Commons download failed ({last_err})")
 
 
 def _fetch_cc_clip(query: str, dest_dir: Path) -> tuple[dict[str, Any] | None, str | None]:
@@ -1360,6 +1418,10 @@ def _render_same_length_cut(
     voice: str | None = DEFAULT_VOICE,
     bed: float = 0.18,
     duration_sec: float | None = None,
+    *,
+    preset: str = "veryfast",
+    max_pieces: int = 4,
+    fast: bool = False,
 ) -> dict[str, Any]:
     """Concat archive matches and keep their audio. Speak each VO line inside its caption window."""
     picks: list[dict[str, Any]] = []
@@ -1374,7 +1436,7 @@ def _render_same_length_cut(
             continue
         seen.add(key)
         picks.append(item)
-        if len(picks) >= 4:
+        if len(picks) >= max_pieces:
             break
     if not picks:
         raise RuntimeError("no archive matches to cut together")
@@ -1395,6 +1457,47 @@ def _render_same_length_cut(
             target = 4.0 * len(picks)
 
     slice_len = target / len(picks)
+    fast_lines = [ln.strip() for ln in re.split(r"\n+", transcript or "") if ln.strip()]
+    burn_fast = bool(fast and fast_lines and len(fast_lines) == len(picks))
+    voice_box: dict[str, Any] = {}
+
+    def _prep_voice() -> None:
+        neural_name = _canonical_voice(voice)
+        windows_now = _caption_windows(fast_lines, target)
+        if not neural_name or not windows_now:
+            voice_box.update(spoken=False, built=[], engine="off", neural=neural_name, windows=windows_now, note=None)
+            return
+        try:
+            built_now = _vo_line_parts(windows_now, neural_name, work, engine="edge-tts")
+            voice_box.update(spoken=True, built=built_now, engine="edge-tts", neural=neural_name, windows=windows_now, note=None)
+        except Exception as exc:
+            try:
+                built_now = _vo_line_parts(windows_now, neural_name, work, engine="espeak")
+                voice_box.update(
+                    spoken=True,
+                    built=built_now,
+                    engine="espeak",
+                    neural=neural_name,
+                    windows=windows_now,
+                    note=f"Neural voice unavailable ({type(exc).__name__}). Used an espeak fallback.",
+                )
+            except Exception as exc2:
+                voice_box.update(
+                    spoken=False,
+                    built=[],
+                    engine="off",
+                    neural=neural_name,
+                    windows=windows_now,
+                    note=(
+                        f"Voiceover skipped: neural voice failed ({type(exc).__name__}) "
+                        f"and espeak failed ({type(exc2).__name__})."
+                    ),
+                )
+
+    voice_thread = None
+    if fast and fast_lines:
+        voice_thread = threading.Thread(target=_prep_voice, daemon=True)
+        voice_thread.start()
     timeline: list[dict[str, Any]] = []
     trimmed: list[Path] = []
     for i, item in enumerate(picks):
@@ -1407,6 +1510,9 @@ def _render_same_length_cut(
             "start_sec": start,
             "end_sec": end,
         }
+        for key in ("location", "camera_id", "capture_type", "origin"):
+            if item.get(key):
+                row[key] = item.get(key)
         if item.get("cc"):
             row["cc"] = item["cc"]
             credit = item["cc"]
@@ -1424,12 +1530,53 @@ def _render_same_length_cut(
             raw.write_bytes(Path(local).read_bytes())
         else:
             _download_mp4(src, raw)
-        norm = work / f"norm_{i}.mp4"
         scale = "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=24"
+        out = work / f"trim_{i}.mp4"
+        if fast:
+            dur = _probe_duration(raw)
+            shot_vf = scale
+            if burn_fast:
+                srt_name = f"cap_{i}.srt"
+                (work / srt_name).write_text(
+                    f"1\n{_srt_time(0)} --> {_srt_time(slice_len)}\n{fast_lines[i]}\n",
+                    encoding="utf-8",
+                )
+                shot_vf += (
+                    f",subtitles={srt_name}:force_style="
+                    "'FontName=DejaVu Sans,FontSize=24,PrimaryColour=&H00FFFFFF,"
+                    "OutlineColour=&H00000000,BorderStyle=1,Outline=2,Alignment=2'"
+                )
+            cmd = ["ffmpeg", "-y"]
+            if dur + 0.05 < slice_len:
+                cmd += ["-stream_loop", "-1"]
+            if _has_audio(raw):
+                cmd += [
+                    "-i", str(raw), "-t", f"{slice_len:.3f}",
+                    "-vf", shot_vf,
+                    "-c:v", "libx264", "-preset", preset, "-pix_fmt", "yuv420p",
+                    "-g", "48",
+                    "-c:a", "aac", "-ar", "44100", "-ac", "2",
+                    str(out),
+                ]
+            else:
+                cmd += [
+                    "-i", str(raw),
+                    "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
+                    "-t", f"{slice_len:.3f}",
+                    "-vf", shot_vf, "-map", "0:v", "-map", "1:a",
+                    "-c:v", "libx264", "-preset", preset, "-pix_fmt", "yuv420p",
+                    "-g", "48",
+                    "-c:a", "aac", "-ar", "44100", "-ac", "2",
+                    str(out),
+                ]
+            _run_ffmpeg(cmd, cwd=work if burn_fast else None)
+            trimmed.append(out)
+            continue
+        norm = work / f"norm_{i}.mp4"
         if _has_audio(raw):
             _run_ffmpeg([
                 "ffmpeg", "-y", "-i", str(raw), "-vf", scale,
-                "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+                "-c:v", "libx264", "-preset", preset, "-pix_fmt", "yuv420p",
                 "-c:a", "aac", "-ar", "44100", "-ac", "2",
                 str(norm),
             ])
@@ -1438,7 +1585,7 @@ def _render_same_length_cut(
                 "ffmpeg", "-y", "-i", str(raw),
                 "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo", "-shortest",
                 "-vf", scale, "-map", "0:v", "-map", "1:a",
-                "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+                "-c:v", "libx264", "-preset", preset, "-pix_fmt", "yuv420p",
                 "-c:a", "aac", "-ar", "44100", "-ac", "2",
                 str(norm),
             ])
@@ -1449,7 +1596,7 @@ def _render_same_length_cut(
             cmd += ["-stream_loop", "-1"]
         cmd += [
             "-i", str(norm), "-t", f"{slice_len:.3f}",
-            "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+            "-c:v", "libx264", "-preset", preset, "-pix_fmt", "yuv420p",
             "-c:a", "aac", "-ar", "44100", "-ac", "2",
             str(out),
         ]
@@ -1464,11 +1611,14 @@ def _render_same_length_cut(
         "-c", "copy", str(concat),
     ])
 
+    if voice_thread is not None:
+        voice_thread.join(40)
+    prebuilt_voice = voice_thread is not None and "spoken" in voice_box
     vf = f"trim=duration={target:.3f},setpts=PTS-STARTPTS"
-    lines = [ln.strip() for ln in re.split(r"\n+", transcript or "") if ln.strip()]
-    windows = _caption_windows(lines, target)
+    lines = fast_lines if fast else [ln.strip() for ln in re.split(r"\n+", transcript or "") if ln.strip()]
+    windows = voice_box.get("windows") if prebuilt_voice else _caption_windows(lines, target)
     vo_windows: list[dict[str, Any]] = []
-    if windows:
+    if windows and not burn_fast:
         blocks = []
         for i, (start, end, line) in enumerate(windows):
             blocks.append(f"{i+1}\n{_srt_time(start)} --> {_srt_time(end)}\n{line}\n")
@@ -1478,11 +1628,24 @@ def _render_same_length_cut(
             "'FontName=DejaVu Sans,FontSize=28,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=2,Alignment=2'"
         )
 
-    neural = _canonical_voice(voice)
-    spoken = bool(neural) and bool(windows)
-    voice_note = None
-    voice_engine = None
-    if spoken and neural:
+    if prebuilt_voice:
+        neural = voice_box.get("neural")
+        spoken = bool(voice_box.get("spoken")) and bool(windows)
+        built = voice_box.get("built") or []
+        voice_note = voice_box.get("note")
+        voice_engine = voice_box.get("engine")
+    else:
+        neural = _canonical_voice(voice)
+        spoken = bool(neural) and bool(windows)
+        voice_note = None
+        voice_engine = None
+        built = []
+    video_args = (
+        ["-c:v", "copy"]
+        if burn_fast
+        else ["-vf", vf, "-c:v", "libx264", "-preset", preset, "-pix_fmt", "yuv420p"]
+    )
+    if not prebuilt_voice and spoken and neural:
         try:
             built = _vo_line_parts(windows, neural, work, engine="edge-tts")
             voice_engine = "edge-tts"
@@ -1501,50 +1664,40 @@ def _render_same_length_cut(
                     f"Voiceover skipped: neural voice failed ({type(exc).__name__}) "
                     f"and espeak failed ({type(exc2).__name__})."
                 )
-        if spoken and built:
-            vo_windows = [
-                {k: v for k, v in info.items() if k != "path"} for info in built
-            ]
-            listing_vo = work / "vo_list.txt"
-            listing_vo.write_text(
-                "".join(f"file '{info['path'].resolve()}'\n" for info in built),
-                encoding="utf-8",
-            )
-            wav = work / "vo.wav"
-            _run_ffmpeg([
-                "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(listing_vo),
-                "-c", "copy", str(wav),
-            ])
-            bed_v = min(0.8, max(0.05, float(bed)))
-            _run_ffmpeg([
-                "ffmpeg", "-y", "-i", str(concat), "-i", str(wav),
-                "-filter_complex",
-                (
-                    f"[0:a]volume={bed_v:.2f}[bed];"
-                    "[1:a]volume=1.15[vo];"
-                    "[bed][vo]amix=inputs=2:duration=first:dropout_transition=0:normalize=0,"
-                    "alimiter=limit=0.95[a]"
-                ),
-                "-map", "0:v", "-map", "[a]",
-                "-vf", vf, "-t", f"{target:.3f}",
-                "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
-                "-c:a", "aac", "-ar", "44100", "-ac", "2",
-                str(work / "cut.mp4"),
-            ], cwd=work)
-        else:
-            spoken = False
-            _run_ffmpeg([
-                "ffmpeg", "-y", "-i", str(concat),
-                "-vf", vf, "-t", f"{target:.3f}",
-                "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
-                "-c:a", "aac", "-ar", "44100", "-ac", "2",
-                str(work / "cut.mp4"),
-            ], cwd=work)
+    if spoken and built:
+        vo_windows = [
+            {k: v for k, v in info.items() if k != "path"} for info in built
+        ]
+        listing_vo = work / "vo_list.txt"
+        listing_vo.write_text(
+            "".join(f"file '{info['path'].resolve()}'\n" for info in built),
+            encoding="utf-8",
+        )
+        wav = work / "vo.wav"
+        _run_ffmpeg([
+            "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(listing_vo),
+            "-c", "copy", str(wav),
+        ])
+        bed_v = min(0.8, max(0.05, float(bed)))
+        _run_ffmpeg([
+            "ffmpeg", "-y", "-i", str(concat), "-i", str(wav),
+            "-filter_complex",
+            (
+                f"[0:a]volume={bed_v:.2f}[bed];"
+                "[1:a]volume=1.15[vo];"
+                "[bed][vo]amix=inputs=2:duration=first:dropout_transition=0:normalize=0,"
+                "alimiter=limit=0.95[a]"
+            ),
+            "-map", "0:v", "-map", "[a]",
+            *video_args, "-t", f"{target:.3f}",
+            "-c:a", "aac", "-ar", "44100", "-ac", "2",
+            str(work / "cut.mp4"),
+        ], cwd=work)
     else:
+        spoken = False
         _run_ffmpeg([
             "ffmpeg", "-y", "-i", str(concat),
-            "-vf", vf, "-t", f"{target:.3f}",
-            "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+            *video_args, "-t", f"{target:.3f}",
             "-c:a", "aac", "-ar", "44100", "-ac", "2",
             str(work / "cut.mp4"),
         ], cwd=work)
@@ -1644,7 +1797,9 @@ def upscale():
             bed = float(payload.get("bed") if payload.get("bed") is not None else 0.18)
         except (TypeError, ValueError):
             bed = 0.18
-        health_safety = bool(payload.get("health_safety"))
+        level_crossing = _is_level_crossing_request(payload)
+        if level_crossing and not (payload.get("voice") or "").strip():
+            voice = "en-GB-SoniaNeural"
         cc_broll = bool(payload.get("cc_broll"))
         duration_sec = None
         if payload.get("duration_sec") not in (None, "", 0, "0"):
@@ -1659,6 +1814,16 @@ def upscale():
 
         source_upload = None
         exclude: set[str] = set()
+        if level_crossing:
+            seed_from_upload = False
+            if not logline:
+                logline = LEVEL_CROSSING_LOGLINE
+            if not beats:
+                beats = LEVEL_CROSSING_BEATS
+            if not transcript:
+                transcript = "\n".join(LEVEL_CROSSING_LINES)
+            if duration_sec is None:
+                duration_sec = 60.0
         if seed_from_upload:
             seed = _load_upload_seed(upload_tag)
             source_upload = {
@@ -1692,65 +1857,92 @@ def upscale():
                 }
             ), 400
 
-        if health_safety:
-            splitter = "health_safety"
-            shots = _health_safety_shots()
+        prebuilt: list[dict[str, Any]] | None = None
+        if level_crossing:
+            splitter = "level_crossing"
+            try:
+                enriched, prebuilt = _assemble_level_crossing()
+            except LevelCrossingFootageError as e:
+                return jsonify(
+                    {
+                        "error": str(e),
+                        "health_safety": "level_crossing",
+                        "splitter": "level_crossing",
+                    }
+                ), 502
         else:
             splitter = "wandb"
             shots = _wandb_shots(logline, beats, transcript)
             if not shots:
                 splitter = "heuristic"
                 shots = _heuristic_shots(logline, beats, transcript)
-        shots = shots[:4]
+            shots = shots[:4]
 
-        # Bias queries toward cinematic archive when seeding from a rough upload.
-        # Health & safety keeps its own single-line queries.
-        if seed_from_upload and not health_safety:
+            # Bias queries toward cinematic archive when seeding from a rough upload.
+            if seed_from_upload:
+                for shot in shots:
+                    q = shot.get("search_query") or ""
+                    shot["search_query"] = (
+                        f"cinematic polished production value - {q} - "
+                        "urban streets traffic pedestrians vehicles dramatic light"
+                    )
+
+            enriched = []
+            used_sources = set(exclude)
             for shot in shots:
-                q = shot.get("search_query") or ""
-                shot["search_query"] = (
-                    f"cinematic polished production value - {q} - "
-                    "urban streets traffic pedestrians vehicles dramatic light"
-                )
-
-        enriched = []
-        used_sources = set(exclude)
-        for shot in shots:
-            try:
-                matches = _search_shot(shot, exclude_sources=used_sources)
-            except Exception as e:
-                matches = []
-                shot = {**shot, "search_error": str(e)}
-            if matches and matches[0].get("source"):
-                used_sources.add(matches[0]["source"])
-            enriched.append({**shot, "matches": matches})
+                try:
+                    matches = _search_shot(shot, exclude_sources=used_sources)
+                except Exception as e:
+                    matches = []
+                    shot = {**shot, "search_error": str(e)}
+                if matches and matches[0].get("source"):
+                    used_sources.add(matches[0]["source"])
+                enriched.append({**shot, "matches": matches})
 
         directors_cut = []
         ordered: list[dict[str, Any] | None] = []
-        for shot in enriched:
-            best = shot["matches"][0] if shot["matches"] else None
-            directors_cut.append(
-                {
-                    "shot_id": shot["id"],
-                    "title": shot["title"],
-                    "intent": shot["intent"],
-                    "shot_type": shot["shot_type"],
-                    "mood": shot["mood"],
-                    "best": best,
-                }
-            )
-            if best and best.get("source"):
-                ordered.append({
-                    "source": best["source"],
-                    "title": shot.get("title") or "",
-                    "filename": best.get("filename") or "",
-                })
-            else:
-                ordered.append(None)
+        if prebuilt is not None:
+            ordered = list(prebuilt)
+            for shot in enriched:
+                best = shot["matches"][0] if shot["matches"] else None
+                directors_cut.append(
+                    {
+                        "shot_id": shot["id"],
+                        "title": shot["title"],
+                        "intent": shot["intent"],
+                        "shot_type": shot["shot_type"],
+                        "mood": shot["mood"],
+                        "best": best,
+                    }
+                )
+        else:
+            for shot in enriched:
+                best = shot["matches"][0] if shot["matches"] else None
+                directors_cut.append(
+                    {
+                        "shot_id": shot["id"],
+                        "title": shot["title"],
+                        "intent": shot["intent"],
+                        "shot_type": shot["shot_type"],
+                        "mood": shot["mood"],
+                        "best": best,
+                    }
+                )
+                if best and best.get("source"):
+                    ordered.append({
+                        "source": best["source"],
+                        "title": shot.get("title") or "",
+                        "filename": best.get("filename") or "",
+                        "location": best.get("location") or "",
+                        "camera_id": best.get("camera_id") or "",
+                        "capture_type": best.get("capture_type") or "",
+                    })
+                else:
+                    ordered.append(None)
 
         cc_note = None
         cc_meta = None
-        if cc_broll:
+        if cc_broll and not level_crossing:
             spoken = {
                 ln.strip().lower()
                 for ln in re.split(r"\n+", transcript or "")
@@ -1824,6 +2016,9 @@ def upscale():
                     voice,
                     bed,
                     duration_sec,
+                    preset="ultrafast" if level_crossing else "veryfast",
+                    max_pieces=5 if level_crossing else 4,
+                    fast=level_crossing,
                 )
             except Exception as e:
                 render_error = str(e)
@@ -1843,7 +2038,7 @@ def upscale():
         return jsonify(
             {
                 "splitter": splitter,
-                "health_safety": health_safety,
+                "health_safety": "level_crossing" if level_crossing else False,
                 "cc_broll": cc_broll,
                 "logline": logline,
                 "seed_from_upload": seed_from_upload,
@@ -1894,21 +2089,105 @@ INDEX_HTML = r"""<!DOCTYPE html>
       var(--bg);
   }
   a { color: var(--accent); }
-  .wrap { max-width: 1180px; margin: 0 auto; padding: 32px 20px 72px; }
+  .wrap { max-width: none; margin: 0 auto; padding: 12px 16px 64px; }
   header h1 {
     font-family: Fraunces, Georgia, serif;
-    font-size: clamp(2.4rem, 5vw, 3.6rem);
+    font-size: clamp(1.8rem, 3vw, 2.6rem);
     font-weight: 500;
-    margin: 6px 0 8px;
+    margin: 2px 0 4px;
     letter-spacing: -0.03em;
     line-height: 0.95;
   }
-  header p.lead { margin: 0 0 28px; color: var(--muted); max-width: 38rem; line-height: 1.5; }
+  header p.lead { margin: 0 0 12px; color: var(--muted); max-width: 40rem; line-height: 1.45; }
   .kicker { margin: 0; font-size: 0.75rem; letter-spacing: 0.14em; text-transform: uppercase; color: var(--muted); }
   .grid { display: grid; gap: 16px; }
-  @media (min-width: 980px) {
-    .grid.compose { grid-template-columns: 1.05fr 0.95fr; align-items: start; }
-    .grid.results { grid-template-columns: 240px 1fr; }
+  .studio {
+    --split: 0.62;
+    --handle: 18px;
+    display: flex;
+    flex-direction: row;
+    align-items: stretch;
+    width: 100%;
+    min-height: 42vh;
+  }
+  .side-col {
+    flex: 1 1 0;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    container-type: inline-size;
+    container-name: brief;
+  }
+  .side-col .panel { min-width: 0; }
+  .stage {
+    flex: 0 0 calc(var(--split) * 100%);
+    width: calc(var(--split) * 100%);
+    max-width: calc(var(--split) * 100%);
+    min-width: 0;
+    align-self: flex-start;
+    position: sticky;
+    top: 8px;
+    z-index: 2;
+    max-height: calc(100vh - 16px);
+    overflow: auto;
+    background: #101410;
+  }
+  .stage h2 { font-size: 1.15rem; margin: 0 0 8px; }
+  .split-handle {
+    flex: 0 0 var(--handle);
+    width: var(--handle);
+    cursor: col-resize;
+    touch-action: none;
+    user-select: none;
+    align-self: stretch;
+    background: linear-gradient(var(--line), var(--line)) center / 2px 100% no-repeat;
+  }
+  .split-handle:hover,
+  body.is-splitting .split-handle {
+    background: linear-gradient(var(--accent), var(--accent)) center / 2px 100% no-repeat;
+  }
+  .drag-grip {
+    position: sticky;
+    top: calc(50vh - 27px);
+    display: block;
+    width: 12px;
+    height: 54px;
+    margin: 12px auto;
+    border-radius: 999px;
+    border: 1px solid var(--accent);
+    background-color: #1c221e;
+    background-image:
+      radial-gradient(circle at 50% 12px, var(--accent) 3px, transparent 3.6px),
+      radial-gradient(circle at 50% 27px, var(--accent) 3px, transparent 3.6px),
+      radial-gradient(circle at 50% 42px, var(--accent) 3px, transparent 3.6px);
+    box-shadow: 0 0 0 3px #121614;
+  }
+  body.is-splitting, body.is-splitting * { cursor: col-resize !important; user-select: none !important; }
+  @container brief (min-width: 520px) {
+    .controls { grid-template-columns: 1fr 1fr; }
+    .grid.results { grid-template-columns: minmax(120px, 180px) minmax(0, 1fr); }
+  }
+  @container brief (min-width: 720px) {
+    .match { grid-template-columns: minmax(160px, 240px) minmax(0, 1fr); }
+  }
+  @media (max-width: 899px) {
+    .studio { flex-direction: column; }
+    .stage {
+      order: -1;
+      position: static;
+      flex: none;
+      width: 100%;
+      max-width: none;
+      max-height: none;
+      overflow: visible;
+    }
+    .side-col {
+      flex: none;
+      width: 100%;
+      max-width: none;
+    }
+    .split-handle { display: none; }
   }
   label { display: block; font-size: 0.68rem; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); margin-bottom: 6px; }
   select, input[type=number], input[type=text] {
@@ -1920,8 +2199,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
     border-radius: 12px; padding: 12px 14px; font: inherit; resize: vertical; min-height: 76px;
   }
   textarea:focus, select:focus, input:focus { outline: 2px solid color-mix(in srgb, var(--accent) 55%, transparent); border-color: transparent; }
-  .controls { display: grid; gap: 10px; margin-top: 14px; }
-  @media (min-width: 720px) { .controls { grid-template-columns: 1fr 1fr; } }
+  .controls { display: grid; gap: 10px; margin-top: 14px; grid-template-columns: 1fr; }
   .actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 16px; align-items: center; }
   button {
     font: inherit; font-weight: 600; border: none; cursor: pointer;
@@ -1946,8 +2224,28 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .shot-list button.active { border-color: var(--accent); background: var(--panel-2); }
   .shot-list .meta { display: block; font-size: 0.75rem; color: var(--muted); margin-top: 2px; font-weight: 400; }
   .match { border-top: 1px solid var(--line); padding: 14px 0; display: grid; gap: 12px; }
-  @media (min-width: 700px) { .match { grid-template-columns: 280px 1fr; } }
-  video { width: 100%; background: #000; border-radius: 14px; aspect-ratio: 16/9; }
+  .match video { width: 100%; background: #000; border-radius: 14px; aspect-ratio: 16/9; object-fit: contain; }
+  .video-frame {
+    background: #000;
+    width: 100%;
+    min-height: 42vh;
+    border-radius: 12px;
+    overflow: hidden;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .video-frame .status { margin: 0; padding: 16px; text-align: center; }
+  #cut-video {
+    width: 100%;
+    height: 42vh;
+    min-height: 42vh;
+    object-fit: contain;
+    background: #000;
+    border-radius: 0;
+    aspect-ratio: auto;
+    display: block;
+  }
   .score { color: var(--accent); font-weight: 600; font-size: 0.85rem; }
   .reason { font-size: 0.92rem; line-height: 1.45; }
   .cut ol { margin: 8px 0 0; padding-left: 1.1rem; }
@@ -1986,7 +2284,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
       <p class="lead">Boards and a voice line, cut from the archive. Streets and traffic are most of the footage. Indoor crowds and the synthetic warehouse are the smaller sets.</p>
     </header>
 
-    <section class="grid compose">
+    <div class="studio" id="studio">
+      <div class="side-col">
       <div class="panel">
         <label for="logline">Logline / scene intent *</label>
         <textarea id="logline" placeholder="A cyclist threads dusk traffic while a voiceover remembers leaving the city…"></textarea>
@@ -2050,10 +2349,27 @@ INDEX_HTML = r"""<!DOCTYPE html>
         <p class="kicker" style="margin-top:16px">Briefs</p>
         <div class="actions" id="briefs"></div>
       </div>
-      <div class="panel cut" id="cut-panel">
+      <section class="grid results panel hidden" id="results">
+        <div>
+          <h2>Shots</h2>
+          <ul class="shot-list" id="shots"></ul>
+        </div>
+        <div>
+          <h2 id="shot-title">Matches</h2>
+          <p class="status" id="shot-meta"></p>
+          <div id="matches"></div>
+        </div>
+      </section>
+      </div>
+      <div id="split-handle" class="split-handle drag-handle" role="separator" aria-orientation="vertical" aria-valuemin="38" aria-valuemax="78" aria-valuenow="62" aria-label="Resize the director cut and the brief" title="Drag to resize. Double-click to reset.">
+        <span class="drag-grip" aria-hidden="true"></span>
+      </div>
+      <section class="panel cut stage" id="cut-panel">
         <h2>Director's cut</h2>
-        <p class="status" id="cut-empty">Upscale shittyvideo to cut a reel the same length as your clip, with the VO burned in.</p>
-        <video id="cut-video" class="hidden" controls playsinline></video>
+        <div class="video-frame">
+          <p class="status" id="cut-empty">Upscale shittyvideo to cut a reel the same length as your clip, with the VO burned in.</p>
+          <video id="cut-video" class="hidden" controls playsinline></video>
+        </div>
         <div id="timeline" class="tl hidden"></div>
         <div id="feedback" class="fb hidden">
           <label>I like this shot, not that one</label>
@@ -2067,20 +2383,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
         <p class="status" id="cut-meta"></p>
         <div id="credits"></div>
         <ol id="cut-list" class="hidden"></ol>
-      </div>
-    </section>
-
-    <section class="grid results panel hidden" id="results" style="margin-top:18px">
-      <div>
-        <h2>Shots</h2>
-        <ul class="shot-list" id="shots"></ul>
-      </div>
-      <div>
-        <h2 id="shot-title">Matches</h2>
-        <p class="status" id="shot-meta"></p>
-        <div id="matches"></div>
-      </div>
-    </section>
+      </section>
+    </div>
   </div>
 <script>
 const $ = (id) => document.getElementById(id);
@@ -2097,14 +2401,14 @@ function setProgress(steps, activeIdx) {
 async function runUpscale({ seed, health }) {
   const logline = $("logline").value.trim();
   const useSeed = seed || $("seed").checked;
-  const useHealth = health === true;
-  if (!logline && !useSeed) {
+  const safetyKind = (health === "level_crossing" || health === true) ? "level_crossing" : "";
+  if (!logline && !useSeed && !safetyKind) {
     $("status").textContent = "Logline is required, or use Upscale shittyvideo.";
     $("status").className = "status err";
     return;
   }
-  const steps = useHealth
-    ? ["Reading the safety brief", "Searching near-miss and forklift moments", "Cutting the training reel", "Timing the safety line to the captions"]
+  const steps = safetyKind
+    ? ["Reading the level crossing brief", "Checking the archive for a real railway crossing", "Filling the beats with level crossing footage", "Timing the safety line to the captions"]
     : useSeed
     ? ["Reading your clip", "Finding stand-in shots", "Cutting a reel to your duration", "Burning the voice line"]
     : ["Splitting the brief", "Searching the archive", "Cutting the shots together", "Burning the voice line"];
@@ -2132,8 +2436,8 @@ async function runUpscale({ seed, health }) {
         duration_sec: $("lengthMode").value === "custom" ? Number($("lengthSec").value) : null,
         seed_from_upload: useSeed,
         upload_tag: ($("tag").value || "shittyvideo").trim(),
-        health_safety: useHealth,
-        cc_broll: $("ccbroll").checked,
+        health_safety: safetyKind || false,
+        cc_broll: safetyKind ? false : $("ccbroll").checked,
       }),
     });
     const raw = await res.text();
@@ -2174,12 +2478,13 @@ const BRIEFS = [
     seconds: 12,
   },
   {
-    label: "Health & safety",
-    health: true,
-    logline: "Spot the hazard before it closes. A pedestrian nears the lane, a person stands in the forklift aisle, then a gap opens that is actually safe.",
-    beats: "Pedestrian approaching a marked crosswalk with cars nearby\nPerson standing close to a forklift in a warehouse aisle\nPedestrians crossing the street while cars wait",
-    transcript: "Spot the hazard before you step closer.\nThat is a close call, not a gap.\nWait until the lane is clear, then move.",
-    seconds: 12,
+    label: "Safety · level crossing",
+    health: "level_crossing",
+    voice: "en-GB-SoniaNeural",
+    logline: "You are helping people avoid a level crossing incident. One railway crossing, from the approach to the rule.",
+    beats: "Approach the railway level crossing\nWarning lights and the barrier come down\nSomeone misuses the crossing\nThe train does not slow — a near miss\nThe rule: wait until the lights are out and the barrier is fully raised",
+    transcript: "You are helping people avoid a level crossing incident. Walk them up to the railway crossing and stop.\nShow them the warning lights and the barrier. Those come down because a train is coming.\nIf they try to beat the barrier, or cross while the lights are still on, that is the misuse.\nThe train will not slow down for them. A near miss is not a safe gap.\nThe rule you give them is simple. Wait until the lights are out and the barrier is fully raised.",
+    seconds: 60,
   },
   {
     label: "Streets · SF crosswalk",
@@ -2219,7 +2524,8 @@ function applyBrief(b, run) {
   $("lengthMode").value = "custom";
   $("lengthSec").value = String(b.seconds || 12);
   $("lengthWrap").classList.remove("hidden");
-  if (run) runUpscale({ seed: false, health: !!b.health });
+  if (b.voice) $("voice").value = b.voice;
+  if (run) runUpscale({ seed: false, health: b.health || false });
 }
 
 $("briefs").innerHTML = BRIEFS.slice(1).map((b, i) =>
@@ -2308,7 +2614,7 @@ function render() {
   $("matches").innerHTML = (s && s.matches && s.matches.length)
     ? s.matches.map(m => `
       <div class="match">
-        <video controls preload="metadata" src="${m.playback_url}"></video>
+        ${m.playback_url ? `<video controls preload="metadata" src="${m.playback_url}"></video>` : ""}
         <div>
           <div class="score">${(m.similarity_score!=null)?(Number(m.similarity_score).toFixed(3)+" similarity"):""}</div>
           <div><span class="tag">${escapeHtml(m.location||"?")}</span><span class="tag">${escapeHtml(m.camera_id||"")}</span></div>
@@ -2332,7 +2638,7 @@ function render() {
       tl.innerHTML = rows.map((row, i) => `
         <button type="button" data-t="${row.start_sec}" style="background:${colors[i % colors.length]}" title="${escapeHtml(row.note || row.title)}">
           ${escapeHtml(row.title)}
-          <small>${fmtTime(row.start_sec)}–${fmtTime(row.end_sec)}${row.cc ? " · " + escapeHtml(row.cc.license || "CC") : ""}</small>
+          <small>${fmtTime(row.start_sec)}–${fmtTime(row.end_sec)}${row.location ? " · " + escapeHtml(row.location) : ""}${row.cc ? " · " + escapeHtml(row.cc.license || "CC") : ""}</small>
         </button>`).join("");
       tl.querySelectorAll("button").forEach(btn => {
         btn.onclick = () => { vid.currentTime = Number(btn.dataset.t) || 0; vid.play(); };
@@ -2392,6 +2698,69 @@ function fmtTime(v) {
 function escapeHtml(s) {
   return String(s||"").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));
 }
+
+(function () {
+  const SPLIT_KEY = "idea-upscaler-split";
+  const studio = document.getElementById("studio");
+  const handle = document.getElementById("split-handle");
+  if (!studio || !handle) return;
+  const MIN_SPLIT = 0.38;
+  const MAX_SPLIT = 0.78;
+  let ratio = 0.62;
+  let dragging = false;
+
+  function clampSplit(n) {
+    return Math.min(MAX_SPLIT, Math.max(MIN_SPLIT, n));
+  }
+  function readSplit() {
+    try {
+      const raw = localStorage.getItem(SPLIT_KEY);
+      if (raw == null || raw === "") return 0.62;
+      const n = parseFloat(String(raw).replace("%", "").trim());
+      if (!Number.isFinite(n)) return 0.62;
+      return clampSplit(n > 1 ? n / 100 : n);
+    } catch (err) {
+      return 0.62;
+    }
+  }
+  function writeSplit(next) {
+    try { localStorage.setItem(SPLIT_KEY, String(Math.round(next * 1000) / 1000)); }
+    catch (err) {}
+  }
+  function applySplit(next) {
+    ratio = clampSplit(next);
+    studio.style.setProperty("--split", String(ratio));
+    handle.setAttribute("aria-valuenow", String(Math.round(ratio * 100)));
+    return ratio;
+  }
+  applySplit(readSplit());
+
+  handle.addEventListener("mousedown", (ev) => {
+    if (ev.button !== 0 || window.innerWidth < 900) return;
+    dragging = true;
+    ev.preventDefault();
+    document.body.classList.add("is-splitting");
+  });
+  window.addEventListener("mousemove", (ev) => {
+    if (!dragging) return;
+    ev.preventDefault();
+    const rect = studio.getBoundingClientRect();
+    const handleW = handle.getBoundingClientRect().width || 18;
+    const videoPx = rect.right - ev.clientX - handleW / 2;
+    applySplit(videoPx / Math.max(1, rect.width));
+  });
+  window.addEventListener("mouseup", () => {
+    if (!dragging) return;
+    dragging = false;
+    document.body.classList.remove("is-splitting");
+    writeSplit(ratio);
+  });
+  handle.addEventListener("dblclick", (ev) => {
+    ev.preventDefault();
+    applySplit(0.62);
+    writeSplit(ratio);
+  });
+})();
 </script>
 </body>
 </html>
