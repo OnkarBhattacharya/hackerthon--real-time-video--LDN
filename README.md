@@ -1,71 +1,72 @@
-# LDN Video Ask
+# Near-miss investigation
 
-Hackathon app for the **VAST Builders Challenge**: ask the team’s indexed video archive in plain language, get a grounded answer, and play the evidence clips.
+Searches an indexed VAST video archive for close approaches between people and moving vehicles, ranks the hits, and shows the clips with an English report, a German report, and a ticket payload.
 
-Built on the **pre-running VSS stack** (skills: `retrieval/login`, `retrieval/agent-qa`, `retrieval/videos`, `retrieval/suggest-prompts`). No custom FFmpeg / YOLO / local ingest pipeline.
+The running VSS stack does the search. This app does not ingest video or run a local detector.
 
-## What it does
+## How it works
 
-1. Logs into the team VSS backend with env credentials
-2. Calls `POST /api/v1/agent/search-and-answer` for Q&A + chunk evidence
-3. Streams matching segments via `GET /api/v1/videos/stream` (proxied)
-4. Seeds the UI with `GET /api/v1/suggestions` and browse via `GET /api/v1/videos/explore`
+An investigation job searches each indexed camera, keeps the strongest segments, scores severity from the description and detections, then attaches the previous, event, and next clips plus privacy flags.
 
-## App code
+## Architecture
 
 ```text
-tools/video-ask/
-├── main.py          # Flask UI + /api/ask|suggestions|explore|stream
-├── vss_client.py    # JWT login + VSS calls
-├── index.html
-├── app.js
-├── style.css
-└── requirements.txt
+Browser (frontend/, relative URLs)
+   -> FastAPI (backend/main.py, also at ingress /app)
+        investigate job -> vss.py (login, search, explore, stream)
+                        -> ranking.py (W&B JSON, or rules if unset)
+                        -> evidence.py (neighbour clips, privacy flags)
+        reports.py (English report, German text, ticket payload)
+VAST VSS archive: search, segment fields, clips
 ```
 
-## Deploy (guest card slot)
-
-Ship as its **own** Deployment + ClusterIP Service (`ldn-video-ask`). Do **not** overwrite `hackathon-app-code` / launcher `main.py`, and do **not** add another Ingress.
+## Run locally
 
 ```bash
-export KUBECONFIG=/config/team-41-k8s.yaml
-APP_DIR=tools/video-ask
-APP_NAME=ldn-video-ask
-NS=team-41
-
-kubectl -n "$NS" create configmap "${APP_NAME}-code" \
-  --from-file="$APP_DIR" \
-  --dry-run=client -o yaml | kubectl apply -f -
-
-kubectl -n "$NS" create secret generic "${APP_NAME}-vss-creds" \
-  --from-literal=VSS_URL="http://video-backend-service:8000" \
-  --from-literal=VSS_USERNAME="$USERNAME" \
-  --from-literal=VSS_PASSWORD="$PASSWORD" \
-  --dry-run=client -o yaml | kubectl apply -f -
+uv venv .venv
+uv pip install --python .venv/bin/python -r requirements.txt
+# Live archive
+export VSS_URL="$INGRESS_URL"   # or the in-cluster video-backend URL
+export VSS_USERNAME="$USERNAME"
+export VSS_PASSWORD="$PASSWORD"
+# Optional: WANDB_API_KEY, WANDB_BASE_URL, WANDB_MODEL, TICKET_WEBHOOK_URL
+PORT=8080 .venv/bin/python -m backend.main
 ```
 
-Apply Deployment + Service (image `python:3.12-slim`, routes at `/` and `/health`). Then claim the launcher’s second card:
+Without archive credentials, the same server can use the labelled sample set:
 
 ```bash
-kubectl -n team-41 set env deploy/hackathon-app \
-  GUEST_UPSTREAM=http://ldn-video-ask:80
+VSS_USE_FIXTURE=1 PORT=8080 .venv/bin/python -m backend.main
 ```
 
-**Open:** [https://workshop.thecosmoslabs.com](https://workshop.thecosmoslabs.com) → **App** → second card (`/app/guest`). Hard-refresh after claiming.
+Open `/`. Behind the team ingress the same routes are served at `/app` because the app does not hard-code that prefix.
 
-Give the card back: `kubectl -n team-41 set env deploy/hackathon-app GUEST_UPSTREAM-`
-
-## Local smoke (optional)
+`pytest` uses the fixture and does not call the archive:
 
 ```bash
-cd tools/video-ask
-pip install -r requirements.txt
-# uses INGRESS_URL / USERNAME / PASSWORD already in the VM env
-PORT=8080 python main.py
+.venv/bin/python -m pytest
 ```
 
-## Out of scope (by design)
+With archive credentials set, the same pipeline can be checked against the live index. The scripts do not print tokens:
 
-- Rebuilding ingest / embed / YOLO locally
-- Internet / YouTube video upload
-- Heavy Node frontend (ConfigMap size limit ~1 MiB)
+```bash
+python scripts/smoke_candidates.py
+python scripts/smoke_ranking.py
+python scripts/smoke_evidence.py
+python scripts/smoke_reports.py
+```
+
+## Deploy
+
+Not deployed from this machine. The team kubeconfig, `INGRESS_URL`, and login variables are not present here. On the team VM, follow `deployment/deploy-app-no-registry`: team namespace, no image build, ingress path `/app`. Until that is done, run the server on the VM and open the local port.
+
+`tools/video-ask/` is the earlier ask UI and is unchanged.
+
+## Limits
+
+- Crop is unavailable. Cards show clips only.
+- Audio transcripts are out of scope.
+- With no `WANDB_API_KEY`, severity is rule-based and the German report is a template. Both say so.
+- With no `TICKET_WEBHOOK_URL`, Create ticket returns JSON for download and does not POST.
+- Neighbour clips are omitted, and labelled, when the archive does not return them.
+- Fixture mode is sample data, not the indexed archive.

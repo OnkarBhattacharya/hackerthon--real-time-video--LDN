@@ -1,5 +1,7 @@
 # Stage 3 — Evidence assembly (spec)
 
+Merged behaviour: `assemble_evidence` returns `EvidenceHit` values. Clips are `previous`, `event`, and `next`. The GDPR sentence is `privacy_note`. `crop_available` stays false. Neighbour lookup uses segment number when the search row has one.
+
 **Time-box:** 30 minutes  
 **Depends on:** Stage 2 `RankedHit` (kept, severity-sorted)  
 **Goal:** For each kept hit, attach a before/event/after clip triptych and privacy flags, and snapshot the run for the UI.

@@ -19,7 +19,7 @@
 - API routes and the UI (Stages 5–6)
 - Object crops (already omitted in Stage 3)
 
-The hit type is the Stage 3 `EvidenceBundle`. Reports cite that object only.
+The merged hit type is `EvidenceHit`. Reports cite that object only. The GDPR sentence lives on `privacy_note`; `privacy_flags` lists people and plates.
 
 ## English report
 

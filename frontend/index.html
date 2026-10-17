@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Near-miss investigation</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="wrap">
+      <header>
+        <h1>Near-miss investigation</h1>
+        <p class="lede">
+          This tool searches the indexed archive for close approaches between people and moving vehicles, ranks them, and shows the footage.
+        </p>
+        <p id="status" class="status" role="status">The archive has not been queried in this session.</p>
+      </header>
+
+      <section class="investigate" aria-label="Investigate">
+        <label for="query">Query</label>
+        <div class="row">
+          <input
+            id="query"
+            type="text"
+            value="person close to a moving vehicle"
+            placeholder="person close to a moving vehicle"
+          />
+          <button id="investigate" class="primary" type="button">Investigate</button>
+        </div>
+      </section>
+
+      <section aria-live="polite">
+        <h2>Progress</h2>
+        <ol id="steps"></ol>
+        <div id="error" class="error" hidden></div>
+        <p id="skipped" hidden></p>
+      </section>
+
+      <section>
+        <h2>Results</h2>
+        <p id="empty">
+          Investigate searches the indexed archive for close approaches between people and moving vehicles, then ranks the footage it finds.
+        </p>
+        <div id="results"></div>
+      </section>
+    </main>
+    <script src="./app.js"></script>
+  </body>
+</html>

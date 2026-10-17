@@ -101,7 +101,7 @@ Pass condition: at least three cameras return one or more hits. If fewer do, fol
 
 ## Working-tree notes preserved during merge
 
-These notes were already in the working tree when `origin/main` added this file. They record the Stage 1–3 implementation contracts and are kept alongside the spec above.
+These notes record the live archive contract from the Stages 1–4 branch. The running app follows the spec above: `find_candidates(queries, cameras, per_query_limit)` and the investigation API in `backend/main.py`. Live search, camera listing, and neighbours use the endpoints in the notes. Clip URLs stored on a hit are relative `api/stream?source=` paths; the stream route attaches the token.
 
 # Stage 1 — Data layer (spec)
 

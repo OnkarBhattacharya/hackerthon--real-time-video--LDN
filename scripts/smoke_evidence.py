@@ -1,23 +1,22 @@
 #!/usr/bin/env python3
-"""Stage 3 verify: triptych URLs for the top 3 hits respond as video."""
+"""Stage 3 verify: triptych clips for the top hits respond as video."""
 
 from __future__ import annotations
 
 import logging
-import re
 import sys
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-import requests  # noqa: E402
-
-from backend.candidates import find_candidates  # noqa: E402
-from backend.evidence import GDPR_NOTE, assemble_evidence  # noqa: E402
+from backend.candidates import DEFAULT_QUERIES, find_candidates  # noqa: E402
+from backend.evidence import assemble_evidence  # noqa: E402
+from backend.models import PRIVACY_NOTE  # noqa: E402
 from backend.ranking import rank_candidates  # noqa: E402
-from backend.vss import VssClient  # noqa: E402
+from backend.vss import VssError, get_client  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 
@@ -30,28 +29,34 @@ SMOKE_CAMERAS = [
 ]
 RANK_LIMIT = 8
 CHECK_TOP = 3
-_TOKEN = re.compile(r"([?&]token=)[^&]+")
+
+
+def source_of(clip_url: str) -> str | None:
+    """Read the stream source out of a relative clip URL."""
+    parsed = urlparse(clip_url if "://" in clip_url else "http://local/" + clip_url)
+    values = parse_qs(parsed.query).get("source") or []
+    return values[0] if values else None
 
 
 def redact_url(url: str) -> str:
-    """Hide the JWT query param before printing a clip URL."""
-    return _TOKEN.sub(r"\1***", url)
+    """Hide a token query param before printing a clip URL."""
+    if "token=" not in url:
+        return url
+    return url.split("token=", 1)[0] + "token=***"
 
 
-def verify_clip(url: str) -> tuple[int, str, bool]:
-    """Return HTTP status, content type, and whether the body is a playable video.
-
-    The live stream endpoint returns ``binary/octet-stream`` with an MP4 body.
-    A ``video/*`` content type is also accepted. Exceptions are reported by
-    type name only so the token in the URL is not logged.
-    """
+def verify_clip(clip_url: str) -> tuple[int, str, bool]:
+    """Return HTTP status, content type, and whether the body looks like video."""
+    source = source_of(clip_url)
+    if not source:
+        return 0, "no-source", False
     try:
-        response = requests.get(url, stream=True, timeout=45)
-    except requests.RequestException as exc:
-        return 0, type(exc).__name__, False
+        response = get_client().open_stream(source, None)
+    except VssError:
+        return 0, "error", False
     try:
-        ctype = (response.headers.get("Content-Type") or "").split(";")[0].strip().lower()
-        chunk = next(response.iter_content(32), b"")
+        ctype = (response.headers.get("content-type") or "").split(";")[0].strip().lower()
+        chunk = next(response.iter_bytes(32), b"")
         is_mp4 = b"ftyp" in chunk[:16]
         ok = response.status_code == 200 and (ctype.startswith("video/") or is_mp4)
         return response.status_code, ctype or "-", ok
@@ -69,13 +74,7 @@ def _cell(present: bool, result: tuple[int, str, bool] | None) -> str:
 
 
 def main() -> int:
-    client = VssClient()
-    client.login()
-    candidates = find_candidates(
-        client=client,
-        cameras=SMOKE_CAMERAS,
-        per_query_limit=2,
-    )
+    candidates = find_candidates(list(DEFAULT_QUERIES), SMOKE_CAMERAS, 2)
     sample = candidates[:RANK_LIMIT]
     print(f"Ranking {len(sample)} of {len(candidates)} candidates…")
     if not sample:
@@ -85,57 +84,57 @@ def main() -> int:
     if not ranked:
         print("FAIL: no ranked hits", file=sys.stderr)
         return 1
-    bundles = assemble_evidence(ranked, client=client)
-    top = bundles[:CHECK_TOP]
+    hits = assemble_evidence(ranked)
+    top = hits[:CHECK_TOP]
 
     print()
     print(f"{'sev':>3}  {'camera':<22}  {'before':<14}  {'event':<14}  {'after':<14}")
     print("-" * 76)
     failed = False
-    for bundle in top:
-        slots = bundle.triptych
+    for hit in top:
         checks: dict[str, tuple[int, str, bool] | None] = {}
+        present: dict[str, bool] = {}
         for role in ("previous", "event", "next"):
-            slot = slots[role]
-            if not slot.present or not slot.clip_url:
+            clip = hit.clips.get(role)
+            clip_url = clip.get("clip_url") if isinstance(clip, dict) else None
+            present[role] = bool(clip_url)
+            if not clip_url:
                 checks[role] = None
                 continue
-            checks[role] = verify_clip(slot.clip_url)
-            status, _ctype, ok = checks[role]
+            checks[role] = verify_clip(str(clip_url))
+            _status, _ctype, ok = checks[role]
             if not ok:
                 failed = True
         print(
-            f"{bundle.hit.severity:>3}  {bundle.hit.candidate.camera_id:<22}  "
-            f"{_cell(slots['previous'].present, checks['previous']):<14}  "
-            f"{_cell(slots['event'].present, checks['event']):<14}  "
-            f"{_cell(slots['next'].present, checks['next']):<14}"
+            f"{hit.ranked.severity:>3}  {hit.ranked.candidate.camera_id:<22}  "
+            f"{_cell(present['previous'], checks['previous']):<14}  "
+            f"{_cell(present['event'], checks['event']):<14}  "
+            f"{_cell(present['next'], checks['next']):<14}"
         )
         for role, label in (("previous", "before"), ("event", "event"), ("next", "after")):
-            slot = slots[role]
-            if not slot.present or not slot.clip_url:
+            clip = hit.clips.get(role)
+            clip_url = clip.get("clip_url") if isinstance(clip, dict) else None
+            if not clip_url:
                 print(f"     {label:<6}  omitted ({role})")
                 continue
             status, ctype, ok = checks[role] or (0, "-", False)
             print(
                 f"     {label:<6}  HTTP {status}  {ctype}  "
-                f"{'video' if ok else 'FAIL'}  {redact_url(slot.clip_url)}"
+                f"{'video' if ok else 'FAIL'}  {redact_url(str(clip_url))}"
             )
-        if GDPR_NOTE not in bundle.privacy_flags:
+        if PRIVACY_NOTE not in hit.privacy_note:
             print("FAIL: missing GDPR note", file=sys.stderr)
             failed = True
-        if bundle.crop_available or not bundle.crop_omitted:
+        if hit.crop_available:
             print("FAIL: crop should be omitted", file=sys.stderr)
             failed = True
 
     print("-" * 76)
-    print(
-        f"kept={len(bundles)} checked={len(top)} "
-        f"crop_available={bundles[0].crop_available}"
-    )
+    print(f"kept={len(hits)} checked={len(top)} crop_available={hits[0].crop_available if hits else None}")
     if failed or not top:
         print("FAIL")
         return 1
-    if any(not b.triptych["event"].present for b in top):
+    if any(not hit.clips.get("event") for hit in top):
         print("FAIL: event clip missing")
         return 1
     print("PASS")

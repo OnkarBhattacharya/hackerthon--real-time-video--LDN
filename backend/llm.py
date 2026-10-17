@@ -1,137 +1,137 @@
-"""W&B serverless inference client (OpenAI-compatible chat)."""
+"""W&B inference client. Callers fall back when this is not configured."""
 
 from __future__ import annotations
 
-import json
 import logging
 import time
 from typing import Any
 
-import requests
+import httpx
 
-from backend.config import Settings, load_settings
+from backend.config import settings
 
-log = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
 
 
-class LlmError(RuntimeError):
-    """Inference call failed."""
+class LlmError(Exception):
+    """The inference endpoint could not complete a request."""
 
 
 class LlmClient:
-    """Chat completions against Weights & Biases Inference."""
+    """OpenAI-compatible chat client with a timeout on every call."""
 
-    def __init__(self, settings: Settings | None = None) -> None:
-        self.settings = settings or load_settings()
-        self._session = requests.Session()
+    def __init__(self) -> None:
+        self._model: str | None = None
 
-    @property
-    def available(self) -> bool:
-        return bool(self.settings.wandb_api_key)
+    def configured(self) -> bool:
+        """Return True when an API key is present."""
+        return settings.wandb_api_key() is not None
 
-    def chat_json(
-        self,
-        *,
-        system: str,
-        user: str,
-        max_tokens: int = 800,
-        temperature: float = 0.0,
-    ) -> dict[str, Any]:
-        """Call the model and return a parsed JSON object.
-
-        Uses response_format json_object when possible; raises LlmError on failure.
-        """
-        if not self.available:
-            raise LlmError("WANDB_API_KEY not set")
-        content = self._complete(
-            system=system,
-            user=user,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            json_mode=True,
-        )
-        try:
-            return _parse_json_object(content)
-        except (json.JSONDecodeError, ValueError) as exc:
-            log.warning("llm.json_parse_failed; attempting repair")
-            repaired = self._complete(
-                system=(
-                    "Fix the following into a single valid JSON object. "
-                    "Output JSON only, no markdown."
-                ),
-                user=f"Invalid output to repair:\n{content}\n\nError: {exc}",
-                max_tokens=max_tokens,
-                temperature=0.0,
-                json_mode=True,
-            )
-            return _parse_json_object(repaired)
-
-    def _complete(
-        self,
-        *,
-        system: str,
-        user: str,
-        max_tokens: int,
-        temperature: float,
-        json_mode: bool,
-    ) -> str:
-        url = f"{self.settings.wandb_inference_url}/chat/completions"
-        body: dict[str, Any] = {
-            "model": self.settings.wandb_model,
+    def complete(self, system: str, user: str, *, json_mode: bool = False) -> str:
+        """Send one chat request and return the assistant text."""
+        if not self.configured():
+            raise LlmError("WANDB_API_KEY is not set")
+        model = self._resolve_model()
+        payload: dict[str, Any] = {
+            "model": model,
             "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
-            "temperature": temperature,
-            "max_tokens": max_tokens,
+            "temperature": 0,
         }
         if json_mode:
-            body["response_format"] = {"type": "json_object"}
-        headers = {
-            "Authorization": f"Bearer {self.settings.wandb_api_key}",
-            "Content-Type": "application/json",
-        }
-        last_err: Exception | None = None
-        for attempt in range(self.settings.max_retries):
-            try:
-                log.info(
-                    "llm.chat model=%s attempt=%s json_mode=%s",
-                    self.settings.wandb_model,
-                    attempt + 1,
-                    json_mode,
-                )
-                r = self._session.post(
-                    url,
-                    headers=headers,
-                    json=body,
-                    timeout=self.settings.request_timeout_sec,
-                )
-                if r.status_code in (429, 500, 502, 503, 504) and attempt + 1 < self.settings.max_retries:
-                    time.sleep(0.5 * (2**attempt))
-                    continue
-                if r.status_code >= 400:
-                    raise LlmError(f"chat HTTP {r.status_code}: {r.text[:200]}")
-                data = r.json()
-                msg = (data.get("choices") or [{}])[0].get("message") or {}
-                content = msg.get("content")
-                if not content:
-                    raise LlmError("empty model content")
-                return str(content)
-            except (requests.RequestException, LlmError, KeyError, IndexError) as exc:
-                last_err = exc
-                if attempt + 1 >= self.settings.max_retries:
-                    break
-                time.sleep(0.5 * (2**attempt))
-        raise LlmError(f"chat failed after retries: {last_err}")
+            payload["response_format"] = {"type": "json_object"}
+        started = time.perf_counter()
+        response = self._post(payload)
+        if json_mode and response.status_code == 400:
+            logger.info("llm chat model=%s json_mode=rejected", model)
+            payload.pop("response_format", None)
+            response = self._post(payload)
+        elapsed = time.perf_counter() - started
+        logger.info(
+            "llm chat model=%s status=%s elapsed=%.2f",
+            model,
+            response.status_code,
+            elapsed,
+        )
+        if response.status_code >= 400:
+            raise LlmError(f"inference failed ({response.status_code})")
+        body = response.json()
+        try:
+            content = body["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise LlmError("inference returned no message") from exc
+        if not isinstance(content, str) or not content.strip():
+            raise LlmError("inference returned an empty message")
+        return content
+
+    def _post(self, payload: dict[str, Any]) -> httpx.Response:
+        key = settings.wandb_api_key() or ""
+        url = settings.wandb_base_url() + "/chat/completions"
+        try:
+            return httpx.post(
+                url,
+                json=payload,
+                headers={"Authorization": f"Bearer {key}"},
+                timeout=60,
+            )
+        except httpx.HTTPError as exc:
+            logger.info("llm chat model=%s status=error", payload.get("model"))
+            raise LlmError("inference did not respond") from exc
+
+    def _resolve_model(self) -> str:
+        chosen = settings.wandb_model()
+        if chosen:
+            return chosen
+        if self._model:
+            return self._model
+        url = settings.wandb_base_url() + "/models"
+        key = settings.wandb_api_key() or ""
+        started = time.perf_counter()
+        try:
+            response = httpx.get(
+                url,
+                headers={"Authorization": f"Bearer {key}"},
+                timeout=30,
+            )
+        except httpx.HTTPError as exc:
+            logger.info("llm models status=error elapsed=%.2f", time.perf_counter() - started)
+            raise LlmError("could not list models") from exc
+        logger.info(
+            "llm models status=%s elapsed=%.2f",
+            response.status_code,
+            time.perf_counter() - started,
+        )
+        if response.status_code >= 400:
+            raise LlmError(f"could not list models ({response.status_code})")
+        model_id = _pick_model(response.json())
+        if not model_id:
+            raise LlmError("no instruction-following model was listed")
+        self._model = model_id
+        return model_id
 
 
-def _parse_json_object(text: str) -> dict[str, Any]:
-    text = text.strip()
-    if text.startswith("```"):
-        lines = text.splitlines()
-        lines = [ln for ln in lines if not ln.strip().startswith("```")]
-        text = "\n".join(lines).strip()
-    data = json.loads(text)
-    if not isinstance(data, dict):
-        raise ValueError("expected a JSON object")
-    return data
+def _pick_model(payload: dict[str, Any]) -> str | None:
+    raw_items = payload.get("data") or payload.get("models") or []
+    ids: list[str] = []
+    for item in raw_items:
+        if isinstance(item, str):
+            ids.append(item)
+        elif isinstance(item, dict) and item.get("id"):
+            ids.append(str(item["id"]))
+    preferred = [
+        model_id
+        for model_id in ids
+        if "embed" not in model_id.lower()
+        and any(token in model_id.lower() for token in ("instruct", "chat", "reason"))
+    ]
+    if preferred:
+        return preferred[0]
+    for model_id in ids:
+        if "embed" not in model_id.lower():
+            return model_id
+    return None
+
+
+llm = LlmClient()

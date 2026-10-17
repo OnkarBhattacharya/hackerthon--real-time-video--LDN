@@ -10,3 +10,5 @@ web/dist/
 .pytest_cache/
 .mypy_cache/
 .DS_Store
+kubeconfig
+*-k8s.yaml

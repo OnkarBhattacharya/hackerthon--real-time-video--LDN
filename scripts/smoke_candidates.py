@@ -12,28 +12,26 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from backend.candidates import find_candidates  # noqa: E402
-from backend.vss import VssClient  # noqa: E402
+from backend.candidates import DEFAULT_QUERIES, find_candidates  # noqa: E402
+from backend.vss import get_client  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 
 
 def main() -> int:
-    client = VssClient()
-    client.login()
-    cameras = client.list_camera_ids()
+    cameras = get_client().list_cameras()
     print(f"cameras ({len(cameras)}): {', '.join(cameras)}")
 
-    candidates = find_candidates(client=client, per_query_limit=6)
+    candidates = find_candidates(list(DEFAULT_QUERIES), cameras, 6)
     by_cam: dict[str, list] = defaultdict(list)
-    for c in candidates:
-        by_cam[c.camera_id].append(c)
+    for candidate in candidates:
+        by_cam[candidate.camera_id].append(candidate)
 
     print(f"\nTotal candidates (capped): {len(candidates)}")
     print("-" * 72)
     cameras_with_hits = 0
-    for cam in sorted(by_cam.keys()):
-        items = sorted(by_cam[cam], key=lambda x: x.search_score, reverse=True)
+    for cam in sorted(by_cam):
+        items = sorted(by_cam[cam], key=lambda item: item.search_score, reverse=True)
         cameras_with_hits += 1
         top = items[0]
         desc = (top.description or "").replace("\n", " ")[:140]

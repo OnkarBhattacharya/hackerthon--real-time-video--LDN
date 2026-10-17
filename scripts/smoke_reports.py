@@ -5,27 +5,25 @@ from __future__ import annotations
 
 import logging
 import sys
-import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from backend.candidates import find_candidates  # noqa: E402
-from backend.config import load_settings  # noqa: E402
+from backend.candidates import DEFAULT_QUERIES, find_candidates  # noqa: E402
+from backend.config import settings  # noqa: E402
 from backend.evidence import assemble_evidence  # noqa: E402
 from backend.ranking import rank_candidates  # noqa: E402
 from backend.reports import (  # noqa: E402
-    GERMAN_DISCLAIMER,
-    ReportError,
+    DISCLAIMER,
+    ReportFormatError,
     TicketWebhookError,
     format_offset,
     incident_report,
     ticket_payload,
     translate_report,
 )
-from backend.vss import VssClient  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 
@@ -52,13 +50,7 @@ _TICKET_KEYS = (
 
 
 def main() -> int:
-    client = VssClient()
-    client.login()
-    candidates = find_candidates(
-        client=client,
-        cameras=SMOKE_CAMERAS,
-        per_query_limit=2,
-    )
+    candidates = find_candidates(list(DEFAULT_QUERIES), SMOKE_CAMERAS, 2)
     sample = candidates[:RANK_LIMIT]
     print(f"Ranking {len(sample)} of {len(candidates)} candidates…")
     if not sample:
@@ -68,22 +60,21 @@ def main() -> int:
     if not ranked:
         print("FAIL: no ranked hits", file=sys.stderr)
         return 1
-    snapshot = Path(tempfile.mkdtemp(prefix="smoke-reports-")) / "run.json"
-    bundles = assemble_evidence(ranked[:1], client=client, snapshot_path=snapshot)
-    if not bundles:
+    hits = assemble_evidence(ranked[:1])
+    if not hits:
         print("FAIL: no evidence hit", file=sys.stderr)
         return 1
-    bundle = bundles[0]
-    segment_id = bundle.hit.segment_id
-    start = format_offset(bundle.hit.candidate.start)
-    end = format_offset(bundle.hit.candidate.end)
+    hit = hits[0]
+    segment_id = hit.ranked.candidate.segment_id
+    start = format_offset(hit.ranked.candidate.start)
+    end = format_offset(hit.ranked.candidate.end)
 
-    english = incident_report(bundle)
+    english = incident_report(hit)
     print("\n===== English report =====\n")
     print(english.text)
     try:
-        german = translate_report(english)
-    except ReportError as exc:
+        german = translate_report(english, hit=hit)
+    except ReportFormatError as exc:
         print(f"FAIL: {type(exc).__name__}", file=sys.stderr)
         return 1
     print("\n===== German report =====\n")
@@ -102,16 +93,16 @@ def main() -> int:
     if end not in english.text or end not in german.text:
         print("FAIL: end offset missing", file=sys.stderr)
         failed = True
-    if german.text.count(GERMAN_DISCLAIMER) != 1:
+    if german.text.count(DISCLAIMER) != 1:
         print("FAIL: German disclaimer missing or repeated", file=sys.stderr)
         failed = True
     if "token=" in english.text or "token=" in german.text:
         print("FAIL: report contains a token", file=sys.stderr)
         failed = True
 
-    configured = bool(load_settings().ticket_webhook_url)
+    configured = settings.ticket_webhook_url() is not None
     try:
-        payload = ticket_payload(bundle, english)
+        payload = ticket_payload(hit, english)
     except TicketWebhookError as exc:
         print(f"FAIL: webhook {exc}", file=sys.stderr)
         return 1

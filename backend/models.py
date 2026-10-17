@@ -1,4 +1,4 @@
-"""Domain models for Stage 1 candidates."""
+"""Shared investigation records."""
 
 from __future__ import annotations
 
@@ -6,30 +6,25 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
-@dataclass
-class DetectionBox:
-    """Optional axis-aligned box in frame coordinates."""
-
-    x1: float
-    y1: float
-    x2: float
-    y2: float
-    conf: float | None = None
-    frame_index: int | None = None
+PRIVACY_NOTE = "Review before sharing. Possible personal data (GDPR)."
 
 
 @dataclass
 class Detection:
-    """Aggregated detection for one object class."""
+    """One detected class on a segment."""
 
-    class_name: str
+    label: str
     count: int
-    boxes: list[DetectionBox] = field(default_factory=list)
+    boxes: list[Any] | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return the API shape. `class` is the wire name."""
+        return {"class": self.label, "count": self.count, "boxes": self.boxes}
 
 
 @dataclass
 class Candidate:
-    """Normalised search hit used by later ranking / evidence stages."""
+    """One normalised search hit."""
 
     segment_id: str
     video_id: str
@@ -41,53 +36,30 @@ class Candidate:
     detections: list[Detection]
     search_score: float
     clip_url: str
-    segment_number: int | None = None
-    total_segments: int | None = None
-    filename: str | None = None
-    capture_type: str | None = None
+
+
+@dataclass
+class Clip:
+    """A playable neighbour or event clip."""
+
+    segment_id: str
+    start: float
+    end: float
+    clip_url: str
 
     def to_dict(self) -> dict[str, Any]:
+        """Return the clip fields the UI plays."""
         return {
             "segment_id": self.segment_id,
-            "video_id": self.video_id,
-            "camera_id": self.camera_id,
-            "location": self.location,
             "start": self.start,
             "end": self.end,
-            "description": self.description,
-            "detections": [
-                {
-                    "class": d.class_name,
-                    "count": d.count,
-                    "boxes": [
-                        {
-                            "x1": b.x1,
-                            "y1": b.y1,
-                            "x2": b.x2,
-                            "y2": b.y2,
-                            "conf": b.conf,
-                            "frame_index": b.frame_index,
-                        }
-                        for b in d.boxes
-                    ],
-                }
-                for d in self.detections
-            ],
-            "search_score": self.search_score,
             "clip_url": self.clip_url,
-            "segment_number": self.segment_number,
-            "total_segments": self.total_segments,
-            "filename": self.filename,
-            "capture_type": self.capture_type,
         }
-
-
-CONFIDENCE_RANK = {"high": 3, "medium": 2, "low": 1}
 
 
 @dataclass
 class RankedHit:
-    """Candidate plus LLM (or fallback) severity ranking fields."""
+    """A candidate plus a severity judgement."""
 
     candidate: Candidate
     severity: int
@@ -97,29 +69,97 @@ class RankedHit:
     faces_or_plates_possibly_visible: bool
     recommended_action: str
     confidence: str
-    ranking_source: str = "llm"  # llm | fallback | repair
+    rule_based: bool = False
 
-    @property
-    def segment_id(self) -> str:
-        return self.candidate.segment_id
 
-    @property
-    def search_score(self) -> float:
-        return self.candidate.search_score
+@dataclass
+class EvidenceHit:
+    """A ranked hit with clips and privacy flags."""
+
+    ranked: RankedHit
+    clips: dict[str, dict[str, Any] | None]
+    missing_neighbours: list[str] = field(default_factory=list)
+    privacy_flags: list[str] = field(default_factory=list)
+    privacy_note: str = PRIVACY_NOTE
+    crop_url: str | None = None
+    crop_available: bool = False
+    clip_error: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        base = self.candidate.to_dict()
-        base.update(
-            {
-                "severity": self.severity,
-                "category": self.category,
-                "rationale": self.rationale,
-                "people_visible": self.people_visible,
-                "faces_or_plates_possibly_visible": self.faces_or_plates_possibly_visible,
-                "recommended_action": self.recommended_action,
-                "confidence": self.confidence,
-                "ranking_source": self.ranking_source,
-            }
-        )
-        return base
+        """Return the flat JSON object stored in jobs and the snapshot."""
+        candidate = self.ranked.candidate
+        payload: dict[str, Any] = {
+            "segment_id": candidate.segment_id,
+            "video_id": candidate.video_id,
+            "camera_id": candidate.camera_id,
+            "location": candidate.location,
+            "start": candidate.start,
+            "end": candidate.end,
+            "description": candidate.description,
+            "detections": [item.to_dict() for item in candidate.detections],
+            "search_score": candidate.search_score,
+            "clip_url": candidate.clip_url,
+            "severity": self.ranked.severity,
+            "category": self.ranked.category,
+            "rationale": self.ranked.rationale,
+            "people_visible": self.ranked.people_visible,
+            "faces_or_plates_possibly_visible": self.ranked.faces_or_plates_possibly_visible,
+            "recommended_action": self.ranked.recommended_action,
+            "confidence": self.ranked.confidence,
+            "rule_based": self.ranked.rule_based,
+            "clips": self.clips,
+            "missing_neighbours": list(self.missing_neighbours),
+            "privacy_flags": list(self.privacy_flags),
+            "privacy_note": self.privacy_note,
+            "crop_url": self.crop_url,
+            "crop_available": self.crop_available,
+        }
+        if self.clip_error:
+            payload["clip_error"] = self.clip_error
+        return payload
 
+
+def evidence_from_dict(data: dict[str, Any]) -> EvidenceHit:
+    """Rebuild an evidence hit from a snapshot or job payload."""
+    detections = [
+        Detection(
+            label=str(item.get("class") or ""),
+            count=int(item.get("count") or 0),
+            boxes=item.get("boxes"),
+        )
+        for item in data.get("detections") or []
+        if isinstance(item, dict)
+    ]
+    candidate = Candidate(
+        segment_id=str(data.get("segment_id") or ""),
+        video_id=str(data.get("video_id") or ""),
+        camera_id=str(data.get("camera_id") or ""),
+        location=str(data.get("location") or ""),
+        start=float(data.get("start") or 0),
+        end=float(data.get("end") or 0),
+        description=str(data.get("description") or ""),
+        detections=detections,
+        search_score=float(data.get("search_score") or 0),
+        clip_url=str(data.get("clip_url") or ""),
+    )
+    ranked = RankedHit(
+        candidate=candidate,
+        severity=int(data.get("severity") or 1),
+        category=str(data.get("category") or "other"),
+        rationale=str(data.get("rationale") or ""),
+        people_visible=bool(data.get("people_visible")),
+        faces_or_plates_possibly_visible=bool(data.get("faces_or_plates_possibly_visible")),
+        recommended_action=str(data.get("recommended_action") or ""),
+        confidence=str(data.get("confidence") or "low"),
+        rule_based=bool(data.get("rule_based")),
+    )
+    return EvidenceHit(
+        ranked=ranked,
+        clips=dict(data.get("clips") or {}),
+        missing_neighbours=list(data.get("missing_neighbours") or []),
+        privacy_flags=list(data.get("privacy_flags") or []),
+        privacy_note=str(data.get("privacy_note") or PRIVACY_NOTE),
+        crop_url=data.get("crop_url"),
+        crop_available=bool(data.get("crop_available")),
+        clip_error=data.get("clip_error"),
+    )

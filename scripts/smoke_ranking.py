@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stage 2 verify: rank 10 real candidates and print a severity table."""
+"""Stage 2 verify: rank real candidates and print a severity table."""
 
 from __future__ import annotations
 
@@ -11,13 +11,11 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from backend.candidates import find_candidates  # noqa: E402
+from backend.candidates import DEFAULT_QUERIES, find_candidates  # noqa: E402
 from backend.ranking import rank_candidates  # noqa: E402
-from backend.vss import VssClient  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 
-# Faster smoke: a representative subset of cameras
 SMOKE_CAMERAS = [
     "neighborhood_cam-1",
     "nyc_streets_cam-1",
@@ -28,13 +26,7 @@ SMOKE_CAMERAS = [
 
 
 def main() -> int:
-    client = VssClient()
-    client.login()
-    candidates = find_candidates(
-        client=client,
-        cameras=SMOKE_CAMERAS,
-        per_query_limit=4,
-    )
+    candidates = find_candidates(list(DEFAULT_QUERIES), SMOKE_CAMERAS, 4)
     if len(candidates) < 10:
         print(f"WARN: only {len(candidates)} candidates; continuing", file=sys.stderr)
     sample = candidates[:10]
@@ -46,30 +38,31 @@ def main() -> int:
     print("-" * 100)
     prev_sev = 99
     order_ok = True
-    for h in ranked:
-        if h.severity > prev_sev:
+    for hit in ranked:
+        if hit.severity > prev_sev:
             order_ok = False
-        prev_sev = h.severity
-        seg = h.segment_id.rsplit("/", 1)[-1][:28]
-        rat = (h.rationale or "").replace("\n", " ")[:70]
+        prev_sev = hit.severity
+        seg = hit.candidate.segment_id.rsplit("/", 1)[-1][:28]
+        rationale = (hit.rationale or "").replace("\n", " ")[:70]
+        source = "rules" if hit.rule_based else "llm"
         print(
-            f"{h.severity:>3}  {h.confidence:<6}  {h.candidate.camera_id:<22}  "
-            f"{h.ranking_source:<8}  {rat}"
+            f"{hit.severity:>3}  {hit.confidence:<6}  {hit.candidate.camera_id:<22}  "
+            f"{source:<8}  {rationale}"
         )
-        print(f"     segment={seg} category={h.category}")
+        print(f"     segment={seg} category={hit.category}")
 
-    llm_n = sum(1 for h in ranked if h.ranking_source == "llm")
+    llm_n = sum(1 for hit in ranked if not hit.rule_based)
     print("-" * 100)
     print(f"kept={len(ranked)} llm={llm_n} fallback={len(ranked) - llm_n}")
 
     if not ranked:
         print("FAIL: no ranked hits", file=sys.stderr)
         return 1
-    for h in ranked:
-        if not (1 <= h.severity <= 5) or h.confidence not in {"low", "medium", "high"}:
-            print("FAIL: invalid fields", h.to_dict(), file=sys.stderr)
+    for hit in ranked:
+        if not (1 <= hit.severity <= 5) or hit.confidence not in {"low", "medium", "high"}:
+            print("FAIL: invalid fields", file=sys.stderr)
             return 1
-        if not h.rationale:
+        if not hit.rationale:
             print("FAIL: empty rationale", file=sys.stderr)
             return 1
     if not order_ok:
