@@ -6,8 +6,12 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
+import sys
 import threading
 import time
+import uuid
+from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
@@ -132,6 +136,7 @@ def _heuristic_shots(logline: str, beats: str, transcript: str) -> list[dict[str
     shots = []
     types = ["wide establishing", "tracking medium", "insert detail", "over-shoulder", "close-up", "pov", "reaction", "closing wide"]
     moods = ["dusk urban", "kinetic", "tense", "intimate", "observational", "night neon", "quiet", "resolute"]
+    vo_lines = [ln.strip() for ln in (transcript or "").split("\n") if ln.strip()]
     for i, text in enumerate(uniq):
         shots.append(
             {
@@ -141,7 +146,7 @@ def _heuristic_shots(logline: str, beats: str, transcript: str) -> list[dict[str
                 "shot_type": types[i % len(types)],
                 "mood": moods[i % len(moods)],
                 "action": text[:160],
-                "dialogue_beat": (transcript.split("\n")[i].strip() if transcript else ""),
+                "dialogue_beat": vo_lines[i] if i < len(vo_lines) else "",
                 "search_query": _film_query(types[i % len(types)], moods[i % len(moods)], text, transcript),
             }
         )
@@ -279,8 +284,9 @@ def _search_shot(
     tags: list[str] | None = None,
     exclude_sources: set[str] | None = None,
 ) -> list[dict[str, Any]]:
+    query = re.sub(r"\s+", " ", (shot.get("search_query") or "")).replace("—", "-").replace("–", "-").strip()
     body: dict[str, Any] = {
-        "query": shot["search_query"],
+        "query": query[:400],
         "top_k": top_k,
         "llm_top_n": 1,  # API requires >= 1
         "min_similarity": 0.2,
@@ -454,6 +460,154 @@ def stream_clip():
     )
 
 
+CUTS_DIR = Path("/tmp/idea-cuts")
+
+
+def _download_mp4(source: str, dest: Path) -> None:
+    token = _login()
+    with requests.get(
+        f"{VSS_URL}/api/v1/videos/stream",
+        params={"source": source, "token": token},
+        stream=True,
+        timeout=180,
+    ) as r:
+        r.raise_for_status()
+        with dest.open("wb") as f:
+            for chunk in r.iter_content(64 * 1024):
+                if chunk:
+                    f.write(chunk)
+
+
+def _probe_duration(path: Path) -> float:
+    out = subprocess.check_output(
+        [
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            str(path),
+        ],
+        text=True,
+    )
+    return max(0.0, float(out.strip() or 0))
+
+
+def _srt_time(sec: float) -> str:
+    ms = max(0, int(round(sec * 1000)))
+    h, ms = divmod(ms, 3_600_000)
+    m, ms = divmod(ms, 60_000)
+    s, ms = divmod(ms, 1000)
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+def _run_ffmpeg(args: list[str], cwd: Path | None = None) -> None:
+    proc = subprocess.run(args, cwd=cwd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise RuntimeError((proc.stderr or proc.stdout or "ffmpeg failed")[-500:])
+
+
+def _render_same_length_cut(
+    source_clips: list[dict[str, Any]],
+    match_sources: list[str],
+    transcript: str,
+) -> dict[str, Any]:
+    """Concat archive matches. Match the upload length when there is one; otherwise 4s per shot. Burn VO lines."""
+    picks: list[str] = []
+    seen: set[str] = set()
+    for src in match_sources:
+        if not src or src in seen:
+            continue
+        seen.add(src)
+        picks.append(src)
+        if len(picks) >= 4:
+            break
+    if not picks:
+        raise RuntimeError("no archive matches to cut together")
+
+    cut_id = uuid.uuid4().hex[:12]
+    work = CUTS_DIR / cut_id
+    work.mkdir(parents=True, exist_ok=True)
+
+    target = 0.0
+    for i, clip in enumerate(source_clips or []):
+        raw = work / f"mine_{i}.mp4"
+        _download_mp4(clip["source"], raw)
+        target += _probe_duration(raw)
+    if target < 0.5:
+        target = 4.0 * len(picks)
+
+    slice_len = target / len(picks)
+    trimmed: list[Path] = []
+    for i, src in enumerate(picks):
+        raw = work / f"raw_{i}.mp4"
+        _download_mp4(src, raw)
+        norm = work / f"norm_{i}.mp4"
+        _run_ffmpeg([
+            "ffmpeg", "-y", "-i", str(raw),
+            "-vf", "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=24",
+            "-an", "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+            str(norm),
+        ])
+        out = work / f"trim_{i}.mp4"
+        dur = _probe_duration(norm)
+        cmd = ["ffmpeg", "-y"]
+        if dur + 0.05 < slice_len:
+            cmd += ["-stream_loop", "-1"]
+        cmd += [
+            "-i", str(norm), "-t", f"{slice_len:.3f}",
+            "-an", "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+            str(out),
+        ]
+        _run_ffmpeg(cmd)
+        trimmed.append(out)
+
+    listing = work / "list.txt"
+    listing.write_text("".join(f"file '{p.resolve()}'\n" for p in trimmed), encoding="utf-8")
+    concat = work / "concat.mp4"
+    _run_ffmpeg([
+        "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(listing),
+        "-c", "copy", str(concat),
+    ])
+
+    vf = f"trim=duration={target:.3f},setpts=PTS-STARTPTS"
+    lines = [ln.strip() for ln in re.split(r"\n+", transcript or "") if ln.strip()]
+    if lines:
+        step = target / len(lines)
+        blocks = []
+        for i, line in enumerate(lines):
+            blocks.append(
+                f"{i+1}\n{_srt_time(i * step)} --> {_srt_time(min(target, (i + 1) * step))}\n{line}\n"
+            )
+        (work / "vo.srt").write_text("\n".join(blocks), encoding="utf-8")
+        vf += (
+            ",subtitles=vo.srt:force_style="
+            "'FontName=DejaVu Sans,FontSize=28,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=2,Alignment=2'"
+        )
+
+    _run_ffmpeg([
+        "ffmpeg", "-y", "-i", str(concat),
+        "-vf", vf, "-t", f"{target:.3f}",
+        "-an", "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+        str(work / "cut.mp4"),
+    ], cwd=work)
+    return {
+        "id": cut_id,
+        "url": f"{APP_PREFIX}/api/cuts/{cut_id}",
+        "target_duration_sec": round(target, 2),
+        "pieces": len(trimmed),
+        "vo": bool(lines),
+    }
+
+
+@app.get("/api/cuts/<cut_id>")
+def serve_cut(cut_id: str):
+    if not re.fullmatch(r"[a-f0-9]{12}", cut_id or ""):
+        return jsonify({"error": "bad id"}), 400
+    path = CUTS_DIR / cut_id / "cut.mp4"
+    if not path.is_file():
+        return jsonify({"error": "cut not ready"}), 404
+    return Response(path.read_bytes(), mimetype="video/mp4")
+
+
 @app.get("/api/upload-seed")
 def upload_seed():
     """Preview an indexed upload by tag (default: shittyvideo)."""
@@ -525,6 +679,7 @@ def upscale():
         if not shots:
             splitter = "heuristic"
             shots = _heuristic_shots(logline, beats, transcript)
+        shots = shots[:4]
 
         # Bias queries toward cinematic archive when seeding from a rough upload
         if seed_from_upload:
@@ -545,6 +700,7 @@ def upscale():
             enriched.append({**shot, "matches": matches})
 
         directors_cut = []
+        match_sources: list[str] = []
         for shot in enriched:
             best = shot["matches"][0] if shot["matches"] else None
             directors_cut.append(
@@ -557,6 +713,20 @@ def upscale():
                     "best": best,
                 }
             )
+            if best and best.get("source"):
+                match_sources.append(best["source"])
+
+        rendered = None
+        render_error = None
+        if match_sources:
+            try:
+                rendered = _render_same_length_cut(
+                    (source_upload or {}).get("clips") or [],
+                    match_sources,
+                    transcript,
+                )
+            except Exception as e:
+                render_error = str(e)
 
         return jsonify(
             {
@@ -568,6 +738,8 @@ def upscale():
                 "vss_url_host": VSS_URL.split("://")[-1].split("/")[0],
                 "shots": enriched,
                 "directors_cut": directors_cut,
+                "rendered_cut": rendered,
+                "render_error": render_error,
                 "pitch": "We start from boards and voice, not a prompt. The archive finds the cinematic version.",
             }
         )
@@ -685,6 +857,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
 <body>
   <div class="wrap">
     <header>
+      <p class="status"><a href="/app/">All apps</a></p>
       <h1>Idea Upscaler</h1>
       <p>Start from boards and voice — not a text-to-video prompt. We turn intent into a shot list and pull cinematic matches from your indexed archive.</p>
     </header>
@@ -715,7 +888,9 @@ INDEX_HTML = r"""<!DOCTYPE html>
       </div>
       <div class="panel cut" id="cut-panel">
         <h2>Director's cut</h2>
-        <p class="status" id="cut-empty">Upscale an idea to assemble an ordered cut from archive matches.</p>
+        <p class="status" id="cut-empty">Upscale shittyvideo to cut a reel the same length as your clip, with the VO burned in.</p>
+        <video id="cut-video" class="hidden" controls playsinline></video>
+        <p class="status" id="cut-meta"></p>
         <ol id="cut-list" class="hidden"></ol>
       </div>
     </section>
@@ -752,8 +927,8 @@ async function runUpscale({ seed }) {
     return;
   }
   const steps = useSeed
-    ? ["Reading shittyvideo captions", "Splitting shots", "Searching archive", "Building director's cut"]
-    : ["Splitting shots", "Searching archive", "Building director's cut"];
+    ? ["Reading your clip", "Finding stand-in shots", "Cutting a reel to your duration", "Burning the voice line"]
+    : ["Splitting the brief", "Searching the archive", "Cutting the shots together", "Burning the voice line"];
   $("go").disabled = true;
   $("shitty").disabled = true;
   $("status").className = "status";
@@ -786,8 +961,16 @@ async function runUpscale({ seed }) {
     active = 0;
     setProgress(steps, steps.length);
     render();
-    const hits = (data.shots || []).reduce((n, s) => n + (s.matches || []).length, 0);
-    $("status").textContent = `Ready · ${data.splitter} · ${data.shots.length} shots · ${hits} matches`;
+    const cut = data.rendered_cut;
+    if (cut && cut.url) {
+      $("status").textContent = `Cut ready · ${cut.target_duration_sec}s · same length as your clip`;
+    } else if (data.render_error) {
+      $("status").className = "status err";
+      $("status").textContent = data.render_error;
+    } else {
+      const hits = (data.shots || []).reduce((n, s) => n + (s.matches || []).length, 0);
+      $("status").textContent = `Ready · ${data.splitter} · ${data.shots.length} shots · ${hits} matches`;
+    }
   } catch (e) {
     $("status").className = "status err";
     $("status").textContent = String(e.message || e);
@@ -845,6 +1028,18 @@ function render() {
       </div>`).join("")
     : `<p class="status">No matches for this shot — try broader beats or drop filters.</p>`;
 
+  const reel = state.rendered_cut;
+  const vid = $("cut-video");
+  if (reel && reel.url) {
+    $("cut-empty").classList.add("hidden");
+    vid.classList.remove("hidden");
+    vid.src = reel.url;
+    $("cut-meta").textContent = `${reel.target_duration_sec}s · ${reel.pieces} shots cut together` + (reel.vo ? " · VO burned in" : "");
+  } else {
+    vid.classList.add("hidden");
+    vid.removeAttribute("src");
+    $("cut-meta").textContent = state.render_error || "";
+  }
   const cut = state.directors_cut || [];
   if (cut.length) {
     $("cut-empty").classList.add("hidden");
@@ -874,9 +1069,165 @@ function escapeHtml(s) {
 """
 
 
+def _catalog() -> list[dict[str, Any]]:
+    """Buttons on the launcher. A teammate claims the guest slot via apps.json + GUEST_UPSTREAM."""
+    path = Path(__file__).with_name("apps.json")
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    guest_upstream = (os.environ.get("GUEST_UPSTREAM") or "").strip().rstrip("/")
+    apps = []
+    for item in raw.get("apps") or []:
+        row = dict(item)
+        if row.get("id") == "guest" and guest_upstream:
+            row["ready"] = True
+            if row.get("live_blurb"):
+                row["blurb"] = row["live_blurb"]
+        else:
+            row["ready"] = bool(row.get("ready", True))
+        apps.append(row)
+    return apps
+
+
+LAUNCHER_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Team 41 apps</title>
+<base href="/app/"/>
+<style>
+  :root { --bg:#e8e2d6; --ink:#1a1f24; --muted:#5a6570; --panel:#f7f3ea; --line:#c9c0b0; --accent:#0d6e6e; }
+  * { box-sizing: border-box; }
+  body { margin:0; min-height:100vh; font-family: "IBM Plex Sans", system-ui, sans-serif; color:var(--ink);
+    background: radial-gradient(ellipse 80% 50% at 10% -10%, #dfecec 0%, transparent 55%), var(--bg); }
+  .wrap { max-width: 880px; margin: 0 auto; padding: 48px 20px 64px; }
+  h1 { font-family: Georgia, serif; font-size: clamp(2rem, 5vw, 3rem); margin: 0 0 8px; }
+  p.lead { color: var(--muted); max-width: 38rem; line-height: 1.45; }
+  .grid { display:grid; gap:14px; margin-top: 28px; }
+  @media (min-width: 720px) { .grid { grid-template-columns: 1fr 1fr; } }
+  a.card { display:block; text-decoration:none; color:inherit; background:var(--panel); border:1px solid var(--line); padding:18px 18px 16px; }
+  a.card:hover { border-color: var(--accent); }
+  a.card h2 { margin: 0 0 8px; font-size: 1.25rem; }
+  a.card p { margin:0; color:var(--muted); line-height:1.4; }
+  .pill { display:inline-block; font-size:0.72rem; letter-spacing:0.04em; text-transform:uppercase; margin-bottom:8px; color:var(--accent); }
+  .pill.wait { color:#8b1e1e; }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Team 41</h1>
+    <p class="lead">One App button on the lab page. Pick a project. The second card is an open slot: another person deploys their app behind it.</p>
+    <div class="grid">
+      __CARDS__
+    </div>
+  </div>
+</body>
+</html>
+"""
+
+GUEST_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>Open slot</title>
+<base href="/app/"/>
+<style>
+  body { margin:0; font-family: system-ui, sans-serif; background:#e8e2d6; color:#1a1f24; }
+  .wrap { max-width: 720px; margin: 0 auto; padding: 40px 20px; }
+  a { color:#0d6e6e; }
+  code, pre { background:#f7f3ea; border:1px solid #c9c0b0; padding:2px 6px; }
+  pre { padding:12px; overflow:auto; }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <p><a href="/app/">All apps</a></p>
+    <h1>This button is free</h1>
+    <p>Idea Upscaler owns the other card. Put your app behind this one without taking <code>/app</code>.</p>
+    <ol>
+      <li>Run your app in namespace <code>team-41</code> (ClusterIP Service).</li>
+      <li>Set <code>GUEST_UPSTREAM</code> on the <code>hackathon-app</code> Deployment to that service, for example <code>http://my-app:8080</code>.</li>
+      <li>Edit <code>tools/idea-upscaler/apps.json</code>: title, blurb, and <code>live_blurb</code>.</li>
+      <li>Recreate the ConfigMap and restart. This card then proxies your app.</li>
+    </ol>
+    <pre>kubectl -n team-41 set env deploy/hackathon-app GUEST_UPSTREAM=http://YOUR-SERVICE:PORT
+kubectl -n team-41 create configmap hackathon-app-code --from-file=tools/idea-upscaler --dry-run=client -o yaml | kubectl apply -f -
+kubectl -n team-41 rollout restart deploy/hackathon-app</pre>
+    <p>The browser still talks to <code>/app/guest/...</code>. This process forwards that to your Service. Pods cannot use the public Ingress hostname.</p>
+  </div>
+</body>
+</html>
+"""
+
+
+def _launcher_page() -> str:
+    cards = []
+    for item in _catalog():
+        ready = item.get("ready")
+        pill = "Ready" if ready else "Open slot"
+        pill_class = "pill" if ready else "pill wait"
+        href = item.get("href") or "guest"
+        title = (item.get("title") or "App").replace("&", "&amp;").replace("<", "&lt;")
+        blurb = (item.get("blurb") or "").replace("&", "&amp;").replace("<", "&lt;")
+        cards.append(
+            f'<a class="card" href="{href}">'
+            f'<div class="{pill_class}">{pill}</div>'
+            f"<h2>{title}</h2><p>{blurb}</p></a>"
+        )
+    return LAUNCHER_HTML.replace("__CARDS__", "\n".join(cards))
+
+
 @app.get("/")
 def index():
+    return Response(_launcher_page(), mimetype="text/html")
+
+
+@app.get("/upscaler")
+def upscaler():
     return Response(INDEX_HTML, mimetype="text/html")
+
+
+@app.route("/guest", defaults={"subpath": ""}, methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
+@app.route("/guest/<path:subpath>", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
+def guest(subpath: str):
+    """Proxy a teammate's in-cluster app. Empty slot explains how to claim the button."""
+    upstream = (os.environ.get("GUEST_UPSTREAM") or "").strip().rstrip("/")
+    if not upstream:
+        return Response(GUEST_HTML, mimetype="text/html")
+    url = f"{upstream}/{subpath}" if subpath else upstream + "/"
+    headers = {
+        k: v for k, v in request.headers
+        if k.lower() not in {"host", "content-length", "connection"}
+    }
+    upstream_resp = requests.request(
+        request.method,
+        url,
+        params=request.args,
+        data=request.get_data(),
+        headers=headers,
+        timeout=60,
+        allow_redirects=False,
+    )
+    hop = {"content-encoding", "content-length", "transfer-encoding", "connection"}
+    out_headers = [(k, v) for k, v in upstream_resp.headers.items() if k.lower() not in hop]
+    return Response(upstream_resp.content, status=upstream_resp.status_code, headers=out_headers)
+
+
+def _mount_bundled_guest() -> None:
+    """Serve the teammate app at /guest unless GUEST_UPSTREAM replaces it."""
+    if (os.environ.get("GUEST_UPSTREAM") or "").strip():
+        return
+    guest_dir = Path(__file__).resolve().parent
+    if not (guest_dir / "video_ask_app.py").is_file():
+        return
+    if str(guest_dir) not in sys.path:
+        sys.path.insert(0, str(guest_dir))
+    import video_ask_app as guest_mod
+    from werkzeug.middleware.dispatcher import DispatcherMiddleware
+
+    app.wsgi_app = DispatcherMiddleware(app.wsgi_app, {"/guest": guest_mod.app})
+
+
+_mount_bundled_guest()
 
 
 if __name__ == "__main__":

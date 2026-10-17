@@ -1,0 +1,19 @@
+{
+  "apps": [
+    {
+      "id": "upscaler",
+      "title": "Idea Upscaler",
+      "blurb": "Your rough clip, cut to the same length from the archive, with the voice line burned in.",
+      "href": "upscaler",
+      "ready": true
+    },
+    {
+      "id": "guest",
+      "title": "LDN Video Ask",
+      "blurb": "Ask the indexed footage in plain language and jump to the clips. Already wired behind this button.",
+      "live_blurb": "This card proxies the Service in GUEST_UPSTREAM instead of the bundled ask app.",
+      "href": "guest",
+      "ready": false
+    }
+  ]
+}
