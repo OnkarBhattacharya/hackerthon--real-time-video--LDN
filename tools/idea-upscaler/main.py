@@ -1186,7 +1186,7 @@ def upscaler():
     return Response(INDEX_HTML, mimetype="text/html")
 
 
-@app.route("/guest", defaults={"subpath": ""}, methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
+@app.route("/guest", defaults={"subpath": ""}, strict_slashes=False, methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
 @app.route("/guest/<path:subpath>", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
 def guest(subpath: str):
     """Proxy a teammate's in-cluster app. Empty slot explains how to claim the button."""
