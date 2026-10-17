@@ -1,6 +1,7 @@
 const queryEl = document.getElementById("query");
 const investigateBtn = document.getElementById("investigate");
 const statusEl = document.getElementById("status");
+const progressEl = document.getElementById("progress");
 const stepsEl = document.getElementById("steps");
 const errorEl = document.getElementById("error");
 const skippedEl = document.getElementById("skipped");
@@ -8,6 +9,8 @@ const emptyEl = document.getElementById("empty");
 const resultsEl = document.getElementById("results");
 
 const DEFAULT_QUERY = "person close to a moving vehicle";
+const INVESTIGATE_LABEL = "Investigate";
+const INVESTIGATING_LABEL = "Investigating…";
 
 const SEVERITY = {
   1: "none",
@@ -81,8 +84,22 @@ function clearNode(node) {
   while (node.firstChild) node.removeChild(node.firstChild);
 }
 
+function syncProgressVisibility() {
+  const hasSteps = stepsEl.children.length > 0;
+  const hasError = !errorEl.hidden;
+  const hasSkipped = !skippedEl.hidden;
+  progressEl.hidden = !(hasSteps || hasError || hasSkipped);
+}
+
+function setInvestigateBusy(busy) {
+  investigateBtn.disabled = busy;
+  investigateBtn.setAttribute("aria-busy", busy ? "true" : "false");
+  investigateBtn.textContent = busy ? INVESTIGATING_LABEL : INVESTIGATE_LABEL;
+}
+
 function showError(error, hint) {
   errorEl.hidden = false;
+  errorEl.setAttribute("role", "alert");
   clearNode(errorEl);
   const title = document.createElement("p");
   title.textContent = error || "The investigation failed.";
@@ -98,11 +115,14 @@ function showError(error, hint) {
   }
   errorEl.appendChild(title);
   errorEl.appendChild(next);
+  syncProgressVisibility();
 }
 
 function hideError() {
   errorEl.hidden = true;
+  errorEl.removeAttribute("role");
   clearNode(errorEl);
+  syncProgressVisibility();
 }
 
 function renderSteps(steps) {
@@ -112,6 +132,7 @@ function renderSteps(steps) {
     item.textContent = step;
     stepsEl.appendChild(item);
   }
+  syncProgressVisibility();
 }
 
 function skippedCameras(job) {
@@ -137,12 +158,14 @@ function renderSkipped(job) {
   if (!names.length) {
     skippedEl.hidden = true;
     skippedEl.textContent = "";
+    syncProgressVisibility();
     return;
   }
   skippedEl.hidden = false;
   skippedEl.textContent = names
     .map((id) => id + " is not indexed and was skipped.")
     .join(" ");
+  syncProgressVisibility();
 }
 
 function safeClipUrl(url) {
@@ -168,6 +191,7 @@ function addSlot(parent, label, clip, role, missing) {
     video.controls = true;
     video.playsInline = true;
     video.preload = "metadata";
+    video.setAttribute("aria-label", label + " clip");
     video.src = safeClipUrl(clip.clip_url);
     slot.appendChild(video);
   }
@@ -224,6 +248,9 @@ function showPanel(card, title, text, filename, mime) {
   panel.appendChild(heading);
   panel.appendChild(pre);
   panel.appendChild(row);
+  const reduceMotion =
+    window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  panel.scrollIntoView({ block: "nearest", behavior: reduceMotion ? "auto" : "smooth" });
 }
 
 function download(filename, text, mime) {
@@ -246,6 +273,7 @@ function renderCard(hit) {
   const card = document.createElement("article");
   card.className = "card";
   const severity = Number(hit.severity) || 1;
+  card.setAttribute("data-severity", String(severity));
   const badge = document.createElement("p");
   const badgeText = document.createElement("span");
   badgeText.className = "badge badge-" + severity;
@@ -278,6 +306,7 @@ function renderCard(hit) {
 
   if (hit.clip_error) {
     const clipError = document.createElement("p");
+    clipError.className = "clip-error";
     clipError.textContent = hit.clip_error;
     card.appendChild(clipError);
   }
@@ -363,11 +392,13 @@ async function openTicket(card, hit) {
 function renderHits(hits) {
   clearNode(resultsEl);
   if (!hits.length) {
-    const note = document.createElement("p");
-    note.textContent = "Search returned nothing. Check login, the dashboard counts, and the valid metadata values, then run Investigate again.";
-    resultsEl.appendChild(note);
+    emptyEl.hidden = false;
+    emptyEl.className = "empty-state";
+    emptyEl.textContent =
+      "Search returned nothing. Check login, the dashboard counts, and the valid metadata values, then run Investigate again.";
     return;
   }
+  emptyEl.hidden = true;
   const groups = [];
   const index = new Map();
   for (const hit of hits) {
@@ -394,10 +425,13 @@ async function investigate() {
   const token = ++pollToken;
   hideError();
   emptyEl.hidden = true;
+  emptyEl.className = "empty-state";
+  emptyEl.textContent =
+    "Run Investigate to search the archive, rank near-miss footage, and open the clips.";
   clearNode(resultsEl);
   clearNode(stepsEl);
   renderSkipped({});
-  investigateBtn.disabled = true;
+  setInvestigateBusy(true);
   try {
     const response = await fetch(apiUrl("api/investigate"), {
       method: "POST",
@@ -407,6 +441,7 @@ async function investigate() {
     const body = await response.json();
     if (!response.ok) {
       showError(body.error, body.hint);
+      emptyEl.hidden = false;
       return;
     }
     while (token === pollToken) {
@@ -414,6 +449,7 @@ async function investigate() {
       const job = await jobResponse.json();
       if (!jobResponse.ok) {
         showError(job.error, job.hint);
+        emptyEl.hidden = false;
         return;
       }
       renderSteps(job.steps || []);
@@ -425,14 +461,16 @@ async function investigate() {
       }
       if (job.status === "failed") {
         showError(job.error, job.hint);
+        emptyEl.hidden = false;
         return;
       }
       await sleep(1000);
     }
   } catch (_err) {
     showError("The investigation request failed.", "Check that the server is running and run Investigate again.");
+    emptyEl.hidden = false;
   } finally {
-    if (token === pollToken) investigateBtn.disabled = false;
+    if (token === pollToken) setInvestigateBusy(false);
   }
 }
 
@@ -447,4 +485,5 @@ queryEl.addEventListener("keydown", (event) => {
   }
 });
 
+syncProgressVisibility();
 loadStatus();

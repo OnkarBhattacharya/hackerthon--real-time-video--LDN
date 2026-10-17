@@ -29,17 +29,17 @@
         </div>
       </section>
 
-      <section aria-live="polite">
+      <section id="progress" class="progress" aria-live="polite" hidden>
         <h2>Progress</h2>
         <ol id="steps"></ol>
         <div id="error" class="error" hidden></div>
         <p id="skipped" hidden></p>
       </section>
 
-      <section>
+      <section class="results-section" aria-label="Results">
         <h2>Results</h2>
-        <p id="empty">
-          Investigate searches the indexed archive for close approaches between people and moving vehicles, then ranks the footage it finds.
+        <p id="empty" class="empty-state">
+          Run Investigate to search the archive, rank near-miss footage, and open the clips.
         </p>
         <div id="results"></div>
       </section>
