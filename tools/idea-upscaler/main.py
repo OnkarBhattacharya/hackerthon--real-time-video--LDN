@@ -109,10 +109,18 @@ def _vss(method: str, path: str, *, retry: bool = True, **kwargs: Any) -> reques
     token = _login()
     headers = kwargs.pop("headers", {})
     headers["Authorization"] = f"Bearer {token}"
-    r = requests.request(method, f"{VSS_URL}{path}", headers=headers, timeout=90, **kwargs)
+    timeout = kwargs.pop("timeout", 90)
+    r = requests.request(method, f"{VSS_URL}{path}", headers=headers, timeout=timeout, **kwargs)
     if r.status_code == 401 and retry:
         _login(force=True)
-        return _vss(method, path, retry=False, headers={k: v for k, v in headers.items() if k != "Authorization"}, **kwargs)
+        return _vss(
+            method,
+            path,
+            retry=False,
+            headers={k: v for k, v in headers.items() if k != "Authorization"},
+            timeout=timeout,
+            **kwargs,
+        )
     return r
 
 
@@ -1480,6 +1488,203 @@ def _cosmos_chat(system_text: str, user_text: str) -> str | None:
     return content if isinstance(content, str) else None
 
 
+_DIRECTION_NOTE = "The line was not expanded."
+
+
+def _one_sentence(text: str) -> str:
+    line = re.sub(r"\s+", " ", text or "").strip().strip("\"'")
+    if not line:
+        return ""
+    first = re.split(r"(?<=[.!?])\s+", line)[0].strip()
+    if first and first[-1] not in ".!?":
+        first += "."
+    if first:
+        first = first[0].upper() + first[1:]
+    return first[:280]
+
+
+def _parse_direction_plan(text: str, shot_count: int) -> dict[str, Any] | None:
+    """Accept only the one JSON object the direction call is asked to return."""
+    cleaned = re.sub(r"<think>.*?</think>", " ", text or "", flags=re.I | re.S)
+    cleaned = cleaned.replace("```json", " ").replace("```", " ").strip()
+    data: Any = None
+    try:
+        data = json.loads(cleaned)
+    except json.JSONDecodeError:
+        start, end = cleaned.find("{"), cleaned.rfind("}")
+        if start >= 0 and end > start:
+            try:
+                data = json.loads(cleaned[start : end + 1])
+            except json.JSONDecodeError:
+                return None
+    if not isinstance(data, dict):
+        return None
+    logline = _one_sentence(str(data.get("logline") or ""))
+    beats = data.get("beats")
+    lines = data.get("voice_lines")
+    if not logline or not isinstance(beats, list) or not isinstance(lines, list):
+        return None
+    if len(beats) < shot_count or len(lines) < shot_count:
+        return None
+    clean_beats: list[str] = []
+    clean_lines: list[str] = []
+    for beat, line in zip(beats[:shot_count], lines[:shot_count]):
+        if not isinstance(beat, str) or not beat.strip():
+            return None
+        if not isinstance(line, str) or not line.strip():
+            return None
+        clean_beats.append(re.sub(r"\s+", " ", beat).strip()[:240])
+        clean_lines.append(re.sub(r"\s+", " ", line).strip()[:180])
+    blob = " ".join([logline, *clean_beats, *clean_lines])
+    if re.search(r"\bmars\b|fantasy world|outer space", blob, re.I):
+        return None
+    return {"logline": logline, "beats": clean_beats, "voice_lines": clean_lines}
+
+
+def _heuristic_direction(line: str, shot_count: int) -> dict[str, Any]:
+    """No model. The typed line is the logline, split into the shot count."""
+    raw = re.sub(r"\s+", " ", line or "").strip()
+    logline = _one_sentence(raw) or "A city street."
+    blob = raw.lower()
+    night_nyc = any(word in blob for word in ("nyc", "new york", "manhattan")) and any(
+        word in blob for word in ("night", "dusk", "ride", "bike", "cycl")
+    )
+    if night_nyc:
+        beats = [
+            "New York City street at night with traffic",
+            "cyclist in a New York bike lane at night",
+            "pedestrians beside night traffic in New York",
+            "dusk traffic along a Manhattan avenue",
+            "a stop on a New York sidewalk after dark",
+        ]
+        voices = [
+            "A nighttime ride through New York.",
+            "The bike lane is open.",
+            "People are still out.",
+            "The traffic keeps moving.",
+            "We stop on the sidewalk.",
+        ]
+        return {
+            "logline": logline,
+            "beats": beats[:shot_count],
+            "voice_lines": voices[:shot_count],
+        }
+    words = raw.split() or ["city street"]
+    if len(words) >= shot_count:
+        size = max(1, len(words) // shot_count)
+        chunks: list[str] = []
+        start = 0
+        for i in range(shot_count):
+            end = len(words) if i == shot_count - 1 else min(len(words), start + size)
+            piece = " ".join(words[start:end]).strip() or raw
+            chunks.append(piece)
+            start = end
+    else:
+        chunks = [raw or logline for _ in range(shot_count)]
+    roles = ["wide street", "the movement", "people nearby", "traffic passing", "a stop"]
+    return {
+        "logline": logline,
+        "beats": [f"{chunk} {roles[i]}".strip()[:240] for i, chunk in enumerate(chunks)],
+        "voice_lines": [_one_sentence(chunk) or logline for chunk in chunks],
+    }
+
+
+def _shots_from_plan(plan: dict[str, Any]) -> list[dict[str, Any]]:
+    """Beats are the archive search queries. Voice lines are what is spoken."""
+    types = ["wide establishing", "tracking medium", "medium", "close-up", "closing wide"]
+    moods = ["night urban", "kinetic", "observational", "quiet", "resolute"]
+    shots = []
+    for i, (beat, line) in enumerate(zip(plan["beats"], plan["voice_lines"])):
+        shots.append(
+            {
+                "id": i + 1,
+                "title": f"Shot {i + 1}",
+                "intent": beat[:280],
+                "shot_type": types[i % len(types)],
+                "mood": moods[i % len(moods)],
+                "action": beat[:200],
+                "dialogue_beat": line[:200],
+                "search_query": beat,
+            }
+        )
+    return shots
+
+
+def _wandb_chat(system_text: str, user_text: str) -> str | None:
+    """One W&B serverless completion. Skipped when WANDB_API_KEY is unset."""
+    if not WANDB_API_KEY:
+        return None
+    headers = {
+        "Authorization": f"Bearer {WANDB_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    if WANDB_TEAM and WANDB_PROJECT:
+        headers["OpenAI-Project"] = f"{WANDB_TEAM}/{WANDB_PROJECT}"
+    try:
+        response = requests.post(
+            f"{WANDB_BASE}/chat/completions",
+            headers=headers,
+            json={
+                "model": WANDB_MODEL or "meta-llama/Llama-3.1-8B-Instruct",
+                "messages": [
+                    {"role": "system", "content": system_text},
+                    {"role": "user", "content": user_text},
+                ],
+                "temperature": 0.2,
+                "max_tokens": 700,
+            },
+            timeout=45,
+        )
+        if response.status_code >= 400:
+            return None
+        content = response.json()["choices"][0]["message"]["content"]
+        return content if isinstance(content, str) else None
+    except Exception:
+        return None
+
+
+def _expand_direction(
+    line: str,
+    shot_count: int,
+    duration_sec: float | None,
+) -> tuple[dict[str, Any], str | None, str]:
+    """One model call turns a casual line into the film. Cosmos, then W&B, then a split."""
+    window = (float(duration_sec) if duration_sec and duration_sec >= 4 else 12.0) / shot_count
+    word_cap = 8 if window <= 3.2 else 14
+    system = (
+        "You turn one casual line into a short film that can be cut from a real city-camera archive. "
+        "Return ONLY JSON, no markdown, with keys logline, beats, and voice_lines. "
+        f"beats and voice_lines must each have exactly {shot_count} strings. "
+        "logline is one sentence. "
+        f"voice_lines are spoken aloud, one short line per shot, at most {word_cap} words, "
+        f"so each line fits a {window:.1f} second caption. "
+        "beats are what to look for, one visual phrase per shot, in story order. "
+        "They are the search queries. "
+        "The archive has New York streets, bike lanes, dusk and night traffic, pedestrians, "
+        "highways, and indoor rooms. It does not have Mars, space, or fantasy. "
+        "A nighttime ride through NYC must use New York streets, a bike lane, "
+        "dusk or night traffic, and pedestrians. "
+        "Do not add a forklift or a warehouse unless the line asks for one."
+    )
+    user = json.dumps(
+        {"line": line, "shots": shot_count, "caption_seconds": round(window, 1)},
+        ensure_ascii=False,
+    )
+    content = None
+    try:
+        content = _cosmos_chat(system, user)
+    except Exception:
+        content = None
+    plan = _parse_direction_plan(content or "", shot_count) if content else None
+    if plan:
+        return plan, None, "Cosmos Reason"
+    content = _wandb_chat(system, user)
+    plan = _parse_direction_plan(content or "", shot_count) if content else None
+    if plan:
+        return plan, None, "W&B"
+    return _heuristic_direction(line, shot_count), _DIRECTION_NOTE, "heuristic"
+
+
 def _as_candidate_index(value: Any) -> int | None:
     if isinstance(value, bool):
         return None
@@ -2345,6 +2550,148 @@ def serve_cut(cut_id: str):
     return Response(path.read_bytes(), mimetype="video/mp4")
 
 
+def _form_value(name: str) -> str:
+    return (request.form.get(name) or "").strip()
+
+
+def _upload_limits() -> dict[str, Any]:
+    """Live size and extension limits from GET /api/v1/config."""
+    response = _vss("GET", "/api/v1/config")
+    if response.status_code >= 400:
+        raise RuntimeError(f"config HTTP {response.status_code}")
+    payload = response.json() if response.content else {}
+    app_cfg = payload.get("app") if isinstance(payload, dict) else None
+    if not isinstance(app_cfg, dict) or app_cfg.get("max_upload_size_mb") is None:
+        raise RuntimeError("config missing max_upload_size_mb")
+    max_mb = int(app_cfg["max_upload_size_mb"])
+    allowed: set[str] = set()
+    for item in app_cfg.get("allowed_video_extensions") or []:
+        text = str(item).strip().lower()
+        if not text:
+            continue
+        if not text.startswith("."):
+            text = "." + text
+        allowed.add(text)
+    if max_mb <= 0 or not allowed:
+        raise RuntimeError("config missing upload limits")
+    return {"max_upload_size_mb": max_mb, "allowed_extensions": allowed}
+
+
+def _ingest_choices() -> dict[str, Any]:
+    """Scenario, capture type, and custom-prompt limits from ingest-config."""
+    response = _vss("GET", "/api/v1/metadata/ingest-config")
+    if response.status_code >= 400:
+        raise RuntimeError(f"ingest-config HTTP {response.status_code}")
+    payload = response.json() if response.content else {}
+    if not isinstance(payload, dict):
+        raise RuntimeError("ingest-config was not an object")
+    scenarios = {
+        str(row.get("value")).strip()
+        for row in (payload.get("analysis_scenarios") or [])
+        if isinstance(row, dict) and str(row.get("value") or "").strip()
+    }
+    captures = {
+        str(row.get("value")).strip()
+        for row in (payload.get("capture_types") or [])
+        if isinstance(row, dict) and str(row.get("value") or "").strip()
+    }
+    try:
+        max_prompt = int(payload.get("custom_prompt_max_length") or 0)
+    except (TypeError, ValueError):
+        max_prompt = 0
+    if max_prompt <= 0:
+        raise RuntimeError("ingest-config missing custom_prompt_max_length")
+    return {
+        "scenarios": scenarios,
+        "capture_types": captures,
+        "custom_prompt_max_length": max_prompt,
+    }
+
+
+@app.post("/api/upload")
+def upload_video():
+    """Forward one video to VSS POST /api/v1/videos/upload. JSON only."""
+    upload = request.files.get("file")
+    filename = ""
+    if upload is not None:
+        filename = Path(str(upload.filename or "").replace("\\", "/")).name.strip()
+    if upload is None or not filename or filename in {".", ".."}:
+        return jsonify({"error": "file is required"}), 400
+    try:
+        limits = _upload_limits()
+    except Exception as exc:
+        return jsonify({"error": str(exc), "type": type(exc).__name__}), 502
+    ext = Path(filename).suffix.lower()
+    allowed = limits["allowed_extensions"]
+    if ext not in allowed:
+        return jsonify(
+            {
+                "error": f"unsupported extension {ext or '(none)'}",
+                "allowed": sorted(allowed),
+            }
+        ), 400
+    blob = upload.read()
+    if not blob:
+        return jsonify({"error": "file is required"}), 400
+    max_bytes = int(limits["max_upload_size_mb"]) * 1024 * 1024
+    if len(blob) > max_bytes:
+        return jsonify(
+            {
+                "error": f"file exceeds {limits['max_upload_size_mb']} MB",
+                "max_upload_size_mb": limits["max_upload_size_mb"],
+            }
+        ), 413
+    raw_public = (_form_value("is_public") or "true").lower()
+    is_public = raw_public in {"true", "1", "public", "yes"}
+    fields: dict[str, str] = {"is_public": "true" if is_public else "false"}
+    for key in (
+        "tags",
+        "allowed_users",
+        "scenario",
+        "custom_prompt",
+        "camera_id",
+        "capture_type",
+        "location",
+    ):
+        value = _form_value(key)
+        if value:
+            fields[key] = value
+    if fields.get("custom_prompt"):
+        fields.pop("scenario", None)
+    if any(key in fields for key in ("scenario", "custom_prompt", "capture_type")):
+        try:
+            choices = _ingest_choices()
+        except Exception as exc:
+            return jsonify({"error": str(exc), "type": type(exc).__name__}), 502
+        scenario = fields.get("scenario")
+        if scenario and scenario not in choices["scenarios"]:
+            return jsonify({"error": f"unknown scenario {scenario}"}), 400
+        capture = fields.get("capture_type")
+        if capture and capture not in choices["capture_types"]:
+            return jsonify({"error": f"unknown capture_type {capture}"}), 400
+        custom = fields.get("custom_prompt")
+        limit = choices["custom_prompt_max_length"]
+        if custom and len(custom) > limit:
+            return jsonify({"error": f"custom_prompt exceeds {limit} characters"}), 400
+    try:
+        upstream = _vss(
+            "POST",
+            "/api/v1/videos/upload",
+            files={"file": (filename, blob, upload.mimetype or "application/octet-stream")},
+            data=fields,
+            timeout=180,
+        )
+    except Exception as exc:
+        return jsonify({"error": str(exc), "type": type(exc).__name__}), 502
+    try:
+        body = upstream.json()
+    except ValueError:
+        body = {"error": (upstream.text or "")[:500], "status": upstream.status_code}
+    if not isinstance(body, dict):
+        body = {"result": body}
+    return jsonify(body), upstream.status_code
+
+
 @app.get("/api/upload-seed")
 def upload_seed():
     """Preview an indexed upload by tag (fallback: my-upload)."""
@@ -2371,11 +2718,16 @@ def upscale():
     level_crossing = False
     cc_broll = False
     logline = ""
+    metaprompt = ""
+    voice_lines: list[str] = []
+    beats_list: list[str] = []
+    expand_note = None
     try:
         payload = request.get_json(force=True, silent=True) or {}
         logline = (payload.get("logline") or "").strip()
         beats = (payload.get("beats") or "").strip()
         transcript = (payload.get("transcript") or "").strip()
+        metaprompt = (payload.get("metaprompt") or "").strip()[:500]
         raw_voice = (payload.get("voice") or DEFAULT_VOICE).strip()
         voice = None if raw_voice == "off" else (_canonical_voice(raw_voice) or DEFAULT_VOICE)
         try:
@@ -2404,7 +2756,20 @@ def upscale():
 
         source_upload = None
         exclude: set[str] = set()
-        if level_crossing:
+        plan = None
+        expanded_by = None
+        if metaprompt:
+            # The typed line is the whole brief, even when the story fields are empty.
+            level_crossing = False
+            plan, expand_note, expanded_by = _expand_direction(
+                metaprompt, shot_count, duration_sec
+            )
+            logline = plan["logline"]
+            beats_list = list(plan["beats"])
+            voice_lines = list(plan["voice_lines"])
+            beats = "\n".join(beats_list)
+            transcript = "\n".join(voice_lines)
+        elif level_crossing:
             seed_from_upload = False
             if not logline:
                 logline = LEVEL_CROSSING_LOGLINE
@@ -2414,7 +2779,7 @@ def upscale():
                 transcript = "\n".join(LEVEL_CROSSING_LINES)
             if duration_sec is None:
                 duration_sec = 60.0
-        if seed_from_upload:
+        if seed_from_upload and not metaprompt:
             seed = _load_upload_seed(upload_tag)
             source_upload = {
                 "tag": seed["tag"],
@@ -2439,7 +2804,7 @@ def upscale():
             if seed["beats"]:
                 beats = (beats + "\n" + seed["beats"]).strip() if beats else seed["beats"]
 
-        if not logline:
+        if not logline and not metaprompt:
             return jsonify(
                 {
                     "error": "logline / scene intent is required "
@@ -2478,15 +2843,19 @@ def upscale():
             finally:
                 _FOOTAGE_DEADLINE.reset(deadline)
         else:
-            splitter = "wandb"
-            shots = _wandb_shots(logline, beats, transcript)
-            if not shots:
-                splitter = "heuristic"
-                shots = _heuristic_shots(logline, beats, transcript)
+            if plan is not None:
+                splitter = "heuristic" if expand_note else "direction"
+                shots = _shots_from_plan(plan)
+            else:
+                splitter = "wandb"
+                shots = _wandb_shots(logline, beats, transcript)
+                if not shots:
+                    splitter = "heuristic"
+                    shots = _heuristic_shots(logline, beats, transcript)
             shots = shots[:shot_count]
 
             # Bias queries toward cinematic archive when seeding from a rough upload.
-            if seed_from_upload:
+            if seed_from_upload and plan is None:
                 for shot in shots:
                     q = shot.get("search_query") or ""
                     shot["search_query"] = (
@@ -2506,19 +2875,20 @@ def upscale():
                     used_sources.add(matches[0]["source"])
                 enriched.append({**shot, "matches": matches})
 
-        cosmos_reason: Any = "fallback"
-        try:
-            enriched, prebuilt, transcript, cosmos_reason = _apply_cosmos_reason(
-                enriched,
-                prebuilt,
-                transcript,
-                logline,
-                beats,
-                level_crossing=level_crossing,
-                duration_sec=duration_sec,
-            )
-        except Exception:
-            cosmos_reason = "fallback"
+        cosmos_reason: Any = expanded_by or "fallback"
+        if plan is None:
+            try:
+                enriched, prebuilt, transcript, cosmos_reason = _apply_cosmos_reason(
+                    enriched,
+                    prebuilt,
+                    transcript,
+                    logline,
+                    beats,
+                    level_crossing=level_crossing,
+                    duration_sec=duration_sec,
+                )
+            except Exception:
+                cosmos_reason = "fallback"
 
         if not level_crossing and len(enriched) > shot_count:
             enriched = enriched[:shot_count]
@@ -2661,7 +3031,7 @@ def upscale():
                 if level_crossing and not cc_broll and _mentions_rate_limit(render_error):
                     render_error = ARCHIVE_RAIL_NOTE
         if rendered is not None:
-            bits = [rendered.get("voice_note"), cc_note, missing_note]
+            bits = [rendered.get("voice_note"), expand_note, cc_note, missing_note]
             merged = " ".join(bit for bit in bits if bit)
             if merged:
                 rendered["note"] = merged
@@ -2673,13 +3043,22 @@ def upscale():
             else:
                 render_error = cc_note
 
+        if transcript:
+            voice_lines = [ln.strip() for ln in re.split(r"\n+", transcript) if ln.strip()]
+        if not beats_list and beats:
+            beats_list = [ln.strip() for ln in beats.splitlines() if ln.strip()]
+
         return jsonify(
             {
                 "splitter": splitter,
                 "cosmos_reason": cosmos_reason,
                 "health_safety": "level_crossing" if level_crossing else False,
                 "cc_broll": cc_broll,
+                "metaprompt": metaprompt,
                 "logline": logline,
+                "beats": beats_list,
+                "voice_lines": voice_lines,
+                "expand_note": expand_note,
                 "seed_from_upload": seed_from_upload,
                 "upload_tag": upload_tag if seed_from_upload else None,
                 "source_upload": source_upload,
@@ -2706,7 +3085,11 @@ def upscale():
                 "cosmos_reason": "fallback",
                 "health_safety": "level_crossing" if level_crossing else False,
                 "cc_broll": cc_broll,
+                "metaprompt": metaprompt,
                 "logline": logline,
+                "beats": beats_list,
+                "voice_lines": voice_lines,
+                "expand_note": expand_note,
                 "seed_from_upload": False,
                 "upload_tag": None,
                 "source_upload": None,
@@ -2856,10 +3239,12 @@ INDEX_HTML = r"""<!DOCTYPE html>
     .split-handle { display: none; }
   }
   label { display: block; font-size: 0.68rem; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); margin-bottom: 6px; }
-  select, input[type=number], input[type=text] {
+  select, input[type=number], input[type=text], input[type=file] {
     font: inherit; width: 100%; padding: 10px 12px; border: 1px solid var(--line);
     background: var(--bg); color: var(--ink); border-radius: 10px;
   }
+  #uploadCustom { min-height: 72px; }
+  #uploadStatus { word-break: break-word; }
   textarea {
     width: 100%; border: 1px solid var(--line); background: var(--bg); color: var(--ink);
     border-radius: 12px; padding: 12px 14px; font: inherit; resize: vertical; min-height: 76px;
@@ -2888,6 +3273,21 @@ INDEX_HTML = r"""<!DOCTYPE html>
     position: static;
     width: 100%;
   }
+  .direction-box {
+    margin: 0 0 16px;
+    padding: 16px;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 18px;
+  }
+  #metaprompt {
+    min-height: 148px;
+    font-size: 1.35rem;
+    line-height: 1.35;
+  }
+  .direction-box .hint { margin: 8px 0 0; color: var(--muted); font-size: 0.88rem; }
+  #expanded { margin-top: 12px; display: grid; gap: 6px; }
+  #expanded p { margin: 0; line-height: 1.4; }
   @media (max-width: 980px) {
     .cut-controls { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   }
@@ -2972,8 +3372,15 @@ INDEX_HTML = r"""<!DOCTYPE html>
     <header>
       <p class="kicker"><a href="/app/">All apps</a></p>
       <h1>Video Recutter</h1>
-      <p class="lead">Boards and a voice line, cut from the archive. Streets and traffic are most of the footage. Indoor crowds and the synthetic warehouse are the smaller sets.</p>
+      <p class="lead">Type one line. Recut turns it into the film and finds the shots in the archive.</p>
     </header>
+
+    <div class="direction-box">
+      <label for="metaprompt">Direction</label>
+      <textarea id="metaprompt" rows="4" placeholder="i want a nighttime ride through nyc"></textarea>
+      <p class="hint">One line is the whole film. Length, shots, voice, and bed stay as you set them.</p>
+      <div id="expanded" class="hidden"></div>
+    </div>
 
     <div class="cut-controls" id="cutControls">
       <div>
@@ -3014,12 +3421,54 @@ INDEX_HTML = r"""<!DOCTYPE html>
     <div class="studio" id="studio">
       <div class="side-col">
       <div class="panel">
-        <label for="logline">Logline / scene intent *</label>
+        <label for="logline">Logline</label>
         <textarea id="logline" placeholder="A cyclist threads dusk traffic while a voiceover remembers leaving the city…"></textarea>
         <label for="beats" style="margin-top:12px">Storyboard notes (per beat)</label>
         <textarea id="beats" placeholder="Wide city canyon at dusk&#10;Bike lane tracking, yellow jacket ahead&#10;Crosswalk pause, phone glow&#10;Night close on helmet reflection"></textarea>
         <label for="transcript" style="margin-top:12px">Director VO / dialogue (optional)</label>
         <textarea id="transcript" placeholder="I kept the camera rolling… we were already gone before we left."></textarea>
+        <div class="opt" id="uploadBox">
+          <label for="uploadFile">Video file</label>
+          <input id="uploadFile" type="file" accept=".mp4,.mov,.webm,.avi,.mkv,video/mp4,video/quicktime,video/webm,video/x-msvideo,video/x-matroska"/>
+          <label for="uploadPublic">Visibility</label>
+          <select id="uploadPublic">
+            <option value="public" selected>public</option>
+            <option value="private">private</option>
+          </select>
+          <label for="uploadAllowed">Allowed users</label>
+          <input id="uploadAllowed" type="text" value="" placeholder="allowed users"/>
+          <label for="uploadPrompt">Analysis prompt</label>
+          <select id="uploadPrompt">
+            <option value="" selected>default</option>
+            <option value="general">general</option>
+            <option value="custom">custom</option>
+          </select>
+          <textarea id="uploadCustom" rows="3" class="hidden" placeholder="custom analysis prompt"></textarea>
+          <label for="uploadTag">Tag</label>
+          <input id="uploadTag" type="text" value="" placeholder="upload tag"/>
+          <label for="uploadLocation">Location</label>
+          <input id="uploadLocation" type="text" value="" placeholder="location"/>
+          <label for="uploadCamera">Camera</label>
+          <input id="uploadCamera" type="text" value="" placeholder="camera id"/>
+          <label for="uploadCapture">Capture type</label>
+          <select id="uploadCapture">
+            <option value="" selected>optional</option>
+            <option value="traffic">traffic</option>
+            <option value="streets">streets</option>
+            <option value="crowds">crowds</option>
+            <option value="malls">malls</option>
+            <option value="general">general</option>
+            <option value="sports">sports</option>
+            <option value="robotics">robotics</option>
+            <option value="warehouse">warehouse</option>
+            <option value="retail">retail</option>
+          </select>
+          <p class="hint">Choose visibility and an analysis prompt, then upload. This does not start a recut. Indexing usually takes a minute or two.</p>
+          <div class="actions">
+            <button id="uploadBtn" type="button">Upload</button>
+            <span class="status" id="uploadStatus"></span>
+          </div>
+        </div>
         <div class="opt">
           <label class="row" for="seed">
             <input id="seed" type="checkbox"/>
@@ -3097,18 +3546,48 @@ function setProgress(steps, activeIdx) {
   el.innerHTML = steps.map((t, i) => `<li class="${i < activeIdx ? "done" : i === activeIdx ? "now" : ""}">${escapeHtml(t)}</li>`).join("");
 }
 
+function showExpanded(data) {
+  const lines = Array.isArray(data.voice_lines) ? data.voice_lines.filter(Boolean) : [];
+  const beatList = Array.isArray(data.beats) ? data.beats.filter(Boolean) : [];
+  if (data.logline) $("logline").value = data.logline;
+  if (beatList.length) $("beats").value = beatList.join("\n");
+  if (lines.length) $("transcript").value = lines.join("\n");
+  const box = $("expanded");
+  if (!box) return;
+  const note = data.expand_note ? `<p class="status">${escapeHtml(data.expand_note)}</p>` : "";
+  box.classList.remove("hidden");
+  box.innerHTML = `<p><strong>Logline.</strong> ${escapeHtml(data.logline || "")}</p>`
+    + `<p><strong>Shots.</strong> ${beatList.map(escapeHtml).join(" · ")}</p>`
+    + `<p><strong>Spoken.</strong> ${lines.map(escapeHtml).join(" · ")}</p>`
+    + note;
+}
+
 async function runUpscale({ seed, health }) {
-  const logline = $("logline").value.trim() || (lastBrief && String(lastBrief.logline || "").trim()) || "";
-  const beats = $("beats").value.trim() || (lastBrief && String(lastBrief.beats || "").trim()) || "";
-  const transcript = $("transcript").value.trim() || (lastBrief && String(lastBrief.transcript || "").trim()) || "";
+  const metaprompt = $("metaprompt").value.trim();
+  const logline = metaprompt
+    ? $("logline").value.trim()
+    : ($("logline").value.trim() || (lastBrief && String(lastBrief.logline || "").trim()) || "");
+  const beats = metaprompt
+    ? $("beats").value.trim()
+    : ($("beats").value.trim() || (lastBrief && String(lastBrief.beats || "").trim()) || "");
+  const transcript = metaprompt
+    ? $("transcript").value.trim()
+    : ($("transcript").value.trim() || (lastBrief && String(lastBrief.transcript || "").trim()) || "");
   const useSeed = seed || $("seed").checked;
-  const safetyKind = (health === "level_crossing" || health === true) ? "level_crossing" : "";
-  if (!logline && !beats && !transcript && !lastBrief) {
-    $("status").textContent = "Pick a brief or type a line, then click Recut.";
+  const safetyKind = metaprompt ? "" : ((health === "level_crossing" || health === true) ? "level_crossing" : "");
+  if (!metaprompt && !logline && !beats && !transcript && !lastBrief) {
+    $("status").textContent = "Type a direction or pick a brief, then click Recut.";
     $("status").className = "status err";
     return;
   }
-  const steps = safetyKind
+  const lengthMode = $("lengthMode").value;
+  const lengthSec = $("lengthSec").value;
+  const shotCount = $("shotCount").value;
+  const voiceValue = $("voice").value;
+  const bedValue = $("bed").value;
+  const steps = metaprompt
+    ? ["Turning your line into the film", "Searching the archive", "Cutting the shots together", "Speaking the lines"]
+    : safetyKind
     ? ["Reading the level crossing brief", "Checking the archive for a real railway crossing", "Filling the beats with level crossing footage", "Timing the safety line to the captions"]
     : useSeed
     ? ["Reading your clip", "Finding stand-in shots", "Cutting a reel to your duration", "Burning the voice line"]
@@ -3129,13 +3608,14 @@ async function runUpscale({ seed, health }) {
       method: "POST",
       headers: {"Content-Type": "application/json"},
       body: JSON.stringify({
+        metaprompt,
         logline,
         beats,
         transcript,
-        voice: $("voice").value,
-        bed: $("bed").value,
-        duration_sec: $("lengthMode").value === "custom" ? Number($("lengthSec").value) : null,
-        shot_count: Math.min(5, Math.max(2, parseInt($("shotCount").value, 10) || 4)),
+        voice: voiceValue,
+        bed: bedValue,
+        duration_sec: lengthMode === "custom" ? Number(lengthSec) : null,
+        shot_count: Math.min(5, Math.max(2, parseInt(shotCount, 10) || 4)),
         seed_from_upload: useSeed,
         upload_tag: ($("tag").value || "my-upload").trim(),
         health_safety: safetyKind || false,
@@ -3149,6 +3629,14 @@ async function runUpscale({ seed, health }) {
     if (!res.ok) throw new Error(data.error || res.statusText);
     state = data;
     active = 0;
+    if (metaprompt) showExpanded(data);
+    $("lengthMode").value = lengthMode;
+    $("lengthSec").value = lengthSec;
+    $("shotCount").value = shotCount;
+    $("voice").value = voiceValue;
+    $("bed").value = bedValue;
+    $("metaprompt").value = metaprompt;
+    syncCutLength();
     setProgress(steps, steps.length);
     render();
     const cut = data.rendered_cut;
@@ -3219,10 +3707,25 @@ const BRIEFS = [
 ];
 
 function applyBrief(b) {
+  const direction = $("metaprompt").value;
+  const lengthMode = $("lengthMode").value;
+  const lengthSec = $("lengthSec").value;
+  const shotCount = $("shotCount").value;
+  const voiceValue = $("voice").value;
+  const bedValue = $("bed").value;
+  const cc = $("ccbroll").checked;
   $("seed").checked = false;
   $("logline").value = b.logline;
   $("beats").value = b.beats;
   $("transcript").value = b.transcript;
+  $("metaprompt").value = direction;
+  $("lengthMode").value = lengthMode;
+  $("lengthSec").value = lengthSec;
+  $("shotCount").value = shotCount;
+  $("voice").value = voiceValue;
+  $("bed").value = bedValue;
+  $("ccbroll").checked = cc;
+  syncCutLength();
   lastBrief = b;
   briefHealth = b.health === "level_crossing" ? "level_crossing" : "";
 }
@@ -3252,6 +3755,76 @@ function syncCutLength() {
 $("lengthMode").onchange = syncCutLength;
 syncCutLength();
 $("go").onclick = () => runUpscale({ seed: false, health: briefHealth || false });
+
+function syncUploadPrompt() {
+  const custom = $("uploadPrompt") && $("uploadPrompt").value === "custom";
+  if ($("uploadCustom")) $("uploadCustom").classList.toggle("hidden", !custom);
+}
+if ($("uploadPrompt")) {
+  $("uploadPrompt").onchange = syncUploadPrompt;
+  syncUploadPrompt();
+}
+function archiveFilename(data) {
+  const key = String((data && data.object_key) || "");
+  return key.split("/").filter(Boolean).pop() || "";
+}
+if ($("uploadBtn")) {
+  $("uploadBtn").onclick = async () => {
+    const input = $("uploadFile");
+    const file = input && input.files && input.files[0];
+    const status = $("uploadStatus");
+    if (!file) {
+      status.className = "status err";
+      status.textContent = "Choose a video file first.";
+      return;
+    }
+    const body = new FormData();
+    body.append("file", file, file.name);
+    body.append("is_public", $("uploadPublic").value === "private" ? "false" : "true");
+    const tag = ($("uploadTag").value || "").trim();
+    if (tag) body.append("tags", tag);
+    const allowedUsers = ($("uploadAllowed").value || "").trim();
+    if (allowedUsers) body.append("allowed_users", allowedUsers);
+    const prompt = $("uploadPrompt").value;
+    if (prompt === "general") body.append("scenario", "general");
+    if (prompt === "custom") {
+      const custom = ($("uploadCustom").value || "").trim();
+      if (custom) body.append("custom_prompt", custom);
+    }
+    const location = ($("uploadLocation").value || "").trim();
+    if (location) body.append("location", location);
+    const camera = ($("uploadCamera").value || "").trim();
+    if (camera) body.append("camera_id", camera);
+    const capture = ($("uploadCapture").value || "").trim();
+    if (capture) body.append("capture_type", capture);
+    $("uploadBtn").disabled = true;
+    status.className = "status";
+    status.textContent = "Uploading…";
+    try {
+      const res = await fetch("/app/api/upload", { method: "POST", body });
+      const raw = await res.text();
+      let data;
+      try { data = JSON.parse(raw); }
+      catch (_) { throw new Error("Server returned non-JSON (HTTP " + res.status + ")."); }
+      if (!res.ok) {
+        const detail = data.detail || data.error || data.message || res.statusText;
+        throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+      }
+      const stored = archiveFilename(data);
+      status.className = "status";
+      status.textContent = stored
+        ? ("Stored " + stored + ". Indexing usually takes a minute or two. Recut when the clip is searchable.")
+        : "Uploaded. Indexing usually takes a minute or two.";
+      $("seed").checked = true;
+      if (tag) $("tag").value = tag;
+    } catch (err) {
+      status.className = "status err";
+      status.textContent = String(err.message || err);
+    } finally {
+      $("uploadBtn").disabled = false;
+    }
+  };
+}
 
 document.querySelectorAll("#feedback [data-v]").forEach(btn => {
   btn.onclick = () => {
