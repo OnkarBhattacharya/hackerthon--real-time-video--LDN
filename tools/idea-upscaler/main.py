@@ -1190,14 +1190,25 @@ def _pick_level_crossing_clips(shots: list[dict[str, Any]]) -> list[dict[str, An
     return clips
 
 
-def _assemble_level_crossing() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+ARCHIVE_RAIL_NOTE = (
+    "No level crossing in the archive. Tick CC B-roll to add Commons footage."
+)
+
+
+def _assemble_level_crossing(*, cc_broll: bool) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     shots = _level_crossing_shots()
     archive = _search_level_crossing_archive()
     archive = [m for m in archive if _archive_is_level_crossing(m)]
-    # Prefer Commons for every beat when the archive has no railway. If it does,
-    # use those hits first and only then fill the remaining beats from Commons.
-    cc_needed = shots[len(archive):]
-    cc_clips = _pick_level_crossing_clips(cc_needed) if cc_needed else []
+    # Commons runs only when the user ticked CC B-roll. An unticked box never
+    # calls Wikimedia, even when the archive has no railway clip.
+    if not cc_broll:
+        if not archive:
+            raise LevelCrossingFootageError(ARCHIVE_RAIL_NOTE)
+        shots = shots[: len(archive)]
+        cc_clips: list[dict[str, Any]] = []
+    else:
+        cc_needed = shots[len(archive):]
+        cc_clips = _pick_level_crossing_clips(cc_needed) if cc_needed else []
     enriched: list[dict[str, Any]] = []
     ordered: list[dict[str, Any]] = []
     for i, shot in enumerate(shots):
@@ -2340,16 +2351,23 @@ def upscale():
             deadline = _FOOTAGE_DEADLINE.set(time.monotonic() + LEVEL_CROSSING_BUDGET_SEC)
             try:
                 try:
-                    enriched, prebuilt = _assemble_level_crossing()
+                    enriched, prebuilt = _assemble_level_crossing(cc_broll=cc_broll)
                 except LevelCrossingFootageError as e:
                     # Status 502 is replaced by an HTML error page in front of this app.
+                    # The empty-archive note is a normal JSON result: no Commons call was made.
+                    note = str(e)
+                    status = 200 if note == ARCHIVE_RAIL_NOTE else 500
                     return jsonify(
                         {
-                            "error": str(e),
+                            "error": note,
+                            "render_error": note,
                             "health_safety": "level_crossing",
                             "splitter": "level_crossing",
+                            "cc_broll": cc_broll,
+                            "shots": [],
+                            "rendered_cut": None,
                         }
-                    ), 500
+                    ), status
             finally:
                 _FOOTAGE_DEADLINE.reset(deadline)
         else:
@@ -2979,7 +2997,7 @@ async function runUpscale({ seed, health }) {
         seed_from_upload: useSeed,
         upload_tag: ($("tag").value || "shittyvideo").trim(),
         health_safety: safetyKind || false,
-        cc_broll: safetyKind === "level_crossing" ? true : $("ccbroll").checked,
+        cc_broll: $("ccbroll").checked,
       }),
     });
     const raw = await res.text();
@@ -3065,7 +3083,6 @@ function applyBrief(b) {
   $("transcript").value = b.transcript;
   lastBrief = b;
   briefHealth = b.health === "level_crossing" ? "level_crossing" : "";
-  if (b.health === "level_crossing") $("ccbroll").checked = true;
 }
 
 $("briefs").innerHTML = BRIEFS.slice(1).map((b, i) =>
