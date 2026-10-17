@@ -3347,11 +3347,11 @@ LAUNCHER_HTML = """<!DOCTYPE html>
   * { box-sizing: border-box; }
   body { margin:0; min-height:100vh; font-family: "IBM Plex Sans", system-ui, sans-serif; color:var(--ink);
     background: radial-gradient(ellipse 80% 50% at 10% -10%, #dfecec 0%, transparent 55%), var(--bg); }
-  .wrap { max-width: 880px; margin: 0 auto; padding: 48px 20px 64px; }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 48px 20px 64px; }
   h1 { font-family: Georgia, serif; font-size: clamp(2rem, 5vw, 3rem); margin: 0 0 8px; }
-  p.lead { color: var(--muted); max-width: 38rem; line-height: 1.45; }
+  p.lead { color: var(--muted); max-width: 40rem; line-height: 1.45; }
   .grid { display:grid; gap:14px; margin-top: 28px; }
-  @media (min-width: 720px) { .grid { grid-template-columns: 1fr 1fr; } }
+  @media (min-width: 800px) { .grid { grid-template-columns: 1fr 1fr 1fr; } }
   a.card { display:block; text-decoration:none; color:inherit; background:var(--panel); border:1px solid var(--line); padding:18px 18px 16px; }
   a.card:hover { border-color: var(--accent); }
   a.card h2 { margin: 0 0 8px; font-size: 1.25rem; }
@@ -3363,7 +3363,7 @@ LAUNCHER_HTML = """<!DOCTYPE html>
 <body>
   <div class="wrap">
     <h1>Team 41</h1>
-    <p class="lead">One App button on the lab page. Pick a project. The second card is an open slot: another person deploys their app behind it.</p>
+    <p class="lead">One App button on the lab page. Pick a project.</p>
     <div class="grid">
       __CARDS__
     </div>
@@ -3434,13 +3434,8 @@ def upscaler():
     return Response(INDEX_HTML, mimetype="text/html")
 
 
-@app.route("/guest", defaults={"subpath": ""}, strict_slashes=False, methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
-@app.route("/guest/<path:subpath>", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
-def guest(subpath: str):
-    """Proxy a teammate's in-cluster app. Empty slot explains how to claim the button."""
-    upstream = (os.environ.get("GUEST_UPSTREAM") or "").strip().rstrip("/")
-    if not upstream:
-        return Response(GUEST_HTML, mimetype="text/html")
+def _proxy_upstream(upstream: str, subpath: str):
+    """Forward to an in-cluster Service. Video responses stream so a clip can start playing."""
     url = f"{upstream}/{subpath}" if subpath else upstream + "/"
     headers = {
         k: v for k, v in request.headers
@@ -3452,12 +3447,52 @@ def guest(subpath: str):
         params=request.args,
         data=request.get_data(),
         headers=headers,
-        timeout=60,
+        timeout=120,
         allow_redirects=False,
+        stream=True,
     )
+    raw_type = (upstream_resp.headers.get("Content-Type") or "").lower()
+    is_media = raw_type.startswith("video/") or "octet-stream" in raw_type or upstream_resp.status_code == 206
+    if is_media:
+        hop = {"content-encoding", "transfer-encoding", "connection"}
+        out_headers = [(k, v) for k, v in upstream_resp.headers.items() if k.lower() not in hop]
+
+        def generate():
+            try:
+                for chunk in upstream_resp.iter_content(chunk_size=64 * 1024):
+                    if chunk:
+                        yield chunk
+            finally:
+                upstream_resp.close()
+
+        return Response(
+            stream_with_context(generate()),
+            status=upstream_resp.status_code,
+            headers=out_headers,
+        )
+    body = upstream_resp.content
+    upstream_resp.close()
     hop = {"content-encoding", "content-length", "transfer-encoding", "connection"}
     out_headers = [(k, v) for k, v in upstream_resp.headers.items() if k.lower() not in hop]
-    return Response(upstream_resp.content, status=upstream_resp.status_code, headers=out_headers)
+    return Response(body, status=upstream_resp.status_code, headers=out_headers)
+
+
+@app.route("/guest", defaults={"subpath": ""}, strict_slashes=False, methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
+@app.route("/guest/<path:subpath>", strict_slashes=False, methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
+def guest(subpath: str):
+    """Proxy a teammate's in-cluster app. Empty slot explains how to claim the button."""
+    upstream = (os.environ.get("GUEST_UPSTREAM") or "").strip().rstrip("/")
+    if not upstream:
+        return Response(GUEST_HTML, mimetype="text/html")
+    return _proxy_upstream(upstream, subpath)
+
+
+@app.route("/hazard", defaults={"subpath": ""}, strict_slashes=False, methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
+@app.route("/hazard/<path:subpath>", strict_slashes=False, methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
+def hazard(subpath: str):
+    """Proxy the driving test. /hazard and /hazard/ both stay on this route."""
+    upstream = (os.environ.get("HAZARD_UPSTREAM") or "http://hazard-perception:80").strip().rstrip("/")
+    return _proxy_upstream(upstream, subpath or "")
 
 
 def _mount_bundled_guest() -> None:

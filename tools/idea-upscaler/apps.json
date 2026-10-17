@@ -9,11 +9,17 @@
     },
     {
       "id": "guest",
-      "title": "Hazard perception",
-      "blurb": "Driving test. Click when you see a hazard. The second pass shows the marks and rates what you should have done.",
-      "live_blurb": "Driving test. Click when you see a hazard. The second pass shows the marks and rates what you should have done.",
+      "title": "LDN Video Ask",
+      "blurb": "Ask the archive in plain language. Get a grounded answer and jump to the matching clips.",
       "href": "guest",
-      "ready": false
+      "ready": true
+    },
+    {
+      "id": "hazard",
+      "title": "Hazard perception",
+      "blurb": "Click when you see a hazard. The second pass annotates the clip and asks what you should do.",
+      "href": "hazard",
+      "ready": true
     }
   ]
 }
