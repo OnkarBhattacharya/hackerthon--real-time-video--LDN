@@ -23,24 +23,20 @@ tools/video-ask/
 └── requirements.txt
 ```
 
-## Deploy (required deliverable)
+## Deploy (guest card slot)
 
-Per `deployment/deploy-app-no-registry`, the app runs on the team Kubernetes namespace at Ingress path `/app`.
+Ship as its **own** Deployment + ClusterIP Service (`ldn-video-ask`). Do **not** overwrite `hackathon-app-code` / launcher `main.py`, and do **not** add another Ingress.
 
 ```bash
-# from repo root, with /config/<team>.config and kubeconfig present
-export KUBECONFIG=/config/${USERNAME}-k8s.yaml
+export KUBECONFIG=/config/team-41-k8s.yaml
 APP_DIR=tools/video-ask
-APP_NAME=hackathon-app
-NS="$USERNAME"
-TEAM_N="${USERNAME#team-}"
-APP_HOST="video-lab-team-${TEAM_N}.cosmos.vastdata.com"
+APP_NAME=ldn-video-ask
+NS=team-41
 
 kubectl -n "$NS" create configmap "${APP_NAME}-code" \
   --from-file="$APP_DIR" \
   --dry-run=client -o yaml | kubectl apply -f -
 
-# Prefer the in-cluster backend — pods often cannot resolve the public Ingress DNS.
 kubectl -n "$NS" create secret generic "${APP_NAME}-vss-creds" \
   --from-literal=VSS_URL="http://video-backend-service:8000" \
   --from-literal=VSS_USERNAME="$USERNAME" \
@@ -48,9 +44,16 @@ kubectl -n "$NS" create secret generic "${APP_NAME}-vss-creds" \
   --dry-run=client -o yaml | kubectl apply -f -
 ```
 
-Then apply Deployment / Service / Ingress from the deploy skill (path `/app`, rewrite to `/`).
+Apply Deployment + Service (image `python:3.12-slim`, routes at `/` and `/health`). Then claim the launcher’s second card:
 
-**Open the app:** [https://workshop.thecosmoslabs.com](https://workshop.thecosmoslabs.com) → **App** (not `$INGRESS_URL`).
+```bash
+kubectl -n team-41 set env deploy/hackathon-app \
+  GUEST_UPSTREAM=http://ldn-video-ask:80
+```
+
+**Open:** [https://workshop.thecosmoslabs.com](https://workshop.thecosmoslabs.com) → **App** → second card (`/app/guest`). Hard-refresh after claiming.
+
+Give the card back: `kubectl -n team-41 set env deploy/hackathon-app GUEST_UPSTREAM-`
 
 ## Local smoke (optional)
 

@@ -98,3 +98,97 @@ Pass condition: at least three cameras return one or more hits. If fewer do, fol
 
 - The smoke script prints at least three cameras with hits.
 - `PROGRESS.md` lists cameras searched, cameras skipped, and hit counts.
+
+## Working-tree notes preserved during merge
+
+These notes were already in the working tree when `origin/main` added this file. They record the Stage 1–3 implementation contracts and are kept alongside the spec above.
+
+# Stage 1 — Data layer (spec)
+
+**Time-box:** 45 minutes  
+**Depends on:** Stage 0 retrieval login/search/videos working (or equivalent live VSS)  
+**Goal:** A FastAPI-ready `backend/` package that finds near-miss / person–vehicle candidates across cameras via the team VSS API.
+
+## Problem
+
+Operations reviewers need ranked video moments where people interact closely with vehicles (street, highway, warehouse forklifts). Stage 1 only **retrieves and normalises** candidates; ranking and reports come later.
+
+## In scope
+
+| Deliverable | Description |
+|-------------|-------------|
+| `backend/config.py` | Read `INGRESS_URL` / `VSS_URL`, `USERNAME`/`VSS_USERNAME`, `PASSWORD`/`VSS_PASSWORD`; fail clearly if missing |
+| `backend/models.py` | `Candidate`, `DetectionBox` (and related) typed models |
+| `backend/vss.py` | Thin VSS client: login + token reuse/refresh, search with filters, segment metadata, detections, clip URL, neighbouring segments |
+| `backend/candidates.py` | `find_candidates(queries, cameras, per_query_limit)` |
+| `backend/main.py` | Minimal FastAPI app stub (health only for now) |
+| `scripts/smoke_candidates.py` | Prints per-camera counts + top description; gate: ≥3 cameras with hits |
+
+## Out of scope (later stages)
+
+- LLM severity ranking, evidence triptych assembly, reports, UI, deploy
+
+## VSS contracts used
+
+| Operation | Endpoint |
+|-----------|----------|
+| Login | `POST /api/v1/auth/login` |
+| Search | `POST /api/v1/search` with `metadata_filters.camera_id` |
+| Segment row | `GET /api/v1/videos/metadata?source=` |
+| Detections | `GET /api/v1/videos/detections?source=` (404 → empty boxes) |
+| Clip URL | `{base}/api/v1/videos/stream?source=&token=` (JWT in query) |
+| Neighbours | `GET /api/v1/tools/segments?original_video=` → order by `segment_number` |
+
+Base URL inside the cluster: `http://video-backend-service:8000`. On the VM for scripts: `$INGRESS_URL`.
+
+## Default investigation queries
+
+1. `person close to a moving vehicle`  
+2. `pedestrian crossing in front of a vehicle`  
+3. `vehicle braking hard`  
+4. `forklift near a person`  
+5. `person walking in a vehicle lane`
+
+## `find_candidates` rules
+
+1. For each query × each `camera_id`, run one search (`top_k = per_query_limit`, `min_similarity` default `0.15`, `include_public=true`).
+2. **Segment id** = segment `source` S3 URI (stable unique key).
+3. De-dupe by segment id; when merging, keep the **max** `similarity_score`.
+4. Cap **12** candidates per camera, then keep the global top **40** by score.
+5. Return normalised `Candidate` objects (see fields below). Skip cameras that return zero hits without failing the run.
+
+## `Candidate` fields
+
+```text
+segment_id      str   # source S3 URI
+video_id        str   # original_video S3 URI
+camera_id       str
+location        str
+start           float # segment_start_sec
+end             float # segment_end_sec
+description     str   # reasoning_content
+detections      list[{class, count, boxes?}]
+search_score    float
+clip_url        str   # stream URL with current token
+```
+
+## Client quality rules
+
+- Timeout on every HTTP call  
+- Retries with exponential backoff on 429/5xx/connection errors (bounded)  
+- Clear typed exceptions (`VssAuthError`, `VssRequestError`)  
+- **Never** log password or JWT  
+
+## Verify (gate)
+
+```bash
+python scripts/smoke_candidates.py
+```
+
+Expect: at least **three** distinct `camera_id`s with ≥1 candidate; print per-camera count and top hit description.
+
+## Notes from live metadata (team-41)
+
+Cameras include: `i24_cam-1`, `neighborhood_cam-1`, `nyc_bike_gopro-1`, `nyc_streets_cam-*`, `pie_cam-3`, `sdg_warehouse_cam-2`, `sf_streets_cam-*`, `smartspace_cam-1`.  
+Locations: `indoor`, `nashville`, `neighborhood`, `new_york`, `san_francisco`, `toronto`, `warehouse3`.  
+Capture types: `crowds`, `streets`, `traffic`, `warehouse`.

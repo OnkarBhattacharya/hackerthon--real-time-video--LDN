@@ -1,104 +1,79 @@
-# Stage 4 — Reports, German version, ticket
+# Stage 4 — Reports, German version, ticket (spec)
 
-**Time box:** 30 minutes
-**Depends on:** Stage 3 evidence hits
-**Blocks:** the report and ticket API endpoints
+**Time-box:** 30 minutes  
+**Depends on:** Stage 3 `EvidenceBundle`  
+**Goal:** Turn one evidence hit into an English incident report, a formal German translation, and a ticket payload.
 
-Shared rules: [constraints.md](constraints.md).
+## In scope
 
-## Outcome
+| Deliverable | Description |
+|-------------|-------------|
+| `backend/reports.py` | `incident_report`, `translate_report`, `ticket_payload` |
+| `backend/config.py` | Optional `TICKET_WEBHOOK_URL` (empty means do not call the network) |
+| `scripts/smoke_reports.py` | One real hit: print English and German, check the ticket keys |
+| `tests/test_reports.py` | Pure logic. No network and no live LLM |
 
-`backend/reports.py` turns one evidence hit into an English incident report, a formal German translation, and a ticket payload. Optional speech transcription is last and is skipped unless Stage 0 marked audio in scope and every other function in this stage already works.
+## Out of scope
 
-## Functions
+- Canary / audio transcription. Stage 0 did not confirm speech. Do not call `CANARY_1B_URL`.
+- API routes and the UI (Stages 5–6)
+- Object crops (already omitted in Stage 3)
 
-```python
-def incident_report(hit: EvidenceHit) -> IncidentReport:
-    """English report that cites only the evidence on the hit."""
-```
-
-```python
-def translate_report(report: IncidentReport, target: str = "de-DE") -> IncidentReport:
-    """German report. Segment ids and numbers stay unchanged."""
-```
-
-```python
-def ticket_payload(hit: EvidenceHit, report: IncidentReport) -> Ticket:
-    """JSON ticket. POST only when TICKET_WEBHOOK_URL is set."""
-```
+The hit type is the Stage 3 `EvidenceBundle`. Reports cite that object only.
 
 ## English report
 
-Sections, in this order:
+`incident_report(hit)` builds the report locally from the hit. It does not call the LLM and does not add people, vehicles, contact, or causes that are absent from the description, detections, rationale, or flags.
 
-1. **Summary** — two sentences.
-2. **What the footage shows** — only description, detections, and time range present on the hit.
-3. **Severity and why** — the numeric severity and the rationale.
+Sections, in order:
+
+1. **Summary** — two sentences. Cites segment id and time range. If the rationale says the evidence is weak, the summary says that too.
+2. **What the footage shows** — description, detection class counts, and the time range.
+3. **Severity and why** — numeric severity and the rationale.
 4. **Location and camera** — `location` and `camera_id`.
-5. **Time window** — start and end, plus the segment id.
-6. **Privacy review items** — `privacy_flags` and the fixed GDPR note.
-7. **Recommended actions** — the ranking field `recommended_action`.
+5. **Time window** — start, end, and segment id. Offsets stay in seconds. No calendar date is invented from a clip offset.
+6. **Privacy review items** — `privacy_flags`, always including `Review before sharing. Possible personal data (GDPR).`
+7. **Recommended actions** — the ranking field `recommended_action` only.
 
-The report must cite the segment id and the time range in the body, not only in metadata. It must not add vehicles, people, contact, or causes that are absent from the hit. If the rationale says the evidence is weak, the summary says that too.
+Clip URLs are not copied into the report text.
 
 ## German report
 
-Translate through the same W&B model used for ranking.
+`translate_report(report, target="de-DE")` translates the prose with the same `LlmClient` used for ranking (`openai/gpt-oss-20b`, JSON mode, timeout).
 
 - Formal **Sie**.
-- Metric units.
-- 24-hour time.
-- Dates as `DD.MM.YYYY` when a calendar date is present. Do not invent a date from a clip offset.
-- Segment ids, camera ids, scores, and severities are copied unchanged, not translated or reformatted.
-- Append this exact line: `Zur manuellen Prüfung; keine Rechtsberatung.`
+- Metric units. No invented conversion when the source has no unit.
+- 24-hour time. No invented clock time.
+- Dates as `DD.MM.YYYY` only when a calendar date is already present.
+- Segment ids, camera ids, scores, and severities are shielded and copied back unchanged.
+- The time window and the location line are written in German from the original values so the segment id and offsets cannot drift.
+- The exact line `Zur manuellen Prüfung; keine Rechtsberatung.` is appended once.
 
-If the model is unavailable, this function is the third scope cut. Keep the English report and return a structured error from the German endpoint rather than a partial translation presented as complete.
+If the model is unavailable or the result is still English, the function raises `ReportError`. It does not return a partial translation as a finished German report.
 
 ## Ticket
 
-```json
-{
-  "title": "short incident title",
-  "severity": 4,
-  "camera_id": "...",
-  "location": "...",
-  "time_window": {"start": 0, "end": 0, "segment_id": "..."},
-  "summary": "the English summary",
-  "clip_urls": {"previous": null, "event": "https://...", "next": null},
-  "privacy_flags": ["people visible"],
-  "assignee": null,
-  "created_at": "ISO-8601"
-}
+`ticket_payload(hit, report)` returns this JSON object:
+
+| Field | Source |
+|-------|--------|
+| `title` | Severity and camera id |
+| `severity` | Ranked severity |
+| `camera_id`, `location` | Candidate |
+| `time_window` | `start`, `end`, `segment_id` |
+| `summary` | English summary |
+| `clip_urls` | `previous`, `event`, `next`; missing neighbour is JSON `null` |
+| `privacy_flags` | Copied from the hit |
+| `assignee` | Always JSON `null` |
+| `created_at` | UTC ISO-8601 |
+
+When `TICKET_WEBHOOK_URL` is set, POST the payload with the shared request timeout. Log the HTTP status only. A connection error or a non-2xx response raises `TicketWebhookError` with the status or error type and without the URL. When the variable is unset, return the JSON and do not open a connection. Do not invent a webhook URL.
+
+## Verify
+
+```bash
+python scripts/smoke_reports.py
+pytest tests/test_reports.py
 ```
 
-`assignee` is always JSON `null` until a person assigns it.
-
-When `TICKET_WEBHOOK_URL` is set, POST the payload with a timeout. A non-2xx response or a connection error raises an exception the API will turn into `{error, hint}`. Never catch and ignore a webhook failure.
-
-When the variable is unset, return the payload for download and do not open a network connection.
-
-## Audio
-
-Only if Stage 0 recorded that sampled clips have speech, and only after the three functions above pass their smoke test: offer an optional Canary-1B transcript for the event segment, attached as `transcript` and omitted from the report unless present. If Stage 0 marked audio out of scope, do not call `CANARY_1B_URL`.
-
-## Tests
-
-`tests/test_reports.py`, no network and no LLM:
-
-- an English report builder includes the segment id and both timestamps
-- a formatting helper leaves segment ids and integers unchanged inside German text
-- the required German disclaimer is present exactly once
-- `ticket_payload` sets `assignee` to null and copies clip URLs, using null for a missing neighbour
-- webhook posting is not attempted when the URL is empty
-
-## Verification
-
-`scripts/smoke_reports.py` takes one real evidence hit, prints the English report, then the German report.
-
-Pass condition: both documents contain the same segment id and the same start and end values, and the German text includes `Zur manuellen Prüfung; keine Rechtsberatung.`
-
-## Done when
-
-- The smoke script has printed both reports for a real hit.
-- A ticket payload is printed locally. It is posted only when the webhook variable exists, and the script reports which of the two happened.
-- `PROGRESS.md` records whether German and the webhook are live or cut.
+The smoke script uses the Stage 3 camera subset, ranks a small candidate sample, and assembles one hit. It prints both reports. Pass means both are non-empty, both contain the segment id and the same start and end, the German disclaimer is present once, and the ticket has the fields above with `assignee` null. The payload is posted only when the webhook variable is set. The script says which of the two happened. Clip URLs are not printed.
