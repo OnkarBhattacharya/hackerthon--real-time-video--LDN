@@ -17,7 +17,7 @@
     {
       "id": "hazard",
       "title": "Hazard perception",
-      "blurb": "Click when you see a hazard. The second pass annotates the clip and asks what you should do.",
+      "blurb": "Click a street clip when you see a hazard. The second pass shows your click marks and YOLO boxes, then asks what you should do.",
       "href": "hazard",
       "ready": true
     }
