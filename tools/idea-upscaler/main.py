@@ -9,6 +9,8 @@ import html
 import json
 import os
 import re
+import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -557,6 +559,8 @@ DEFAULT_VOICE = "en-US-JennyNeural"
 
 COMMONS_API = "https://commons.wikimedia.org/w/api.php"
 COMMONS_UA = "IdeaUpscaler/1.0 (educational video cut; VAST builders challenge)"
+# Same file, three retries, then the next railway candidate for that beat.
+_CC_BACKOFF_SEC = (2, 5, 10)
 MAX_CC_BYTES = 40 * 1024 * 1024
 MAX_CC_SECONDS = 75.0
 # Search still keeps hits at 0.2. The CC toggle only replaces one shot that
@@ -849,9 +853,15 @@ def _search_level_crossing_archive() -> list[dict[str, Any]]:
     return found
 
 
+def _sleep_cc_backoff(step: int) -> None:
+    """Wait 2s, then 5s, then 10s. Stay inside the footage budget so the POST returns JSON."""
+    delay = float(_CC_BACKOFF_SEC[min(step, len(_CC_BACKOFF_SEC) - 1)])
+    time.sleep(min(delay, _footage_timeout(delay)))
+
+
 def _commons_api(params: dict[str, Any]) -> dict[str, Any]:
     last: Exception | None = None
-    for attempt in range(3):
+    for attempt in range(1 + len(_CC_BACKOFF_SEC)):
         try:
             resp = requests.get(
                 COMMONS_API,
@@ -860,16 +870,26 @@ def _commons_api(params: dict[str, Any]) -> dict[str, Any]:
                 timeout=_footage_timeout(25),
             )
             if resp.status_code == 429:
-                time.sleep(min(1.2 * (attempt + 1), _footage_timeout(3)))
                 last = RuntimeError("Commons rate limited")
-                continue
+                if attempt < len(_CC_BACKOFF_SEC):
+                    _sleep_cc_backoff(attempt)
+                    continue
+                break
             resp.raise_for_status()
             return resp.json()
         except LevelCrossingFootageError:
             raise
         except requests.RequestException as exc:
             last = exc
-            time.sleep(min(0.8 * (attempt + 1), _footage_timeout(2)))
+            if attempt < len(_CC_BACKOFF_SEC):
+                _sleep_cc_backoff(attempt)
+                continue
+            break
+    if last and "rate limit" in str(last).lower():
+        raise LevelCrossingFootageError(
+            "Level crossing film stopped: Commons is rate limited. "
+            "No street crosswalk or warehouse clip was used."
+        )
     raise LevelCrossingFootageError(
         "Level crossing film stopped: Wikimedia Commons is unreachable "
         f"({type(last).__name__ if last else 'error'}). "
@@ -982,18 +1002,55 @@ def _commons_search_railway(query: str, used: set[str]) -> dict[str, Any] | None
     return None
 
 
+def _cc_cache_path(title: str, ext: str) -> Path:
+    """One cache file per Commons filename under /tmp/idea-cuts/cc-cache."""
+    name = (title or "clip").replace("\\", "_").replace("/", "_").replace("\x00", "").strip() or "clip"
+    if ext and not name.lower().endswith(ext.lower()):
+        name = f"{name}{ext}"
+    return CUTS_DIR / "cc-cache" / Path(name).name
+
+
+def _accept_rail_clip(path: Path) -> None:
+    try:
+        got = _probe_duration(path)
+    except Exception as exc:
+        path.unlink(missing_ok=True)
+        raise RuntimeError(f"could not read duration ({type(exc).__name__})") from exc
+    if got > MAX_RAIL_CC_SECONDS or got < 0.5:
+        path.unlink(missing_ok=True)
+        raise RuntimeError(f"clip duration {got:.1f}s is outside 0.5–{MAX_RAIL_CC_SECONDS:.0f}s")
+
+
 def _download_commons_record(record: dict[str, Any], dest_dir: Path) -> dict[str, Any]:
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest = dest_dir / f"{uuid.uuid4().hex[:10]}{record['ext']}"
+    cached = _cc_cache_path(str(record.get("title") or "clip"), str(record.get("ext") or ""))
+    if cached.is_file() and cached.stat().st_size > 0:
+        shutil.copyfile(cached, dest)
+        try:
+            _accept_rail_clip(dest)
+        except Exception:
+            dest.unlink(missing_ok=True)
+            cached.unlink(missing_ok=True)
+        else:
+            return {
+                "path": str(dest),
+                "title": record["title"],
+                "author": record["author"],
+                "license": record["license"],
+                "license_url": record["license_url"],
+            }
     _download_capped(record["url"], dest)
     try:
-        got = _probe_duration(dest)
-    except Exception as exc:
+        _accept_rail_clip(dest)
+    except Exception:
         dest.unlink(missing_ok=True)
-        raise RuntimeError(f"could not read duration ({type(exc).__name__})") from exc
-    if got > MAX_RAIL_CC_SECONDS or got < 0.5:
-        dest.unlink(missing_ok=True)
-        raise RuntimeError(f"clip duration {got:.1f}s is outside 0.5–{MAX_RAIL_CC_SECONDS:.0f}s")
+        raise
+    try:
+        cached.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(dest, cached)
+    except OSError:
+        pass
     return {
         "path": str(dest),
         "title": record["title"],
@@ -1071,24 +1128,58 @@ def _pick_level_crossing_clips(shots: list[dict[str, Any]]) -> list[dict[str, An
         }
         got = None
         last_err = "no downloadable railway clip"
-        for record in options:
+        saw_rate_limit = False
+
+        def _take(record: dict[str, Any]) -> bool:
+            nonlocal got, last_err, saw_rate_limit
             if any(record["title"] == clip["title"] for clip in clips):
-                continue
+                return False
             if record["title"] in reserved and (not chosen[i] or record["title"] != chosen[i]["title"]):
-                continue
+                return False
             try:
                 _raise_if_footage_late()
                 got = _download_commons_record(record, dest_dir)
-                break
+                return True
             except LevelCrossingFootageError:
                 raise
             except Exception as exc:
                 last_err = f"{type(exc).__name__}: {exc}"[:220]
-                time.sleep(min(2.0, _footage_timeout(2)))
+                if "rate limit" in last_err.lower():
+                    saw_rate_limit = True
+                return False
+
+        for record in options:
+            if _take(record):
+                break
         if not got:
+            used_now = {clip["title"] for clip in clips}
+            for query in shot.get("commons_queries") or []:
+                try:
+                    _raise_if_footage_late()
+                    record = _commons_search_railway(query, used_now)
+                except LevelCrossingFootageError:
+                    raise
+                except Exception as exc:
+                    last_err = f"Commons search failed ({type(exc).__name__})"
+                    if "rate limit" in str(exc).lower():
+                        saw_rate_limit = True
+                    continue
+                if not record:
+                    last_err = f"tighter search “{query}” returned no railway clip"
+                    continue
+                used_now.add(record["title"])
+                if _take(record):
+                    break
+        if not got:
+            beat = shot.get("title") or "a beat"
+            if saw_rate_limit or "rate limit" in last_err.lower():
+                raise LevelCrossingFootageError(
+                    "Level crossing film stopped: Commons is rate limited and no real railway clip "
+                    f"could be downloaded for “{beat}”. No street crosswalk was used."
+                )
             raise LevelCrossingFootageError(
                 "Level crossing film stopped: could not download a real railway clip for "
-                f"“{shot.get('title') or 'a beat'}” ({last_err}). "
+                f"“{beat}” ({last_err}). "
                 "No street crosswalk was substituted."
             )
         clips.append(got)
@@ -1166,6 +1257,328 @@ def _assemble_level_crossing() -> tuple[list[dict[str, Any]], list[dict[str, Any
                 f"({item.get('title')}: {item.get('filename')}). No crosswalk cut was rendered."
             )
     return enriched, ordered
+
+
+# Cosmos3-Reason chat. The skill builds this URL when COSMOS3_REASON_URL is unset.
+_COSMOS_REASON_FALLBACK_URL = "http://166.19.38.112:8001"
+_cosmos_model_lock = threading.Lock()
+_cosmos_model_id: str | None = None
+
+
+def _resolve_cosmos_reason_url() -> str:
+    """Use COSMOS3_REASON_URL. If that hostname does not resolve, use the in-cluster IP."""
+    raw = (os.environ.get("COSMOS3_REASON_URL") or "").strip().rstrip("/")
+    if not raw:
+        raw = _COSMOS_REASON_FALLBACK_URL
+    host = raw.split("://")[-1].split("/")[0].split(":")[0]
+    if host and not all(part.isdigit() for part in host.split(".")):
+        try:
+            socket.getaddrinfo(host, None)
+        except OSError:
+            return _COSMOS_REASON_FALLBACK_URL
+    return raw
+
+
+def _gpu_bearer() -> str:
+    """Bearer for Cosmos3-Reason. Never log this value."""
+    for name in ("GPU_BEARER_TOKEN", "NVIDIA_API_KEY"):
+        value = (os.environ.get(name) or "").strip()
+        if value:
+            return value
+    file_path = Path(__file__).with_name("gpu-bearer")
+    try:
+        if file_path.is_file():
+            value = file_path.read_text(encoding="utf-8").strip()
+            if value:
+                return value
+    except OSError:
+        pass
+    try:
+        configs = sorted(Path("/config").glob("*.config"))
+    except OSError:
+        return ""
+    if len(configs) != 1:
+        return ""
+    try:
+        for line in configs[0].read_text(encoding="utf-8").splitlines():
+            if line.startswith("GPU_BEARER_TOKEN="):
+                return line.split("=", 1)[1].strip().strip('"').strip("'")
+    except OSError:
+        return ""
+    return ""
+
+
+def _cosmos_model_id(url: str, token: str) -> str:
+    """Model id from COSMOS3_REASON_MODEL, else the id /v1/models returns."""
+    global _cosmos_model_id
+    configured = (os.environ.get("COSMOS3_REASON_MODEL") or "").strip()
+    if not configured:
+        try:
+            configs = sorted(Path("/config").glob("*.config"))
+            if len(configs) == 1:
+                for line in configs[0].read_text(encoding="utf-8").splitlines():
+                    if line.startswith("COSMOS3_REASON_MODEL="):
+                        configured = line.split("=", 1)[1].strip().strip('"').strip("'")
+                        break
+        except OSError:
+            configured = ""
+    if configured:
+        return configured
+    with _cosmos_model_lock:
+        if _cosmos_model_id:
+            return _cosmos_model_id
+        response = requests.get(
+            f"{url}/v1/models",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=15,
+        )
+        response.raise_for_status()
+        model_id = str((response.json().get("data") or [{}])[0].get("id") or "").strip()
+        if not model_id:
+            raise RuntimeError("cosmos model id missing")
+        _cosmos_model_id = model_id
+        return _cosmos_model_id
+
+
+def _cosmos_chat(system_text: str, user_text: str) -> str | None:
+    """One Cosmos3-Reason chat completion. Returns None when it cannot be called."""
+    token = _gpu_bearer()
+    if not token:
+        return None
+    url = _resolve_cosmos_reason_url()
+    model = _cosmos_model_id(url, token)
+    response = requests.post(
+        f"{url}/v1/chat/completions",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system_text},
+                {"role": "user", "content": user_text},
+            ],
+            "temperature": 0.2,
+            "max_tokens": 900,
+        },
+        timeout=45,
+    )
+    response.raise_for_status()
+    message = (response.json().get("choices") or [{}])[0].get("message") or {}
+    content = message.get("content") or message.get("reasoning_content") or ""
+    return content if isinstance(content, str) else None
+
+
+def _as_candidate_index(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, str) and value.strip().lstrip("-").isdigit():
+        return int(value.strip())
+    return None
+
+
+def _cosmos_candidates(
+    enriched: list[dict[str, Any]],
+    *,
+    per_shot: int,
+) -> list[dict[str, Any]]:
+    found: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for shot_index, shot in enumerate(enriched):
+        taken = 0
+        for match in shot.get("matches") or []:
+            if taken >= per_shot:
+                break
+            key = str(match.get("source") or match.get("filename") or "")
+            if not key or key in seen:
+                continue
+            description = re.sub(
+                r"\s+",
+                " ",
+                str(match.get("reasoning") or shot.get("intent") or ""),
+            ).strip()
+            if not description:
+                continue
+            seen.add(key)
+            found.append(
+                {
+                    "shot_index": shot_index,
+                    "match": match,
+                    "location": str(match.get("location") or ""),
+                    "camera": str(match.get("camera_id") or ""),
+                    "description": description[:360],
+                }
+            )
+            taken += 1
+            if len(found) >= 8:
+                return found
+    return found
+
+
+def _matches_brief_place(match: dict[str, Any], *, level_crossing: bool, brief: str) -> bool:
+    blob = " ".join(
+        str(match.get(key) or "")
+        for key in ("location", "camera_id", "filename", "reasoning", "capture_type")
+    )
+    if level_crossing:
+        if match.get("cc") or str(match.get("location") or "") == "wikimedia-commons":
+            if _RAIL_BAD_RE.search(blob) and not _RAIL_OK_RE.search(blob):
+                return False
+            return bool(_RAIL_OK_RE.search(blob))
+        return _archive_is_level_crossing(match)
+    brief_l = brief.lower()
+    streetish = any(word in brief_l for word in ("street", "crosswalk", "bike", "cyclist", "highway", "traffic"))
+    warehouseish = any(word in brief_l for word in ("warehouse", "forklift", "aisle"))
+    if streetish and not warehouseish and re.search(r"forklift|warehouse aisle", blob, re.I):
+        return False
+    if warehouseish and not streetish and re.search(r"crosswalk|bike lane", blob, re.I):
+        return False
+    return True
+
+
+def _parse_cosmos_order(
+    text: str,
+    matches: list[dict[str, Any]],
+    *,
+    level_crossing: bool,
+    brief: str,
+) -> dict[str, Any] | None:
+    cleaned = re.sub(r"<think>.*?</think>", " ", text or "", flags=re.I | re.S)
+    cleaned = cleaned.replace("```json", " ").replace("```", " ").strip()
+    data: Any = None
+    try:
+        data = json.loads(cleaned)
+    except json.JSONDecodeError:
+        start, end = cleaned.find("{"), cleaned.rfind("}")
+        if start >= 0 and end > start:
+            try:
+                data = json.loads(cleaned[start : end + 1])
+            except json.JSONDecodeError:
+                return None
+    if not isinstance(data, dict):
+        return None
+    order = data.get("order")
+    lines = data.get("voice_lines")
+    why = data.get("why")
+    if not isinstance(order, list) or not isinstance(lines, list):
+        return None
+    if not isinstance(why, str) or not why.strip():
+        why = "The shots follow the brief."
+    picked_i: list[int] = []
+    picked_lines: list[str] = []
+    for raw_index, line in zip(order, lines):
+        index = _as_candidate_index(raw_index)
+        if index is None or index < 0 or index >= len(matches) or index in picked_i:
+            continue
+        if not isinstance(line, str) or not line.strip():
+            continue
+        if not _matches_brief_place(matches[index], level_crossing=level_crossing, brief=brief):
+            continue
+        picked_i.append(index)
+        picked_lines.append(re.sub(r"\s+", " ", line).strip()[:220])
+        if len(picked_i) >= 5:
+            break
+    if not picked_i:
+        return None
+    return {
+        "order": picked_i,
+        "voice_lines": picked_lines,
+        "why": re.sub(r"\s+", " ", why).strip()[:280],
+    }
+
+
+def _apply_cosmos_reason(
+    enriched: list[dict[str, Any]],
+    prebuilt: list[dict[str, Any]] | None,
+    transcript: str,
+    logline: str,
+    beats: str,
+    *,
+    level_crossing: bool,
+    duration_sec: float | None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]] | None, str, Any]:
+    """One Cosmos Reason call for voice lines and shot order. Falls back without failing the cut."""
+    if prebuilt is not None and len(prebuilt) != len(enriched):
+        return enriched, prebuilt, transcript, "fallback"
+    candidates = _cosmos_candidates(enriched, per_shot=1 if prebuilt is not None else 2)
+    if not candidates:
+        return enriched, prebuilt, transcript, "fallback"
+    brief = " ".join(part.strip() for part in (logline, beats) if part and part.strip())[:900]
+    word_cap = 10 if duration_sec and duration_sec <= 15 else 16
+    place_rule = (
+        "This is a level-crossing safety film. Every chosen shot must be a railway level crossing. "
+        "Do not include a forklift, a warehouse, or a plain street crosswalk."
+        if level_crossing
+        else
+        "Every chosen shot must match the brief's place. "
+        "Do not mix in a forklift or a warehouse when the brief is about a street, "
+        "and do not use a different city than the one the brief names."
+    )
+    system = (
+        "You write the spoken voiceover and choose the shot order from indexed Cosmos descriptions. "
+        "Return ONLY JSON, no markdown, with keys voice_lines, order, and why. "
+        "order is indexes into the candidate list. "
+        "Use 3 to 5 shots when that many candidates match the brief, otherwise every matching candidate. "
+        f"voice_lines has one short spoken sentence per chosen shot, under {word_cap} words, "
+        "and the same length as order. why is one sentence. One coherent story. "
+        + place_rule
+    )
+    listing = " | ".join(
+        f"{i}. location={cand['location'] or 'unknown'} camera={cand['camera'] or 'unknown'} "
+        f"description={cand['description']}"
+        for i, cand in enumerate(candidates)
+    )
+    try:
+        content = _cosmos_chat(system, f"Brief: {brief} Candidates: {listing}")
+    except Exception:
+        return enriched, prebuilt, transcript, "fallback"
+    if not content:
+        return enriched, prebuilt, transcript, "fallback"
+    parsed = _parse_cosmos_order(
+        content,
+        [cand["match"] for cand in candidates],
+        level_crossing=level_crossing,
+        brief=brief,
+    )
+    if not parsed:
+        return enriched, prebuilt, transcript, "fallback"
+    new_enriched: list[dict[str, Any]] = []
+    new_prebuilt: list[dict[str, Any]] | None = [] if prebuilt is not None else None
+    used_shots: set[int] = set()
+    kept_lines: list[str] = []
+    for line, index in zip(parsed["voice_lines"], parsed["order"]):
+        cand = candidates[index]
+        shot_index = cand["shot_index"]
+        if prebuilt is not None and shot_index in used_shots:
+            continue
+        used_shots.add(shot_index)
+        shot = {**enriched[shot_index], "matches": [cand["match"]], "dialogue_beat": line}
+        if any(row.get("_shot_index") == shot_index for row in new_enriched):
+            shot["title"] = f"{shot.get('title') or 'Shot'} alt"
+        new_enriched.append({**shot, "_shot_index": shot_index})
+        kept_lines.append(line)
+        if new_prebuilt is not None:
+            clip = dict(prebuilt[shot_index])
+            clip["title"] = shot.get("title") or clip.get("title") or ""
+            new_prebuilt.append(clip)
+    if not new_enriched:
+        return enriched, prebuilt, transcript, "fallback"
+    cleaned_enriched = []
+    for shot in new_enriched:
+        row = dict(shot)
+        row.pop("_shot_index", None)
+        cleaned_enriched.append(row)
+    return (
+        cleaned_enriched,
+        new_prebuilt,
+        "\n".join(kept_lines),
+        {"by": "Cosmos Reason", "why": parsed["why"]},
+    )
 
 
 def _caption_windows(lines: list[str], target: float) -> list[tuple[float, float, str]]:
@@ -1296,16 +1709,22 @@ def _extmeta(meta: dict[str, Any], key: str) -> str:
 
 
 def _download_capped(url: str, dest: Path) -> None:
+    """Download one Commons file. On HTTP 429, retry that same file 3 times (2s, 5s, 10s)."""
     last_err: Exception | None = None
-    for attempt in range(2):
+    for attempt in range(1 + len(_CC_BACKOFF_SEC)):
         try:
             with requests.get(
-                url, stream=True, timeout=_footage_timeout(45), headers={"User-Agent": COMMONS_UA}
+                url,
+                stream=True,
+                timeout=_footage_timeout(45),
+                headers={"User-Agent": COMMONS_UA},
             ) as resp:
                 if resp.status_code == 429:
-                    time.sleep(min(1.5, _footage_timeout(2)))
                     last_err = RuntimeError("Commons rate limited")
-                    continue
+                    if attempt < len(_CC_BACKOFF_SEC):
+                        _sleep_cc_backoff(attempt)
+                        continue
+                    break
                 resp.raise_for_status()
                 total = 0
                 with dest.open("wb") as fh:
@@ -1324,6 +1743,10 @@ def _download_capped(url: str, dest: Path) -> None:
         except requests.RequestException as exc:
             dest.unlink(missing_ok=True)
             last_err = exc
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            if status == 429 and attempt < len(_CC_BACKOFF_SEC):
+                _sleep_cc_backoff(attempt)
+                continue
             if attempt < 1:
                 time.sleep(min(1.5, _footage_timeout(2)))
                 continue
@@ -1942,6 +2365,20 @@ def upscale():
                     used_sources.add(matches[0]["source"])
                 enriched.append({**shot, "matches": matches})
 
+        cosmos_reason: Any = "fallback"
+        try:
+            enriched, prebuilt, transcript, cosmos_reason = _apply_cosmos_reason(
+                enriched,
+                prebuilt,
+                transcript,
+                logline,
+                beats,
+                level_crossing=level_crossing,
+                duration_sec=duration_sec,
+            )
+        except Exception:
+            cosmos_reason = "fallback"
+
         directors_cut = []
         ordered: list[dict[str, Any] | None] = []
         if prebuilt is not None:
@@ -2060,7 +2497,7 @@ def upscale():
                     bed,
                     duration_sec,
                     preset="ultrafast" if level_crossing else "veryfast",
-                    max_pieces=5 if level_crossing else 4,
+                    max_pieces=5 if level_crossing or isinstance(cosmos_reason, dict) else 4,
                     fast=level_crossing,
                 )
             except Exception as e:
@@ -2081,6 +2518,7 @@ def upscale():
         return jsonify(
             {
                 "splitter": splitter,
+                "cosmos_reason": cosmos_reason,
                 "health_safety": "level_crossing" if level_crossing else False,
                 "cc_broll": cc_broll,
                 "logline": logline,
@@ -2424,6 +2862,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
           </div>
         </div>
         <p class="status" id="cut-meta"></p>
+        <p class="status" id="cosmos-reason"></p>
         <div id="credits"></div>
         <ol id="cut-list" class="hidden"></ol>
       </section>
@@ -2434,6 +2873,7 @@ const $ = (id) => document.getElementById(id);
 let state = null;
 let active = 0;
 let verdict = "";
+let briefHealth = "";
 
 function setProgress(steps, activeIdx) {
   const el = $("progress");
@@ -2480,7 +2920,7 @@ async function runUpscale({ seed, health }) {
         seed_from_upload: useSeed,
         upload_tag: ($("tag").value || "shittyvideo").trim(),
         health_safety: safetyKind || false,
-        cc_broll: safetyKind ? false : $("ccbroll").checked,
+        cc_broll: safetyKind === "level_crossing" ? true : $("ccbroll").checked,
       }),
     });
     const raw = await res.text();
@@ -2559,28 +2999,26 @@ const BRIEFS = [
   },
 ];
 
-function applyBrief(b, run) {
+function applyBrief(b) {
   $("seed").checked = false;
   $("logline").value = b.logline;
   $("beats").value = b.beats;
   $("transcript").value = b.transcript;
-  $("lengthMode").value = "custom";
-  $("lengthSec").value = String(b.seconds || 12);
-  $("lengthWrap").classList.remove("hidden");
-  if (b.voice) $("voice").value = b.voice;
-  if (run) runUpscale({ seed: false, health: b.health || false });
+  briefHealth = b.health === "level_crossing" ? "level_crossing" : "";
+  if (b.health === "level_crossing") $("ccbroll").checked = true;
 }
 
 $("briefs").innerHTML = BRIEFS.slice(1).map((b, i) =>
   `<button type="button" class="chip${b.health ? " health" : ""}" data-brief="${i + 1}">${b.label}</button>`
 ).join("");
 $("briefs").querySelectorAll("button").forEach(btn => {
-  btn.onclick = () => applyBrief(BRIEFS[Number(btn.dataset.brief)], true);
+  btn.onclick = () => applyBrief(BRIEFS[Number(btn.dataset.brief)]);
 });
 
-$("demo").onclick = () => applyBrief(BRIEFS[0], true);
+$("demo").onclick = () => applyBrief(BRIEFS[0]);
 
 $("shitty").onclick = () => {
+  briefHealth = "";
   $("seed").checked = true;
   $("tag").value = "shittyvideo";
   $("logline").value = "Edit the hand out. Make this rough toy clip feel cinematic — close on the figure, then a wider world around it.";
@@ -2592,7 +3030,7 @@ $("shitty").onclick = () => {
 $("lengthMode").onchange = () => {
   $("lengthWrap").classList.toggle("hidden", $("lengthMode").value !== "custom");
 };
-$("go").onclick = () => runUpscale({ seed: false });
+$("go").onclick = () => runUpscale({ seed: false, health: briefHealth || false });
 
 document.querySelectorAll("#feedback [data-v]").forEach(btn => {
   btn.onclick = () => {
@@ -2668,6 +3106,13 @@ function render() {
     : `<p class="status">No matches for this shot — try broader beats or drop filters.</p>`;
 
   const reel = state.rendered_cut;
+  const reasonEl = $("cosmos-reason");
+  if (reasonEl) {
+    const reason = state.cosmos_reason;
+    reasonEl.textContent = (reason && typeof reason === "object" && reason.why)
+      ? ("Ordered by Cosmos Reason. " + reason.why)
+      : "";
+  }
   const vid = $("cut-video");
   if (reel && reel.url) {
     $("cut-empty").classList.add("hidden");
