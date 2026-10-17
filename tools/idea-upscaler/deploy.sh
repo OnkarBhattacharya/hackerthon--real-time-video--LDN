@@ -19,12 +19,24 @@ done
 
 TOKEN_FILE=""
 BUCKET_FILE=""
+WANDB_KEY_FILE=""
+WANDB_TEAM_FILE=""
+WANDB_PROJECT_FILE=""
 cleanup_token() {
   if [[ -n "${TOKEN_FILE}" && -f "${TOKEN_FILE}" ]]; then
     rm -f "${TOKEN_FILE}"
   fi
   if [[ -n "${BUCKET_FILE}" && -f "${BUCKET_FILE}" ]]; then
     rm -f "${BUCKET_FILE}"
+  fi
+  if [[ -n "${WANDB_KEY_FILE}" && -f "${WANDB_KEY_FILE}" ]]; then
+    rm -f "${WANDB_KEY_FILE}"
+  fi
+  if [[ -n "${WANDB_TEAM_FILE}" && -f "${WANDB_TEAM_FILE}" ]]; then
+    rm -f "${WANDB_TEAM_FILE}"
+  fi
+  if [[ -n "${WANDB_PROJECT_FILE}" && -f "${WANDB_PROJECT_FILE}" ]]; then
+    rm -f "${WANDB_PROJECT_FILE}"
   fi
 }
 trap cleanup_token EXIT
@@ -65,6 +77,22 @@ if [[ -n "${S3_CHUNKS_BUCKET:-}" ]]; then
   BUCKET_FILE="$(mktemp)"
   printf '%s' "$S3_CHUNKS_BUCKET" > "$BUCKET_FILE"
   CM_ARGS+=(--from-file="chunks-bucket=${BUCKET_FILE}")
+fi
+# W&B key stays out of git. The pod reads /code/wandb-key when the env var is unset.
+if [[ -n "${WANDB_API_KEY:-}" ]]; then
+  WANDB_KEY_FILE="$(mktemp)"
+  printf '%s' "$WANDB_API_KEY" > "$WANDB_KEY_FILE"
+  CM_ARGS+=(--from-file="wandb-key=${WANDB_KEY_FILE}")
+fi
+if [[ -n "${WANDB_TEAM:-}" ]]; then
+  WANDB_TEAM_FILE="$(mktemp)"
+  printf '%s' "$WANDB_TEAM" > "$WANDB_TEAM_FILE"
+  CM_ARGS+=(--from-file="wandb-team=${WANDB_TEAM_FILE}")
+fi
+if [[ -n "${WANDB_PROJECT:-}" ]]; then
+  WANDB_PROJECT_FILE="$(mktemp)"
+  printf '%s' "$WANDB_PROJECT" > "$WANDB_PROJECT_FILE"
+  CM_ARGS+=(--from-file="wandb-project=${WANDB_PROJECT_FILE}")
 fi
 
 kubectl -n "$NS" create configmap hackathon-app-code \

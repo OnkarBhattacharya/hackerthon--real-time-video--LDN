@@ -51,6 +51,64 @@ WANDB_MODEL = os.environ.get("WANDB_MODEL", "meta-llama/Llama-3.1-8B-Instruct")
 # Public path prefix (Ingress strips /app → / inside the container).
 APP_PREFIX = "/app"
 
+
+def _sidecar_text(filename: str) -> str:
+    """One-line file shipped in the ConfigMap. Never log the value."""
+    path = Path(__file__).with_name(filename)
+    try:
+        if not path.is_file():
+            return ""
+        value = path.read_text(encoding="utf-8").strip().strip('"').strip("'")
+    except OSError:
+        return ""
+    if not value or "\n" in value or "\r" in value:
+        return ""
+    return value
+
+
+def _team_config_value(key: str) -> str:
+    """Read one key from the single team config. Never log the value."""
+    try:
+        configs = sorted(Path("/config").glob("*.config"))
+    except OSError:
+        return ""
+    if len(configs) != 1:
+        return ""
+    prefix = key + "="
+    try:
+        for line in configs[0].read_text(encoding="utf-8").splitlines():
+            if line.startswith(prefix):
+                return line.split("=", 1)[1].strip().strip('"').strip("'")
+    except OSError:
+        return ""
+    return ""
+
+
+def _secret_setting(env_name: str, filename: str) -> str:
+    """Env, then a ConfigMap sidecar, then the team config. Never log the value."""
+    value = (os.environ.get(env_name) or "").strip()
+    if value:
+        return value
+    value = _sidecar_text(filename)
+    if value:
+        return value
+    return _team_config_value(env_name)
+
+
+def _wandb_headers() -> dict[str, str] | None:
+    key = _secret_setting("WANDB_API_KEY", "wandb-key")
+    if not key:
+        return None
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+    }
+    team = _secret_setting("WANDB_TEAM", "wandb-team")
+    project = _secret_setting("WANDB_PROJECT", "wandb-project")
+    if team and project:
+        headers["OpenAI-Project"] = f"{team}/{project}"
+    return headers
+
 app = Flask(__name__)
 app.url_map.strict_slashes = False
 
@@ -196,7 +254,8 @@ def _film_query(shot_type: str, mood: str, action: str, dialogue: str) -> str:
 
 
 def _wandb_shots(logline: str, beats: str, transcript: str) -> list[dict[str, Any]] | None:
-    if not WANDB_API_KEY:
+    headers = _wandb_headers()
+    if not headers:
         return None
     system = (
         "You are a film AD turning director intent into a shot list for archival clip retrieval. "
@@ -213,12 +272,6 @@ def _wandb_shots(logline: str, beats: str, transcript: str) -> list[dict[str, An
             "corpus_hint": "real-world street/traffic/warehouse/indoor camera archive",
         }
     )
-    headers = {
-        "Authorization": f"Bearer {WANDB_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    if WANDB_TEAM and WANDB_PROJECT:
-        headers["OpenAI-Project"] = f"{WANDB_TEAM}/{WANDB_PROJECT}"
     try:
         r = requests.post(
             f"{WANDB_BASE}/chat/completions",
@@ -481,7 +534,7 @@ def _load_upload_seed(tag: str) -> dict[str, Any]:
 
 @app.get("/health")
 def health():
-    return jsonify({"status": "ok", "app": "idea-upscaler", "wandb": bool(WANDB_API_KEY)})
+    return jsonify({"status": "ok", "app": "idea-upscaler", "wandb": bool(_wandb_headers())})
 
 
 @app.get("/api/stream")
@@ -1458,7 +1511,7 @@ def _cosmos_model_id(url: str, token: str) -> str:
         return _cached_cosmos_model
 
 
-def _cosmos_chat(system_text: str, user_text: str) -> str | None:
+def _cosmos_chat(system_text: str, user_text: str, timeout: int = 45) -> str | None:
     """One Cosmos3-Reason chat completion. Returns None when it cannot be called."""
     token = _gpu_bearer()
     if not token:
@@ -1480,7 +1533,7 @@ def _cosmos_chat(system_text: str, user_text: str) -> str | None:
             "temperature": 0.2,
             "max_tokens": 900,
         },
-        timeout=45,
+        timeout=timeout,
     )
     response.raise_for_status()
     message = (response.json().get("choices") or [{}])[0].get("message") or {}
@@ -1488,11 +1541,57 @@ def _cosmos_chat(system_text: str, user_text: str) -> str | None:
     return content if isinstance(content, str) else None
 
 
+def _collapse_query(text: str) -> str:
+    """One line for an embedder or a model prompt. No newlines, no em dashes."""
+    cleaned = (text or "").replace("—", "-").replace("–", "-")
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def _agent_ask_text(question: str) -> str | None:
+    """Cosmos Reason through the retrieval agent. Does not recut or call Commons."""
+    question = _collapse_query(question)[:1200]
+    if not question:
+        return None
+    try:
+        response = _vss(
+            "POST",
+            "/api/v1/agent/ask",
+            json={"question": question, "top_k": 4},
+            timeout=20,
+        )
+    except Exception:
+        return None
+    if response.status_code >= 400:
+        return None
+    try:
+        answer = response.json().get("answer")
+    except Exception:
+        return None
+    return answer if isinstance(answer, str) and answer.strip() else None
+
+
 _DIRECTION_NOTE = "The line was not expanded."
 
 
+def _brief_lines(value: Any, limit: int) -> list[str] | None:
+    if isinstance(value, str):
+        raw_items = re.split(r"\n+", value)
+    elif isinstance(value, list):
+        raw_items = value
+    else:
+        return None
+    clean: list[str] = []
+    for item in raw_items:
+        if not isinstance(item, str):
+            continue
+        piece = _collapse_query(item)
+        if piece:
+            clean.append(piece[:limit])
+    return clean or None
+
+
 def _one_sentence(text: str) -> str:
-    line = re.sub(r"\s+", " ", text or "").strip().strip("\"'")
+    line = _collapse_query(text).strip("\"'")
     if not line:
         return ""
     first = re.split(r"(?<=[.!?])\s+", line)[0].strip()
@@ -1503,7 +1602,13 @@ def _one_sentence(text: str) -> str:
     return first[:280]
 
 
-def _parse_direction_plan(text: str, shot_count: int) -> dict[str, Any] | None:
+def _parse_direction_plan(
+    text: str,
+    shot_count: int,
+    source_line: str = "",
+    *,
+    strict_count: bool = True,
+) -> dict[str, Any] | None:
     """Accept only the one JSON object the direction call is asked to return."""
     cleaned = re.sub(r"<think>.*?</think>", " ", text or "", flags=re.I | re.S)
     cleaned = cleaned.replace("```json", " ").replace("```", " ").strip()
@@ -1520,23 +1625,29 @@ def _parse_direction_plan(text: str, shot_count: int) -> dict[str, Any] | None:
     if not isinstance(data, dict):
         return None
     logline = _one_sentence(str(data.get("logline") or ""))
-    beats = data.get("beats")
-    lines = data.get("voice_lines")
-    if not logline or not isinstance(beats, list) or not isinstance(lines, list):
+    beats = _brief_lines(data.get("beats"), 240)
+    spoken = data.get("voice_lines")
+    if spoken is None:
+        spoken = data.get("transcript")
+    lines = _brief_lines(spoken, 180)
+    if not logline or not beats or not lines:
         return None
-    if len(beats) < shot_count or len(lines) < shot_count:
+    if len(beats) >= shot_count and len(lines) >= shot_count:
+        count = shot_count
+    elif strict_count:
         return None
-    clean_beats: list[str] = []
-    clean_lines: list[str] = []
-    for beat, line in zip(beats[:shot_count], lines[:shot_count]):
-        if not isinstance(beat, str) or not beat.strip():
-            return None
-        if not isinstance(line, str) or not line.strip():
-            return None
-        clean_beats.append(re.sub(r"\s+", " ", beat).strip()[:240])
-        clean_lines.append(re.sub(r"\s+", " ", line).strip()[:180])
+    else:
+        count = min(len(beats), len(lines))
+    if count < 2:
+        return None
+    clean_beats = beats[:count]
+    clean_lines = lines[:count]
     blob = " ".join([logline, *clean_beats, *clean_lines])
     if re.search(r"\bmars\b|fantasy world|outer space", blob, re.I):
+        return None
+    asks_rail = re.search(r"\b(railway|railroad|train|level crossing)\b", source_line or "", re.I)
+    has_rail = re.search(r"\b(railway|railroad|train|level crossing)\b", blob, re.I)
+    if has_rail and not asks_rail:
         return None
     return {"logline": logline, "beats": clean_beats, "voice_lines": clean_lines}
 
@@ -1604,22 +1715,17 @@ def _shots_from_plan(plan: dict[str, Any]) -> list[dict[str, Any]]:
                 "mood": moods[i % len(moods)],
                 "action": beat[:200],
                 "dialogue_beat": line[:200],
-                "search_query": beat,
+                "search_query": _collapse_query(beat),
             }
         )
     return shots
 
 
-def _wandb_chat(system_text: str, user_text: str) -> str | None:
-    """One W&B serverless completion. Skipped when WANDB_API_KEY is unset."""
-    if not WANDB_API_KEY:
+def _wandb_chat(system_text: str, user_text: str, timeout: int = 45) -> str | None:
+    """One W&B serverless completion. Skipped when the API key is unset."""
+    headers = _wandb_headers()
+    if not headers:
         return None
-    headers = {
-        "Authorization": f"Bearer {WANDB_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    if WANDB_TEAM and WANDB_PROJECT:
-        headers["OpenAI-Project"] = f"{WANDB_TEAM}/{WANDB_PROJECT}"
     try:
         response = requests.post(
             f"{WANDB_BASE}/chat/completions",
@@ -1633,7 +1739,7 @@ def _wandb_chat(system_text: str, user_text: str) -> str | None:
                 "temperature": 0.2,
                 "max_tokens": 700,
             },
-            timeout=45,
+            timeout=timeout,
         )
         if response.status_code >= 400:
             return None
@@ -1647,41 +1753,76 @@ def _expand_direction(
     line: str,
     shot_count: int,
     duration_sec: float | None,
-) -> tuple[dict[str, Any], str | None, str]:
-    """One model call turns a casual line into the film. Cosmos, then W&B, then a split."""
+    *,
+    context: dict[str, str] | None = None,
+    allow_heuristic: bool = True,
+) -> tuple[dict[str, Any] | None, str | None, str]:
+    """Write the brief. Cosmos Reason, then W&B. A split is only for Recut."""
     window = (float(duration_sec) if duration_sec and duration_sec >= 4 else 12.0) / shot_count
     word_cap = 8 if window <= 3.2 else 14
     system = (
-        "You turn one casual line into a short film that can be cut from a real city-camera archive. "
+        "You turn one casual direction into a short film brief. "
+        "This is a brief only. Do not choose a duration, a shot count, a voice, or a music bed. "
         "Return ONLY JSON, no markdown, with keys logline, beats, and voice_lines. "
         f"beats and voice_lines must each have exactly {shot_count} strings. "
         "logline is one sentence. "
-        f"voice_lines are spoken aloud, one short line per shot, at most {word_cap} words, "
-        f"so each line fits a {window:.1f} second caption. "
-        "beats are what to look for, one visual phrase per shot, in story order. "
-        "They are the search queries. "
-        "The archive has New York streets, bike lanes, dusk and night traffic, pedestrians, "
-        "highways, and indoor rooms. It does not have Mars, space, or fantasy. "
-        "A nighttime ride through NYC must use New York streets, a bike lane, "
-        "dusk or night traffic, and pedestrians. "
-        "Do not add a forklift or a warehouse unless the line asks for one."
+        f"voice_lines are spoken aloud, one short line per shot, at most {word_cap} words. "
+        "beats are one visual phrase per shot, in story order. "
+        "The archive has New York bike streets, San Francisco streets, traffic, indoor crowds, "
+        "and warehouse forklifts. It has no railway footage. "
+        "Do not write trains, railways, or level crossings. "
+        "A nighttime ride through NYC uses New York streets, a bike lane, night traffic, and pedestrians. "
+        "Use a warehouse or a forklift only when the direction asks for one. "
+        "No Mars, space, or fantasy. "
+        "If current_logline, current_beats, or current_transcript are present, use them only as context."
     )
-    user = json.dumps(
-        {"line": line, "shots": shot_count, "caption_seconds": round(window, 1)},
-        ensure_ascii=False,
-    )
+    payload: dict[str, Any] = {"direction": _collapse_query(line)[:500], "shots": shot_count}
+    if context:
+        for key in ("logline", "beats", "transcript"):
+            value = _collapse_query(str(context.get(key) or ""))
+            if value:
+                payload["current_" + key] = value[:800]
+    user = json.dumps(payload, ensure_ascii=False)
+    fail = "Could not fill the brief. Cosmos Reason and W&B inference both failed."
+
+    def accept(content: str | None) -> dict[str, Any] | None:
+        if not content:
+            return None
+        return _parse_direction_plan(
+            content,
+            shot_count,
+            line,
+            strict_count=allow_heuristic,
+        )
+
     content = None
+    timed_out = False
     try:
-        content = _cosmos_chat(system, user)
+        content = _cosmos_chat(system, user, timeout=22)
+    except requests.Timeout:
+        content = None
+        timed_out = True
     except Exception:
         content = None
-    plan = _parse_direction_plan(content or "", shot_count) if content else None
+    plan = accept(content)
     if plan:
         return plan, None, "Cosmos Reason"
-    content = _wandb_chat(system, user)
-    plan = _parse_direction_plan(content or "", shot_count) if content else None
+    if not content and not timed_out:
+        ask = (
+            "Write a short film brief as JSON only with keys logline, beats, and voice_lines. "
+            f"beats and voice_lines are arrays of exactly {shot_count} strings. "
+            "The archive has NYC bike streets, San Francisco streets, traffic, indoor crowds, "
+            "and warehouse forklifts. There is no railway footage. Direction: "
+            + _collapse_query(line)
+        )
+        plan = accept(_agent_ask_text(ask))
+        if plan:
+            return plan, None, "Cosmos Reason"
+    plan = accept(_wandb_chat(system, user, timeout=20))
     if plan:
         return plan, None, "W&B"
+    if not allow_heuristic:
+        return None, fail, "error"
     return _heuristic_direction(line, shot_count), _DIRECTION_NOTE, "heuristic"
 
 
@@ -2762,25 +2903,37 @@ def upload_seed():
 
 @app.post("/api/expand")
 def expand_brief():
-    """One model call fills the brief. It does not search, recut, or call Commons."""
+    """Fill logline, beats, and transcript. Does not recut, search, or call Commons."""
     payload = request.get_json(force=True, silent=True) or {}
-    line = str(payload.get("metaprompt") or "").strip()[:500]
+    line = str(payload.get("direction") or payload.get("metaprompt") or "").strip()[:500]
     if not line:
-        return jsonify({"error": "type a direction first"}), 400
-    try:
-        shot_count = int(payload.get("shot_count") if payload.get("shot_count") not in (None, "") else 4)
-    except (TypeError, ValueError):
-        shot_count = 4
-    shot_count = max(2, min(5, shot_count))
-    plan, note, _engine = _expand_direction(line, shot_count, None)
-    body = {
-        "logline": plan["logline"],
-        "beats": plan["beats"],
-        "voice_lines": plan["voice_lines"],
+        return jsonify({"ok": False, "error": "type a direction first"}), 400
+    context = {
+        "logline": str(payload.get("logline") or "").strip()[:500],
+        "beats": str(payload.get("beats") or "").strip()[:2000],
+        "transcript": str(payload.get("transcript") or "").strip()[:2000],
     }
-    if note:
-        body["expand_note"] = note
-    return jsonify(body)
+    try:
+        plan, note, _engine = _expand_direction(
+            line,
+            4,
+            None,
+            context=context,
+            allow_heuristic=False,
+        )
+    except Exception:
+        return jsonify({
+            "ok": False,
+            "error": "Could not fill the brief. Cosmos Reason and W&B inference both failed.",
+        }), 422
+    if not plan:
+        return jsonify({"ok": False, "error": note or "Could not fill the brief."}), 422
+    return jsonify({
+        "ok": True,
+        "logline": plan["logline"],
+        "beats": "\n".join(plan["beats"]),
+        "transcript": "\n".join(plan["voice_lines"]),
+    })
 
 
 @app.post("/api/upscale")
@@ -3367,10 +3520,25 @@ INDEX_HTML = r"""<!DOCTYPE html>
     border: 1px solid var(--line);
     border-radius: 18px;
   }
+  .direction-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    align-items: flex-end;
+  }
+  .direction-row .grow { flex: 1 1 280px; min-width: 0; }
   #metaprompt {
-    min-height: 148px;
-    font-size: 1.35rem;
-    line-height: 1.35;
+    min-height: 46px;
+    height: 46px;
+    font-size: 1.05rem;
+    line-height: 1.3;
+  }
+  #expandBtn {
+    flex: 0 0 auto;
+    min-height: 46px;
+    padding: 12px 18px;
+    font-size: 1rem;
+    white-space: nowrap;
   }
   .direction-box .hint { margin: 8px 0 0; color: var(--muted); font-size: 0.88rem; }
   #expanded { margin-top: 12px; display: grid; gap: 6px; }
@@ -3473,12 +3641,14 @@ INDEX_HTML = r"""<!DOCTYPE html>
     </header>
 
     <div class="direction-box">
-      <label for="metaprompt">Direction</label>
-      <textarea id="metaprompt" rows="4" placeholder="i want a nighttime ride through nyc"></textarea>
-      <div class="actions">
+      <div class="direction-row">
+        <div class="grow">
+          <label for="metaprompt">Direction</label>
+          <input id="metaprompt" name="direction" type="text" maxlength="500" placeholder="i want a nighttime ride through nyc" autocomplete="off"/>
+        </div>
         <button id="expandBtn" type="button">Fill the brief</button>
-        <span class="status" id="expandStatus"></span>
       </div>
+      <p class="status" id="expandStatus"></p>
       <p class="hint">Fill the brief writes the logline, the shots, and the spoken lines. Length, shots, voice, and bed stay as you set them. Recut makes the video.</p>
       <div id="expanded" class="hidden"></div>
     </div>
@@ -3653,19 +3823,24 @@ function setProgress(steps, activeIdx) {
   el.innerHTML = steps.map((t, i) => `<li class="${i < activeIdx ? "done" : i === activeIdx ? "now" : ""}">${escapeHtml(t)}</li>`).join("");
 }
 
+function briefText(value) {
+  if (Array.isArray(value)) return value.map(item => String(item || "").trim()).filter(Boolean).join("\n");
+  return String(value || "").trim();
+}
+
 function showExpanded(data) {
-  const lines = Array.isArray(data.voice_lines) ? data.voice_lines.filter(Boolean) : [];
-  const beatList = Array.isArray(data.beats) ? data.beats.filter(Boolean) : [];
+  const beatText = briefText(data.beats);
+  const spoken = briefText(data.voice_lines).trim() || briefText(data.transcript);
   if (data.logline) $("logline").value = data.logline;
-  if (beatList.length) $("beats").value = beatList.join("\n");
-  if (lines.length) $("transcript").value = lines.join("\n");
+  if (beatText) $("beats").value = beatText;
+  if (spoken) $("transcript").value = spoken;
   const box = $("expanded");
   if (!box) return;
   const note = data.expand_note ? `<p class="status">${escapeHtml(data.expand_note)}</p>` : "";
   box.classList.remove("hidden");
   box.innerHTML = `<p><strong>Logline.</strong> ${escapeHtml(data.logline || "")}</p>`
-    + `<p><strong>Shots.</strong> ${beatList.map(escapeHtml).join(" · ")}</p>`
-    + `<p><strong>Spoken.</strong> ${lines.map(escapeHtml).join(" · ")}</p>`
+    + `<p><strong>Shots.</strong> ${escapeHtml(beatText).replace(/\n/g, " · ")}</p>`
+    + `<p><strong>Spoken.</strong> ${escapeHtml(spoken).replace(/\n/g, " · ")}</p>`
     + note;
 }
 
@@ -3875,6 +4050,8 @@ if ($("expandBtn")) {
     const shotCount = $("shotCount").value;
     const voiceValue = $("voice").value;
     const bedValue = $("bed").value;
+    const cc = $("ccbroll").checked;
+    const seed = $("seed").checked;
     if (!line) {
       if (status) {
         status.className = "status err";
@@ -3892,19 +4069,21 @@ if ($("expandBtn")) {
         method: "POST",
         headers: {"Content-Type": "application/json"},
         body: JSON.stringify({
-          metaprompt: line,
-          shot_count: Math.min(5, Math.max(2, parseInt(shotCount, 10) || 4)),
+          direction: line,
+          logline: $("logline").value,
+          beats: $("beats").value,
+          transcript: $("transcript").value,
         }),
       });
       const raw = await res.text();
       let data;
       try { data = JSON.parse(raw); }
       catch (_) { throw new Error("Server returned non-JSON (HTTP " + res.status + ")."); }
-      if (!res.ok) throw new Error(data.error || res.statusText);
-      if (!data.logline || !Array.isArray(data.beats) || !Array.isArray(data.voice_lines)) {
-        throw new Error("The brief did not come back.");
-      }
-      showExpanded(data);
+      if (!res.ok || data.ok === false) throw new Error(data.error || res.statusText);
+      const beatsText = briefText(data.beats);
+      const spoken = briefText(data.transcript);
+      if (!data.logline || !beatsText || !spoken) throw new Error("The brief did not come back.");
+      showExpanded({logline: data.logline, beats: beatsText, transcript: spoken});
       filledDirection = line;
       $("metaprompt").value = direction;
       $("lengthMode").value = lengthMode;
@@ -3912,12 +4091,10 @@ if ($("expandBtn")) {
       $("shotCount").value = shotCount;
       $("voice").value = voiceValue;
       $("bed").value = bedValue;
+      $("ccbroll").checked = cc;
+      $("seed").checked = seed;
       syncCutLength();
-      if (status) {
-        status.textContent = data.expand_note
-          ? data.expand_note
-          : "Brief filled. Recut when you want the video.";
-      }
+      if (status) status.textContent = "Brief filled. Recut when you want the video.";
     } catch (err) {
       if (status) {
         status.className = "status err";
