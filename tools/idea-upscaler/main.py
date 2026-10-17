@@ -1054,7 +1054,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
         <ol class="progress hidden" id="progress"></ol>
         <div class="actions">
           <button id="go" type="button">Upscale idea</button>
-          <button id="demo" class="ghost" type="button">Dusk bike ride</button>
+          <button id="demo" class="ghost" type="button">Streets · NYC bike</button>
           <button id="shitty" class="ghost" type="button">Upscale shittyvideo</button>
           <span class="status" id="status"></span>
         </div>
@@ -1171,38 +1171,38 @@ async function runUpscale({ seed }) {
 
 const BRIEFS = [
   {
-    label: "Dusk bike ride",
+    label: "Streets · NYC bike",
     logline: "Dusk ride through the city. A cyclist in the bike lane, then a quiet stop.",
     beats: "Wide city street at dusk\nCyclist riding in the marked bike lane\nPedestrians at a crosswalk\nCyclist paused on the sidewalk",
     transcript: "We told ourselves it was just another night ride.\nBut the city already knew we were leaving.",
     seconds: 12,
   },
   {
-    label: "Warehouse forklift",
-    logline: "A forklift moves down a warehouse aisle and slows near the racks.",
-    beats: "Wide view of the warehouse aisle\nForklift driving between the shelves\nIt slows beside stacked goods",
-    transcript: "The aisle is clear.\nThen the forklift takes the lane.",
-    seconds: 12,
-  },
-  {
-    label: "SF crosswalk",
+    label: "Streets · SF crosswalk",
     logline: "People cross a San Francisco street while the cars wait.",
     beats: "Wide city intersection\nTwo people walking in the crosswalk\nCars held at the crossing",
     transcript: "They step off the curb.\nThe street lets them through.",
     seconds: 12,
   },
   {
-    label: "Highway lanes",
+    label: "Traffic · highway",
     logline: "Overhead highway. Traffic flows both ways, with a truck among the lanes.",
     beats: "Wide multi-lane highway\nTraffic moving in both directions\nA truck holding its lane",
     transcript: "The lanes keep moving.\nNobody brakes.",
     seconds: 12,
   },
   {
-    label: "Indoor hall",
-    logline: "People walk across a bright indoor hall.",
+    label: "Crowds · indoor",
+    logline: "People walk across a bright indoor warehouse floor.",
     beats: "Open indoor floor and white walls\nPeople crossing the space\nThey pass toward the far side",
     transcript: "The room is already busy.\nSomeone crosses through.",
+    seconds: 12,
+  },
+  {
+    label: "Warehouse · forklift",
+    logline: "A forklift moves down a warehouse aisle and slows near the racks.",
+    beats: "Wide view of the warehouse aisle\nForklift driving between the shelves\nIt slows beside stacked goods",
+    transcript: "The aisle is clear.\nThen the forklift takes the lane.",
     seconds: 12,
   },
 ];
