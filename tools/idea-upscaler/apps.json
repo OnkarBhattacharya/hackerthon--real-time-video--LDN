@@ -9,9 +9,9 @@
     },
     {
       "id": "guest",
-      "title": "LDN Video Ask",
-      "blurb": "Ask the indexed footage in plain language and jump to the clips. Already wired behind this button.",
-      "live_blurb": "This card proxies the Service in GUEST_UPSTREAM instead of the bundled ask app.",
+      "title": "Hazard perception",
+      "blurb": "Driving test. Click when you see a hazard. The second pass shows the marks and rates what you should have done.",
+      "live_blurb": "Driving test. Click when you see a hazard. The second pass shows the marks and rates what you should have done.",
       "href": "guest",
       "ready": false
     }
