@@ -1,10 +1,12 @@
-"""Thin client for the retrieval calls already used by tools/video-ask."""
+"""Thin client for live archive retrieval and the local fixture."""
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
@@ -38,11 +40,13 @@ class VssClient:
         self._explore: dict[str, Any] | None = None
         self._count: int | None = None
         self._count_at = 0.0
+        self._segment_numbers: dict[str, int] = {}
         self._http = httpx.Client()
 
     def clear_cache(self) -> None:
         """Drop cached explore data at the start of an investigation."""
         self._explore = None
+        self._segment_numbers.clear()
 
     def list_cameras(self) -> list[str]:
         """Return indexed camera ids."""
@@ -50,6 +54,20 @@ class VssClient:
             from backend.fixture import camera_ids
 
             return camera_ids()
+        try:
+            payload = self._request_json(
+                "GET",
+                "/api/v1/metadata/values?field=camera_id&limit=200",
+                operation="metadata",
+                detail="camera_id",
+                timeout=30,
+            )
+        except VssError:
+            logger.info("vss metadata camera_id unavailable")
+            payload = {}
+        found = [str(value) for value in (payload.get("values") or []) if str(value).strip()]
+        if found:
+            return list(dict.fromkeys(found))
         payload = self.explore(limit=100)
         found: list[str] = []
         for item in payload.get("cameras") or []:
@@ -95,27 +113,37 @@ class VssClient:
         body = {
             "query": query,
             "top_k": limit,
-            "llm_top_n": min(5, limit),
-            "min_similarity": 0.25,
+            "llm_top_n": 1,
+            "min_similarity": 0.15,
             "time_filter": "all",
             "include_public": True,
             "metadata_filters": {"camera_id": camera_id},
         }
         payload = self._request_json(
             "POST",
-            "/api/v1/agent/search-and-answer",
+            "/api/v1/search",
             operation="search",
             detail=camera_id,
             json_body=body,
             timeout=90,
         )
-        evidence = payload.get("evidence") if isinstance(payload.get("evidence"), dict) else {}
-        chunks = evidence.get("chunks") or payload.get("chunks") or []
-        return [
-            candidate_from_chunk(chunk, camera_id)
-            for chunk in chunks
-            if isinstance(chunk, dict)
-        ]
+        rows = payload.get("results")
+        if not isinstance(rows, list) or not rows:
+            evidence = payload.get("evidence") if isinstance(payload.get("evidence"), dict) else {}
+            rows = evidence.get("chunks") or payload.get("chunks") or []
+        candidates: list[Candidate] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            candidate = candidate_from_chunk(row, camera_id)
+            number = row.get("segment_number")
+            if number is not None:
+                try:
+                    self._segment_numbers[candidate.segment_id] = int(number)
+                except (TypeError, ValueError):
+                    pass
+            candidates.append(candidate)
+        return candidates
 
     def explore(self, limit: int = 100, offset: int = 0) -> dict[str, Any]:
         """Return one explore page. The first page is cached for neighbour lookup."""
@@ -144,6 +172,9 @@ class VssClient:
             from backend.fixture import neighbours_for
 
             return neighbours_for(segment_id)
+        numbered = self._neighbours_by_segment_number(segment_id, video_id)
+        if numbered is not None:
+            return numbered
         previous: Clip | None = None
         nxt: Clip | None = None
         try:
@@ -166,12 +197,43 @@ class VssClient:
                 nxt = clip
         return {"previous": previous, "next": nxt}
 
+    def _neighbours_by_segment_number(
+        self,
+        segment_id: str,
+        video_id: str,
+    ) -> dict[str, Clip | None] | None:
+        """Use the segment index when search stored a segment number for this hit."""
+        number = self._segment_numbers.get(segment_id)
+        if number is None or not video_id:
+            return None
+        try:
+            payload = self._request_json(
+                "GET",
+                "/api/v1/tools/segments?original_video=" + quote(video_id, safe=""),
+                operation="segments",
+                detail=segment_id,
+                timeout=60,
+            )
+        except VssError:
+            logger.info("vss segments segment=%s status=error", segment_id)
+            return None
+        by_number: dict[int, dict[str, Any]] = {}
+        for row in payload.get("segments") or []:
+            if not isinstance(row, dict) or row.get("segment_number") is None:
+                continue
+            try:
+                by_number[int(row["segment_number"])] = row
+            except (TypeError, ValueError):
+                continue
+        return {
+            "previous": clip_from_row(by_number.get(number - 1)),
+            "next": clip_from_row(by_number.get(number + 1)),
+        }
+
     def open_stream(self, source: str, range_header: str | None) -> httpx.Response:
         """Open the upstream clip stream. The URL is not logged because it carries the token."""
         token = self._bearer(force=False)
         base, _, _ = settings.require_vss()
-        from urllib.parse import quote
-
         url = f"{base}/api/v1/videos/stream?source={quote(source, safe='')}&token={quote(token, safe='')}"
         headers = {"Range": range_header} if range_header else {}
         started = time.perf_counter()
@@ -288,12 +350,18 @@ class VssClient:
 
 def candidate_from_chunk(chunk: dict[str, Any], camera_id: str) -> Candidate:
     """Map one search or explore chunk onto a Candidate. Missing fields stay empty."""
-    start = _number(_first(chunk, "start", "start_sec", "best_match_start_sec"), 0)
-    end = _number(_first(chunk, "end", "end_sec", "best_match_end_sec"), start)
+    start = _number(
+        _first(chunk, "start", "start_sec", "best_match_start_sec", "segment_start_sec"),
+        0,
+    )
+    end = _number(
+        _first(chunk, "end", "end_sec", "best_match_end_sec", "segment_end_sec"),
+        start,
+    )
     video_id = str(_first(chunk, "video_id", "original_video", "filename") or "")
     resolved_camera = str(_first(chunk, "camera_id") or camera_id)
     segment_id = str(
-        _first(chunk, "segment_id", "id", "chunk_id")
+        _first(chunk, "segment_id", "id", "chunk_id", "source")
         or f"{resolved_camera}:{video_id}:{start}:{end}"
     )
     preview = _first(chunk, "preview_source", "source")
@@ -305,10 +373,24 @@ def candidate_from_chunk(chunk: dict[str, Any], camera_id: str) -> Candidate:
         start=start,
         end=end,
         description=str(_first(chunk, "description", "reasoning_content", "caption") or ""),
-        detections=_detections(chunk.get("detections")),
+        detections=_detections(chunk),
         search_score=_number(_first(chunk, "search_score", "similarity_score", "score"), 0),
         clip_url=clip_url_for_source(str(preview) if preview else None) or "",
     )
+
+
+def clip_from_row(row: dict[str, Any] | None) -> Clip | None:
+    """Map one neighbour segment row onto a playable clip."""
+    if not isinstance(row, dict):
+        return None
+    source = _first(row, "preview_source", "source")
+    url = clip_url_for_source(str(source) if source else None)
+    if not url:
+        return None
+    start = _number(_first(row, "start", "start_sec", "segment_start_sec"), 0)
+    end = _number(_first(row, "end", "end_sec", "segment_end_sec"), start)
+    segment_id = str(_first(row, "segment_id", "source") or "")
+    return Clip(segment_id, start, end, url)
 
 
 def _first(chunk: dict[str, Any], *keys: str) -> Any:
@@ -326,21 +408,60 @@ def _number(value: Any, default: float) -> float:
         return default
 
 
-def _detections(raw: Any) -> list[Detection]:
-    if not isinstance(raw, list):
-        return []
-    detections: list[Detection] = []
-    for item in raw:
-        if not isinstance(item, dict):
+def _detections(chunk: dict[str, Any]) -> list[Detection]:
+    """Read a detections list, or object_counts when search returns metadata strings."""
+    raw = chunk.get("detections")
+    if isinstance(raw, list) and raw:
+        detections: list[Detection] = []
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            label = str(item.get("class") or item.get("label") or "")
+            boxes = item.get("boxes")
+            if boxes is None:
+                boxes = item.get("bbox")
+            detections.append(
+                Detection(label=label, count=int(item.get("count") or 1), boxes=boxes)
+            )
+        if detections:
+            return detections
+    counts = _coerce_counts(chunk.get("object_counts"))
+    if counts:
+        return [Detection(label=label, count=count, boxes=None) for label, count in counts.items()]
+    return [
+        Detection(label=label, count=1, boxes=None)
+        for label in _coerce_classes(chunk.get("object_classes"))
+    ]
+
+
+def _coerce_counts(value: Any) -> dict[str, int]:
+    """Accept a count dict or a JSON object string from search metadata."""
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return {}
+        try:
+            value = json.loads(text)
+        except json.JSONDecodeError:
+            return {}
+    if not isinstance(value, dict):
+        return {}
+    counts: dict[str, int] = {}
+    for key, count in value.items():
+        try:
+            counts[str(key)] = int(count)
+        except (TypeError, ValueError):
             continue
-        label = str(item.get("class") or item.get("label") or "")
-        boxes = item.get("boxes")
-        if boxes is None:
-            boxes = item.get("bbox")
-        detections.append(
-            Detection(label=label, count=int(item.get("count") or 1), boxes=boxes)
-        )
-    return detections
+    return counts
+
+
+def _coerce_classes(value: Any) -> list[str]:
+    """Accept a class list or a comma-separated string."""
+    if isinstance(value, str):
+        return [part.strip() for part in value.split(",") if part.strip()]
+    if isinstance(value, list):
+        return [str(part).strip() for part in value if str(part).strip()]
+    return []
 
 
 _client: VssClient | None = None

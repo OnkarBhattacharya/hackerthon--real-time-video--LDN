@@ -90,3 +90,66 @@ Pass condition: every row is schema-valid, severities are integers 1–5, and a 
 
 - The smoke table is valid and the order matches the sort rules.
 - `PROGRESS.md` records the model name and whether JSON mode, plain JSON, or the rule fallback was used.
+
+## Working-tree notes preserved during merge
+
+These notes were already in the working tree when `origin/main` added this file. They record the Stage 1–3 implementation contracts and are kept alongside the spec above.
+
+# Stage 2 — Severity ranking with the LLM (spec)
+
+**Time-box:** 45 minutes  
+**Depends on:** Stage 1 `Candidate` + `find_candidates`  
+**Goal:** Score near-miss candidates 1–5 via W&B serverless inference with strict JSON; keep actionable hits.
+
+## In scope
+
+| Deliverable | Description |
+|-------------|-------------|
+| `backend/config.py` | Add W&B inference settings (`WANDB_API_KEY`, optional model/base URL) |
+| `backend/models.py` | `RankedHit` extending candidate + severity fields |
+| `backend/llm.py` | Thin OpenAI-compatible chat client for W&B Inference |
+| `backend/ranking.py` | Rubric prompt, JSON validate/repair, concurrency ≤4, filter+sort |
+| `scripts/smoke_ranking.py` | Rank 10 real candidates; print table |
+
+## Inference
+
+- Base URL: `WANDB_INFERENCE_URL` or `https://api.inference.wandb.ai/v1`
+- Auth: `Authorization: Bearer $WANDB_API_KEY`
+- Default model: `WANDB_MODEL` or `openai/gpt-oss-20b`
+- Prefer `response_format: {type: json_object}`; on parse failure, one repair retry
+
+## Rubric (prompt)
+
+1 = no real interaction · 2 = same scene, no close approach · 3 = close approach (~1 vehicle length), no evasive action · 4 = close approach + evasive action or VRU in path · 5 = contact / extreme near-miss. Warehouse: forklift = vehicle. Use only provided evidence.
+
+## Required JSON per candidate
+
+```json
+{
+  "segment_id": "...",
+  "severity": 1,
+  "category": "highway|driving|street|warehouse|indoor|other",
+  "rationale": "...",
+  "people_visible": true,
+  "faces_or_plates_possibly_visible": false,
+  "recommended_action": "...",
+  "confidence": "low|medium|high"
+}
+```
+
+## Selection
+
+- Keep severity ≥ 3; if fewer than 6 remain, keep top 6 by severity then search_score.
+- Sort: severity DESC, confidence (high>medium>low), search_score DESC.
+
+## Fallback
+
+If W&B unavailable: rule-based score from search_score + person/vehicle detection counts + keywords (braking, swerving, close, near, forklift). Mark `confidence=low` and log clearly.
+
+## Verify
+
+```bash
+python scripts/smoke_ranking.py
+```
+
+Prints a table of 10 ranked rows with valid JSON-derived fields and sensible ordering.

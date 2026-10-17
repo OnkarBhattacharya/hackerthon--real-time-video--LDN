@@ -47,6 +47,15 @@ Open `/`. Behind the team ingress the same routes are served at `/app` because t
 .venv/bin/python -m pytest
 ```
 
+With archive credentials set, the same pipeline can be checked against the live index. The scripts do not print tokens:
+
+```bash
+python scripts/smoke_candidates.py
+python scripts/smoke_ranking.py
+python scripts/smoke_evidence.py
+python scripts/smoke_reports.py
+```
+
 ## Deploy
 
 Not deployed from this machine. The team kubeconfig, `INGRESS_URL`, and login variables are not present here. On the team VM, follow `deployment/deploy-app-no-registry`: team namespace, no image build, ingress path `/app`. Until that is done, run the server on the VM and open the local port.

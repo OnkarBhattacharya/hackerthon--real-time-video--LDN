@@ -1,5 +1,11 @@
 # Progress
 
+## Stages 1–4 merged into the investigation app
+
+The Stages 1–4 branch was merged onto the investigation API. Shared modules keep the interfaces the job, fixture, and review page already call. Live retrieval uses the archive calls that branch verified: `POST /api/v1/search`, camera ids from `GET /api/v1/metadata/values`, and neighbour clips from `GET /api/v1/tools/segments` when a search row includes `segment_number`. Stored clip URLs stay relative (`api/stream?source=`) so the page plays them without a bearer token in the JSON.
+
+That branch recorded these live checks before the merge: candidate smoke with at least three cameras, severity ranking, triptych clips with crop omitted, and English/German reports plus a ticket payload that was not posted. On this tree, `pytest` covers the fixture. The scripts under `scripts/` repeat the live checks when archive credentials are set.
+
 ## Stage 6
 
 Click-through on `http://127.0.0.1:8090` with `VSS_USE_FIXTURE=1` (the server that was already running).
