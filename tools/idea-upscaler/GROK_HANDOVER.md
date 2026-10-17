@@ -1,0 +1,93 @@
+# Handover for the next Grok
+
+## Repo and push rules
+
+- Live checkout: `/home/onkarbhattacharya/hackerthon--real-time-video--LDN`
+- `/home/samialsindi/vast-builders-challenge` is not on this machine. Do not assume the two paths are the same.
+- Branch: `idea-upscaler`
+- Team remote URL: `https://github.com/ahmedm87/hackerthon--real-time-video--LDN.git`
+- Push only that URL, only branch `idea-upscaler`, HTTPS only. Never push `origin`. Never force-push. Never use SSH or port 22.
+- This clone has no saved remote named `teamrepo` (`origin` and `fork` are a different GitHub user; `upstream` is the team URL). Do not edit git config to add a remote. Push with a one-shot override:
+
+```bash
+git -c remote.teamrepo.url=https://github.com/ahmedm87/hackerthon--real-time-video--LDN.git push teamrepo HEAD:idea-upscaler
+```
+
+- Git identity is empty. Do not set `user.name` or `user.email`. On the commit command only:
+
+```bash
+GIT_AUTHOR_NAME=samialsindi
+GIT_AUTHOR_EMAIL=samialsindi@bc-pool-233.cosmo.vastdata.com
+GIT_COMMITTER_NAME=samialsindi
+GIT_COMMITTER_EMAIL=samialsindi@bc-pool-233.cosmo.vastdata.com
+```
+
+- Do not commit `/config`, kubeconfigs, credentials, or real values from config. Do not commit `data/last_run.json`.
+
+## Config-window prompt
+
+The prompt is the three scenario lines on Video Recutter, labeled **Scenarios for the VAST reasoner (1–3)**.
+
+- File: `tools/idea-upscaler/main.py` (the page is the `INDEX_HTML` string)
+- Fields: `#scenario1`, `#scenario2`, `#scenario3`, filled from `#scenarioPreset`
+- Browser: `scenarioLines()` sends them as `scenarios` on `POST /app/api/upscale`
+- Server: `upscale()` keeps them with `_clean_scenarios`
+
+Before this fix those lines were only search text (`_query_for_scenarios` / `_search_shot`) and, on upload, one VSS `custom_prompt` (`_scenario_custom_prompt`). They did not set the shot count or the length.
+
+## The bug
+
+The Shots control defaulted to 4 and was clamped with `max(2, min(5, shot_count))`. A filled brief then did `count = min(shot_count, len(form_beats), len(form_lines))`, so four beats won. `_render_same_length_cut` kept at most that many clips and set `slice_len = target / len(picks)`.
+
+A one-minute cut whose scenario prompt asked for 6 shots therefore became four clips stretched across 60 seconds:
+
+- before: 0–15, 15–30, 30–45, 45–60 (15s each)
+
+## The fix
+
+`_parse_cut_instructions` reads a shot count and a duration only when the text states them. `_stated_cut_from_prompts` checks the scenario lines first. The Direction line fills a field only when the scenario text did not state it. Six is not a default. If neither prompt states a count, the Shots control stays as set (default 4).
+
+`_equal_shot_spans` and `_select_cut_sources` build exactly that many slices of `duration / count`. Fewer source clips are repeated into the remaining slices. They are not widened to fill the minute.
+
+After, for the scenario text `one minute cut of 6 shots` (Shots control still 4):
+
+- 0–10, 10–20, 20–30, 30–40, 40–50, 50–60
+
+The same field with `one minute, 3 shots` is 3 × 20s. `8 shots of 5 seconds` is 8 × 5s. `six shots at 10 seconds each` is 6 × 10s. A scenario with no count leaves the control at 4. A checked ffmpeg render of four source files with that 6-shot minute plan produced a 60.0s file and six 10s timeline rows.
+
+## How to reproduce
+
+1. Open Video Recutter (`/app/upscaler`).
+2. In scenario 1 type `one minute cut of 6 shots`. Leave Shots at 4.
+3. Recut. The timeline is six segments of 10 seconds, and the response `shot_count` is 6 with `duration_sec` 60.
+4. Change that same box to `one minute, 3 shots` and recut. The plan becomes three segments of 20 seconds.
+
+## Deploy
+
+```bash
+KUBECONFIG=/config/team-41-k8s.yaml tools/idea-upscaler/deploy.sh
+```
+
+- Namespace: `team-41`
+- Kubeconfig: `/config/team-41-k8s.yaml`
+- Live path: `/app` on the team ingress (`video-lab-team-41.cosmos.vastdata.com`). People open it from the workshop App button.
+- No docker build. `deploy.sh` updates ConfigMap `hackathon-app-code` and restarts `deploy/hackathon-app`.
+
+## Card 2
+
+LDN Video Ask stays card 2. Do not lock it. Do not change `GUEST_UPSTREAM`. It must remain `http://ldn-video-ask:80`. `deploy.sh` does not set, unset, or restore that variable.
+
+## Card 3
+
+`/app/hazard` is already routed. `hazard()` in `main.py` proxies `HAZARD_UPSTREAM` or `http://hazard-perception:80`. It was left in place.
+
+## Git
+
+- Shot-fix commit: `f9b19377e9e46c1038bd1d326f7ede28a3b6520d`
+- This file is committed on top of that. After both commits are pushed, `git rev-parse HEAD` on `idea-upscaler` is the tip.
+
+## Still broken
+
+- Level-crossing briefs still use their own five-beat storyboard.
+- If the scenario prompt names a shot count but no length, and Cut length is Automatic, the total is still the source length (or the automatic fallback), split into that many equal slices.
+- A scenario line is still also a search hint, so a line that is only "6 shots, one minute" does not describe a picture. Put the picture in the other scenario boxes or in Direction.
