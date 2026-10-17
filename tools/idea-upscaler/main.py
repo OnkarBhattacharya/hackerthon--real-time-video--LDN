@@ -527,15 +527,19 @@ def _render_same_length_cut(
     transcript: str,
     voice: str | None = "en-us+f3",
     bed: float = 0.22,
+    duration_sec: float | None = None,
 ) -> dict[str, Any]:
     """Concat archive matches and keep their audio. Speak the VO over a quieter bed."""
-    picks: list[str] = []
+    picks: list[dict[str, Any]] = []
     seen: set[str] = set()
-    for src in match_sources:
+    for item in match_sources:
+        if isinstance(item, str):
+            item = {"source": item, "title": "", "filename": item.rsplit("/", 1)[-1]}
+        src = item.get("source") or ""
         if not src or src in seen:
             continue
         seen.add(src)
-        picks.append(src)
+        picks.append(item)
         if len(picks) >= 4:
             break
     if not picks:
@@ -546,16 +550,29 @@ def _render_same_length_cut(
     work.mkdir(parents=True, exist_ok=True)
 
     target = 0.0
-    for i, clip in enumerate(source_clips or []):
-        raw = work / f"mine_{i}.mp4"
-        _download_mp4(clip["source"], raw)
-        target += _probe_duration(raw)
-    if target < 0.5:
-        target = 4.0 * len(picks)
+    if duration_sec and duration_sec >= 4:
+        target = min(90.0, float(duration_sec))
+    else:
+        for i, clip in enumerate(source_clips or []):
+            raw = work / f"mine_{i}.mp4"
+            _download_mp4(clip["source"], raw)
+            target += _probe_duration(raw)
+        if target < 0.5:
+            target = 4.0 * len(picks)
 
     slice_len = target / len(picks)
+    timeline: list[dict[str, Any]] = []
     trimmed: list[Path] = []
-    for i, src in enumerate(picks):
+    for i, item in enumerate(picks):
+        src = item["source"]
+        start = round(i * slice_len, 2)
+        end = round(target if i == len(picks) - 1 else (i + 1) * slice_len, 2)
+        timeline.append({
+            "title": item.get("title") or f"Shot {i + 1}",
+            "filename": item.get("filename") or src.rsplit("/", 1)[-1],
+            "start_sec": start,
+            "end_sec": end,
+        })
         raw = work / f"raw_{i}.mp4"
         _download_mp4(src, raw)
         norm = work / f"norm_{i}.mp4"
@@ -650,6 +667,7 @@ def _render_same_length_cut(
         "vo": spoken,
         "voice": voice if spoken else "off",
         "bed": bed,
+        "timeline": timeline,
     }
 
 
@@ -698,6 +716,14 @@ def upscale():
             bed = float(payload.get("bed") if payload.get("bed") is not None else 0.22)
         except (TypeError, ValueError):
             bed = 0.22
+        duration_sec = None
+        if payload.get("duration_sec") not in (None, "", 0, "0"):
+            try:
+                duration_sec = float(payload.get("duration_sec"))
+            except (TypeError, ValueError):
+                return jsonify({"error": "cut length must be a number of seconds"}), 400
+            if duration_sec < 4 or duration_sec > 90:
+                return jsonify({"error": "cut length must be between 4 and 90 seconds"}), 400
         seed_from_upload = bool(payload.get("seed_from_upload"))
         upload_tag = (payload.get("upload_tag") or "shittyvideo").strip() or "shittyvideo"
 
@@ -762,7 +788,7 @@ def upscale():
             enriched.append({**shot, "matches": matches})
 
         directors_cut = []
-        match_sources: list[str] = []
+        match_sources: list[dict[str, Any]] = []
         for shot in enriched:
             best = shot["matches"][0] if shot["matches"] else None
             directors_cut.append(
@@ -776,7 +802,11 @@ def upscale():
                 }
             )
             if best and best.get("source"):
-                match_sources.append(best["source"])
+                match_sources.append({
+                    "source": best["source"],
+                    "title": shot.get("title") or "",
+                    "filename": best.get("filename") or "",
+                })
 
         rendered = None
         render_error = None
@@ -788,6 +818,7 @@ def upscale():
                     transcript,
                     None if voice == "off" else voice,
                     bed,
+                    duration_sec,
                 )
             except Exception as e:
                 render_error = str(e)
@@ -917,6 +948,9 @@ INDEX_HTML = r"""<!DOCTYPE html>
   }
   .source-box { margin-top: 14px; border-top: 1px solid var(--line); padding-top: 12px; }
   .source-box video { max-width: 320px; }
+  .tl { display: flex; width: 100%; height: 44px; margin-top: 10px; gap: 2px; }
+  .tl button { flex: 1 1 0; min-width: 0; border: none; color: #f7f3ea; font: inherit; font-size: 0.72rem; padding: 4px; cursor: pointer; text-align: left; overflow: hidden; }
+  .tl button small { display: block; opacity: 0.85; }
 </style>
 </head>
 <body>
@@ -954,6 +988,17 @@ INDEX_HTML = r"""<!DOCTYPE html>
               <option value="0.65">Louder</option>
             </select>
           </div>
+          <div>
+            <label for="lengthMode">Cut length</label>
+            <select id="lengthMode">
+              <option value="auto">Automatic</option>
+              <option value="custom">Custom seconds</option>
+            </select>
+          </div>
+          <div id="lengthWrap" class="hidden">
+            <label for="lengthSec">Seconds (4–90)</label>
+            <input id="lengthSec" type="number" min="4" max="90" step="1" value="15"/>
+          </div>
         </div>
         <div class="opt">
           <label class="row" for="seed">
@@ -975,6 +1020,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
         <h2>Director's cut</h2>
         <p class="status" id="cut-empty">Upscale shittyvideo to cut a reel the same length as your clip, with the VO burned in.</p>
         <video id="cut-video" class="hidden" controls playsinline></video>
+        <div id="timeline" class="tl hidden"></div>
         <p class="status" id="cut-meta"></p>
         <ol id="cut-list" class="hidden"></ol>
       </div>
@@ -1035,6 +1081,7 @@ async function runUpscale({ seed }) {
         transcript: $("transcript").value,
         voice: $("voice").value,
         bed: $("bed").value,
+        duration_sec: $("lengthMode").value === "custom" ? Number($("lengthSec").value) : null,
         seed_from_upload: useSeed,
         upload_tag: ($("tag").value || "shittyvideo").trim(),
       }),
@@ -1050,7 +1097,7 @@ async function runUpscale({ seed }) {
     render();
     const cut = data.rendered_cut;
     if (cut && cut.url) {
-      $("status").textContent = `Cut ready · ${cut.target_duration_sec}s · same length as your clip`;
+      $("status").textContent = `Cut ready · ${cut.target_duration_sec}s`;
     } else if (data.render_error) {
       $("status").className = "status err";
       $("status").textContent = data.render_error;
@@ -1084,6 +1131,9 @@ $("shitty").onclick = () => {
   runUpscale({ seed: true });
 };
 
+$("lengthMode").onchange = () => {
+  $("lengthWrap").classList.toggle("hidden", $("lengthMode").value !== "custom");
+};
 $("go").onclick = () => runUpscale({ seed: false });
 
 function render() {
@@ -1121,6 +1171,23 @@ function render() {
     $("cut-empty").classList.add("hidden");
     vid.classList.remove("hidden");
     vid.src = reel.url;
+    const colors = ["#0d6e6e", "#c45c26", "#1f6b3a", "#3d4f7c"];
+    const tl = $("timeline");
+    const rows = reel.timeline || [];
+    if (rows.length) {
+      tl.classList.remove("hidden");
+      tl.innerHTML = rows.map((row, i) => `
+        <button type="button" data-t="${row.start_sec}" style="background:${colors[i % colors.length]}">
+          ${escapeHtml(row.title)}
+          <small>${fmtTime(row.start_sec)}–${fmtTime(row.end_sec)}</small>
+        </button>`).join("");
+      tl.querySelectorAll("button").forEach(btn => {
+        btn.onclick = () => { vid.currentTime = Number(btn.dataset.t) || 0; vid.play(); };
+      });
+    } else {
+      tl.classList.add("hidden");
+      tl.innerHTML = "";
+    }
     $("cut-meta").textContent = `${reel.target_duration_sec}s · ${reel.pieces} shots` + (reel.vo ? " · voice over quieter footage audio" : " · footage audio only");
   } else {
     vid.classList.add("hidden");
