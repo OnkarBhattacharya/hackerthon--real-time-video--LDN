@@ -407,8 +407,10 @@ def _search_shot(
     exclude_sources: set[str] | None = None,
     metadata_filters: dict[str, Any] | None = None,
     fallback: bool = True,
+    scenarios: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     query = re.sub(r"\s+", " ", (shot.get("search_query") or "")).replace("—", "-").replace("–", "-").strip()
+    query = _query_for_scenarios(query, scenarios or [])
     filters = metadata_filters if metadata_filters is not None else shot.get("metadata_filters") or None
     exclude = exclude_sources or set()
 
@@ -421,6 +423,11 @@ def _search_shot(
             "include_public": True,
             "time_filter": "all",
         }
+        if scenarios:
+            body["system_prompt"] = (
+                "Prefer a clip only when it clearly shows at least one of these scenarios: "
+                + "; ".join(scenarios)
+            )[:800]
         if tags:
             body["tags"] = tags
         if filt:
@@ -632,10 +639,6 @@ NEURAL_VOICES = {
 }
 VOICE_ALIASES = {espeak: neural for neural, espeak in NEURAL_VOICES.items()}
 DEFAULT_VOICE = "en-US-JennyNeural"
-# The shot control drives the cut. 6 × 10s is the one-minute demo, not a hard cap.
-MIN_SHOT_COUNT = 2
-MAX_SHOT_COUNT = 12
-DEFAULT_SHOT_COUNT = 6
 
 COMMONS_API = "https://commons.wikimedia.org/w/api.php"
 COMMONS_UA = "IdeaUpscaler/1.0 (educational video cut; VAST builders challenge)"
@@ -1656,15 +1659,6 @@ def _parse_direction_plan(
     return {"logline": logline, "beats": clean_beats, "voice_lines": clean_lines}
 
 
-def _clamp_shot_count(value: Any, default: int = DEFAULT_SHOT_COUNT) -> int:
-    """The number the user asked for, inside the range the cutter can render."""
-    try:
-        count = int(value) if value not in (None, "") else default
-    except (TypeError, ValueError):
-        count = default
-    return max(MIN_SHOT_COUNT, min(MAX_SHOT_COUNT, count))
-
-
 def _heuristic_direction(line: str, shot_count: int) -> dict[str, Any]:
     """No model. The typed line is the logline, split into the shot count."""
     raw = re.sub(r"\s+", " ", line or "").strip()
@@ -1673,14 +1667,13 @@ def _heuristic_direction(line: str, shot_count: int) -> dict[str, Any]:
     night_nyc = any(word in blob for word in ("nyc", "new york", "manhattan")) and any(
         word in blob for word in ("night", "dusk", "ride", "bike", "cycl")
     )
-    if night_nyc:
+    if night_nyc and shot_count <= 5:
         beats = [
             "New York City street at night with traffic",
             "cyclist in a New York bike lane at night",
             "pedestrians beside night traffic in New York",
             "dusk traffic along a Manhattan avenue",
             "a stop on a New York sidewalk after dark",
-            "the next block of the New York night ride",
         ]
         voices = [
             "A nighttime ride through New York.",
@@ -1688,14 +1681,12 @@ def _heuristic_direction(line: str, shot_count: int) -> dict[str, Any]:
             "People are still out.",
             "The traffic keeps moving.",
             "We stop on the sidewalk.",
-            "The next block is still lit.",
         ]
-        if shot_count <= len(beats):
-            return {
-                "logline": logline,
-                "beats": beats[:shot_count],
-                "voice_lines": voices[:shot_count],
-            }
+        return {
+            "logline": logline,
+            "beats": beats[:shot_count],
+            "voice_lines": voices[:shot_count],
+        }
     words = raw.split() or ["city street"]
     if len(words) >= shot_count:
         size = max(1, len(words) // shot_count)
@@ -1723,27 +1714,8 @@ def _heuristic_direction(line: str, shot_count: int) -> dict[str, Any]:
     }
 
 
-def _fit_to_shot_count(lines: list[str], shot_count: int, fallback: str, *, kind: str) -> list[str]:
-    """Exactly shot_count lines. A longer brief is trimmed. A shorter one is re-split."""
-    clean = [ln.strip() for ln in lines if ln and str(ln).strip()]
-    limit = 240 if kind == "beat" else 180
-    if len(clean) >= shot_count:
-        return [ln[:limit] for ln in clean[:shot_count]]
-    text = " ".join(clean) if clean else (fallback or "A city street.")
-    plan = _heuristic_direction(text, shot_count)
-    key = "beats" if kind == "beat" else "voice_lines"
-    fitted = [str(item).strip()[:limit] for item in (plan.get(key) or []) if str(item).strip()]
-    if len(fitted) < shot_count:
-        seed = fitted or clean or [text]
-        fitted = [seed[i % len(seed)][:limit] for i in range(shot_count)]
-    return fitted[:shot_count]
-
-
 def _beat_search_query(logline: str, beat: str) -> str:
-    """"{logline}. {beat}" so a later shot cannot drop the film premise.
-
-    An empty logline leaves the beat as today's query.
-    """
+    """Keep the film premise on every shot, including the later ones."""
     premise = _collapse_query(logline).strip()
     text = _collapse_query(beat).strip()
     if not premise:
@@ -1759,10 +1731,7 @@ def _beat_search_query(logline: str, beat: str) -> str:
 
 
 def _shots_from_plan(plan: dict[str, Any]) -> list[dict[str, Any]]:
-    """Beats are the archive search queries. Voice lines are what is spoken.
-
-    Every beat is searched with the logline in front of that beat's own text.
-    """
+    """Beats are the archive search queries. Voice lines are what is spoken."""
     types = ["wide establishing", "tracking medium", "medium", "close-up", "closing wide"]
     moods = ["night urban", "kinetic", "observational", "quiet", "resolute"]
     logline = str(plan.get("logline") or "")
@@ -1781,22 +1750,6 @@ def _shots_from_plan(plan: dict[str, Any]) -> list[dict[str, Any]]:
             }
         )
     return shots
-
-
-def _fit_shot_list(shots: list[dict[str, Any]], shot_count: int) -> list[dict[str, Any]]:
-    """Keep exactly shot_count shots. Do not drop the tail and stretch what remains."""
-    if shot_count < 1:
-        return []
-    if not shots:
-        return []
-    if len(shots) >= shot_count:
-        fitted = [dict(shot) for shot in shots[:shot_count]]
-    else:
-        fitted = [dict(shots[i % len(shots)]) for i in range(shot_count)]
-    for i, shot in enumerate(fitted):
-        shot["id"] = i + 1
-        shot["title"] = f"Shot {i + 1}"
-    return fitted
 
 
 def _wandb_chat(system_text: str, user_text: str, timeout: int = 45) -> str | None:
@@ -2076,7 +2029,10 @@ def _apply_cosmos_reason(
             f"order and voice_lines must each have length {shot_count}. "
         )
     else:
-        count_rule = "Use 3 to 5 shots when that many candidates match the brief, otherwise every matching candidate. "
+        count_rule = (
+            "Use 3 to 5 shots when that many candidates match the brief, "
+            "otherwise every matching candidate. "
+        )
     system = (
         "You write the spoken voiceover and choose the shot order from indexed Cosmos descriptions. "
         "Return ONLY JSON, no markdown, with keys voice_lines, order, and why. "
@@ -2432,11 +2388,7 @@ def _fetch_cc_clip(query: str, dest_dir: Path) -> tuple[dict[str, Any] | None, s
 
 
 def _equal_shot_spans(target: float, count: int) -> list[tuple[float, float]]:
-    """N slices that add up to target.
-
-    The requested shot count sets N. Fewer source clips must not widen the slices
-    (that was 4 clips stretched across a 60s cut, 15s each, instead of 6 × 10s).
-    """
+    """N slices that add up to target. A shorter clip list must not widen them."""
     count = max(1, int(count))
     target = float(target)
     slice_len = target / count
@@ -2451,7 +2403,7 @@ def _equal_shot_spans(target: float, count: int) -> list[tuple[float, float]]:
 
 
 def _select_cut_sources(match_sources: list[Any], count: int) -> list[dict[str, Any]]:
-    """Take `count` sources. Cycle a short list so the timeline still has `count` shots."""
+    """Keep `count` sources. Cycle a short list so fewer clips are not stretched."""
     count = max(1, int(count))
     unique: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -2489,13 +2441,13 @@ def _render_same_length_cut(
     duration_sec: float | None = None,
     *,
     preset: str = "veryfast",
-    max_pieces: int = DEFAULT_SHOT_COUNT,
+    max_pieces: int = 4,
     fast: bool = False,
 ) -> dict[str, Any]:
     """Concat archive matches and keep their audio. Speak each VO line inside its caption window.
 
-    `max_pieces` is the requested shot count. The timeline is that many equal slices
-    of the target duration, not fewer clips stretched to fill the minute.
+    max_pieces is the shot count for this cut. The timeline is that many equal
+    slices of the target, even when fewer distinct clips were found.
     """
     picks = _select_cut_sources(match_sources, max_pieces)
     if not picks:
@@ -2881,6 +2833,178 @@ def _ingest_choices() -> dict[str, Any]:
     }
 
 
+_SCENARIO_MAX = 3
+_SCENARIO_LEAD = (
+    "Describe this clip only against the scenarios below. "
+    "For each scenario, say whether it is clearly visible and the concrete evidence "
+    "(who, what, and where in the frame). Skip anything that is not one of these scenarios."
+)
+
+
+def _clean_scenarios(raw: list[Any]) -> list[str]:
+    """Keep 1–3 distinct scenario lines. Empty input means no override."""
+    kept: list[str] = []
+    for item in raw:
+        text = re.sub(r"\s+", " ", str(item or "")).strip()
+        if not text or text in kept:
+            continue
+        kept.append(text)
+        if len(kept) > _SCENARIO_MAX:
+            raise ValueError("give 1 to 3 scenarios")
+    return kept
+
+
+def _scenario_custom_prompt(scenarios: list[str], max_len: int) -> str:
+    """One reasoner prompt. VAST ingest accepts a single custom_prompt, not a list."""
+    lines = [f"{index}. {text}" for index, text in enumerate(scenarios, 1)]
+    prompt = _SCENARIO_LEAD + "\n" + "\n".join(lines)
+    if len(prompt) > max_len:
+        raise ValueError(f"scenarios exceed {max_len} characters")
+    return prompt
+
+
+def _form_scenarios() -> list[str]:
+    return _clean_scenarios([_form_value(f"scenario_{index}") for index in (1, 2, 3)])
+
+
+def _query_for_scenarios(query: str, scenarios: list[str]) -> str:
+    if not scenarios:
+        return query[:400]
+    clause = "Scenarios: " + "; ".join(scenarios) + ". "
+    room = 400 - len(clause)
+    if room < 40:
+        return clause[:400]
+    return (clause + query[:room]).strip()
+
+
+_SHOT_WORDS = {
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+    "eleven": 11,
+    "twelve": 12,
+}
+_STATED_SHOT_MIN = 2
+_STATED_SHOT_MAX = 12
+
+
+def _parse_cut_instructions(text: str) -> dict[str, Any]:
+    """Read a shot count and a duration only when the prompt text states them.
+
+    The scenario boxes are the reasoner prompt. A line such as
+    "one minute, 6 shots" sets the cut. A line with no count leaves the
+    Shots control alone. Nothing here defaults to six.
+    """
+    lowered = re.sub(r"\s+", " ", (text or "").lower()).strip()
+    shot_count = None
+    numbered = re.search(r"\b(\d{1,2})\s*[- ]?\s*shots?\b", lowered)
+    if numbered:
+        shot_count = int(numbered.group(1))
+    else:
+        worded = re.search(
+            r"\b(two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s+shots?\b",
+            lowered,
+        )
+        if worded:
+            shot_count = _SHOT_WORDS[worded.group(1)]
+
+    each = None
+    each_match = re.search(
+        r"\b(\d+(?:\.\d+)?)\s*[- ]?(?:seconds?|secs?|s)\s*(?:each|apiece|per shot)\b",
+        lowered,
+    )
+    if each_match:
+        each = float(each_match.group(1))
+    if each is None:
+        each_match = re.search(
+            r"\b(\d+(?:\.\d+)?)\s*[- ]?second\s+shots?\b",
+            lowered,
+        )
+        if each_match:
+            each = float(each_match.group(1))
+    if each is None and shot_count is not None:
+        of_match = re.search(
+            rf"\b{shot_count}\s*[- ]?\s*shots?\s+of\s+(\d+(?:\.\d+)?)\s*(?:seconds?|secs?|s)\b",
+            lowered,
+        )
+        if of_match:
+            each = float(of_match.group(1))
+
+    duration = None
+    if re.search(r"\b(?:a|an|one|1)\s+minutes?\b|\bone-minute\b", lowered):
+        duration = 60.0
+    else:
+        minutes = re.search(r"\b(\d+(?:\.\d+)?)\s*[- ]?\s*minutes?\b", lowered)
+        if minutes:
+            duration = float(minutes.group(1)) * 60.0
+        else:
+            for seconds in re.finditer(r"\b(\d+(?:\.\d+)?)\s*(?:seconds?|secs?|s)\b", lowered):
+                val = float(seconds.group(1))
+                if each is not None and abs(val - each) < 0.01:
+                    continue
+                duration = val
+                break
+    if duration is None and each is not None and shot_count:
+        duration = each * shot_count
+    if shot_count is not None:
+        shot_count = max(_STATED_SHOT_MIN, min(_STATED_SHOT_MAX, shot_count))
+    if duration is not None:
+        duration = max(4.0, min(90.0, float(duration)))
+    return {"shot_count": shot_count, "duration_sec": duration}
+
+
+def _stated_cut_from_prompts(*texts: str) -> dict[str, Any]:
+    """First prompt that states a field wins. Later prompts fill only the gaps."""
+    found: dict[str, Any] = {"shot_count": None, "duration_sec": None}
+    for text in texts:
+        parsed = _parse_cut_instructions(text)
+        if found["shot_count"] is None and parsed.get("shot_count"):
+            found["shot_count"] = parsed["shot_count"]
+        if found["duration_sec"] is None and parsed.get("duration_sec") is not None:
+            found["duration_sec"] = parsed["duration_sec"]
+    return found
+
+
+def _lines_to_count(lines: list[str], count: int, fallback: str) -> list[str]:
+    """Exactly `count` lines. Extra lines drop. A short brief is re-split, not stretched."""
+    clean = [ln.strip() for ln in lines if ln and str(ln).strip()]
+    if len(clean) >= count:
+        return [ln[:240] for ln in clean[:count]]
+    words = " ".join(clean or [fallback or "A city street."]).split() or ["street"]
+    if len(words) >= count:
+        size = max(1, len(words) // count)
+        chunks: list[str] = []
+        start = 0
+        for i in range(count):
+            end = len(words) if i == count - 1 else min(len(words), start + size)
+            piece = " ".join(words[start:end]).strip() or words[-1]
+            chunks.append(piece[:240])
+            start = end
+        return chunks
+    seed = clean or [" ".join(words)]
+    return [seed[i % len(seed)][:240] for i in range(count)]
+
+
+def _pad_shots(shots: list[dict[str, Any]], shot_count: int) -> list[dict[str, Any]]:
+    if shot_count < 1 or not shots:
+        return list(shots)
+    if len(shots) >= shot_count:
+        fitted = [dict(shot) for shot in shots[:shot_count]]
+    else:
+        fitted = [dict(shots[i % len(shots)]) for i in range(shot_count)]
+    for i, shot in enumerate(fitted):
+        shot["id"] = i + 1
+        if len(shots) != shot_count:
+            shot["title"] = f"Shot {i + 1}"
+    return fitted
+
+
 @app.post("/api/upload")
 def upload_video():
     """Forward one video to VSS POST /api/v1/videos/upload. JSON only."""
@@ -2929,6 +3053,22 @@ def upload_video():
         value = _form_value(key)
         if value:
             fields[key] = value
+    try:
+        typed_scenarios = _form_scenarios()
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    if typed_scenarios:
+        try:
+            prompt_choices = _ingest_choices()
+            fields["custom_prompt"] = _scenario_custom_prompt(
+                typed_scenarios,
+                prompt_choices["custom_prompt_max_length"],
+            )
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        except Exception as exc:
+            return jsonify({"error": str(exc), "type": type(exc).__name__}), 502
+        fields.pop("scenario", None)
     if fields.get("custom_prompt"):
         fields.pop("scenario", None)
     if any(key in fields for key in ("scenario", "custom_prompt", "capture_type")):
@@ -3045,21 +3185,11 @@ def expand_brief():
         "beats": str(payload.get("beats") or "").strip()[:2000],
         "transcript": str(payload.get("transcript") or "").strip()[:2000],
     }
-    shot_count = _clamp_shot_count(payload.get("shot_count"))
-    duration_sec = None
-    if payload.get("duration_sec") not in (None, "", 0, "0"):
-        try:
-            duration_sec = float(payload.get("duration_sec"))
-        except (TypeError, ValueError):
-            duration_sec = None
-        else:
-            if duration_sec < 4 or duration_sec > 90:
-                duration_sec = None
     try:
         plan, note, _engine = _expand_direction(
             line,
-            shot_count,
-            duration_sec,
+            4,
+            None,
             context=context,
             allow_heuristic=False,
         )
@@ -3111,9 +3241,30 @@ def upscale():
                 return jsonify({"error": "cut length must be a number of seconds"}), 400
             if duration_sec < 4 or duration_sec > 90:
                 return jsonify({"error": "cut length must be between 4 and 90 seconds"}), 400
-        shot_count = _clamp_shot_count(payload.get("shot_count"))
+        try:
+            shot_count = int(payload.get("shot_count") if payload.get("shot_count") not in (None, "") else 4)
+        except (TypeError, ValueError):
+            shot_count = 4
+        shot_count = max(2, min(_STATED_SHOT_MAX, shot_count))
         seed_from_upload = bool(payload.get("seed_from_upload"))
         upload_tag = (payload.get("upload_tag") or "my-upload").strip() or "my-upload"
+        raw_scenarios = payload.get("scenarios") or []
+        if isinstance(raw_scenarios, str):
+            raw_scenarios = [line for line in raw_scenarios.splitlines()]
+        if not isinstance(raw_scenarios, list):
+            return jsonify({"error": "scenarios must be 1 to 3 lines"}), 400
+        try:
+            scenarios = _clean_scenarios(raw_scenarios)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        # Scenario lines are the reasoner prompt. A shot count or length written
+        # there overrides the Shots and Seconds controls. The controls still win
+        # when the prompt does not state them.
+        stated = _stated_cut_from_prompts("\n".join(scenarios), metaprompt)
+        if stated.get("shot_count"):
+            shot_count = int(stated["shot_count"])
+        if stated.get("duration_sec") is not None:
+            duration_sec = float(stated["duration_sec"])
 
         source_upload = None
         exclude: set[str] = set()
@@ -3123,13 +3274,14 @@ def upscale():
         form_beats = [ln.strip() for ln in beats.splitlines() if ln.strip()]
         form_lines = [ln.strip() for ln in transcript.splitlines() if ln.strip()]
         if metaprompt and use_form and logline and len(form_beats) >= 2 and len(form_lines) >= 2:
-            # Fill the brief already wrote these. The requested shot count still wins:
-            # a 4-line brief must not shrink a 6-shot minute into four stretched clips.
+            # The scenario prompt's shot count wins over a shorter filled brief.
             level_crossing = False
+            beats_list = _lines_to_count(form_beats, shot_count, logline)
+            voice_lines = _lines_to_count(form_lines, shot_count, logline)
             plan = {
                 "logline": logline[:280],
-                "beats": _fit_to_shot_count(form_beats, shot_count, logline, kind="beat"),
-                "voice_lines": _fit_to_shot_count(form_lines, shot_count, logline, kind="voice"),
+                "beats": beats_list,
+                "voice_lines": voice_lines,
             }
             beats_list = list(plan["beats"])
             voice_lines = list(plan["voice_lines"])
@@ -3230,7 +3382,7 @@ def upscale():
                 if not shots:
                     splitter = "heuristic"
                     shots = _heuristic_shots(logline, beats, transcript)
-            shots = _fit_shot_list(shots, shot_count)
+            shots = _pad_shots(shots, shot_count)
 
             # Bias queries toward cinematic archive when seeding from a rough upload.
             if seed_from_upload and plan is None:
@@ -3245,7 +3397,11 @@ def upscale():
             used_sources = set(exclude)
             for shot in shots:
                 try:
-                    matches = _search_shot(shot, exclude_sources=used_sources)
+                    matches = _search_shot(
+                        shot,
+                        exclude_sources=used_sources,
+                        scenarios=scenarios,
+                    )
                 except Exception as e:
                     matches = []
                     shot = {**shot, "search_error": str(e)}
@@ -3270,7 +3426,7 @@ def upscale():
                 cosmos_reason = "fallback"
 
         if not level_crossing and enriched:
-            enriched = _fit_shot_list(enriched, shot_count)
+            enriched = _pad_shots(enriched, shot_count)
             if isinstance(prebuilt, list) and prebuilt:
                 if len(prebuilt) >= shot_count:
                     prebuilt = [dict(item) for item in prebuilt[:shot_count]]
@@ -3278,9 +3434,7 @@ def upscale():
                     prebuilt = [dict(prebuilt[i % len(prebuilt)]) for i in range(shot_count)]
             spoken_lines = [ln for ln in (transcript or "").split("\n") if ln.strip()]
             if len(spoken_lines) != shot_count:
-                transcript = "\n".join(
-                    _fit_to_shot_count(spoken_lines, shot_count, logline, kind="voice")
-                )
+                transcript = "\n".join(_lines_to_count(spoken_lines, shot_count, logline))
 
         directors_cut = []
         ordered: list[dict[str, Any] | None] = []
@@ -3444,6 +3598,9 @@ def upscale():
                 "expand_note": expand_note,
                 "seed_from_upload": seed_from_upload,
                 "upload_tag": upload_tag if seed_from_upload else None,
+                "scenarios": scenarios,
+                "shot_count": shot_count,
+                "duration_sec": duration_sec,
                 "source_upload": source_upload,
                 "vss_url_host": VSS_URL.split("://")[-1].split("/")[0],
                 "shots": enriched,
@@ -3689,23 +3846,6 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .direction-box .actions { margin-top: 10px; }
   #userClipDetails { margin-top: 8px; }
   #userClipDetails summary { cursor: pointer; font-weight: 600; }
-  #uploadSettings {
-    margin-top: 12px;
-    padding: 12px;
-    border-radius: 14px;
-    background: var(--panel-2);
-    border: 1px solid var(--line);
-  }
-  #uploadSettings > summary {
-    cursor: pointer;
-    font-weight: 600;
-    color: var(--ink);
-  }
-  #uploadSettings > .opt {
-    margin-top: 10px;
-    padding: 0;
-    background: transparent;
-  }
   #userClip {
     width: 100%;
     margin-top: 8px;
@@ -3818,16 +3958,16 @@ INDEX_HTML = r"""<!DOCTYPE html>
         <label for="lengthMode">Cut length</label>
         <select id="lengthMode">
           <option value="auto">Automatic</option>
-          <option value="custom" selected>Custom seconds</option>
+          <option value="custom">Custom seconds</option>
         </select>
       </div>
       <div id="lengthWrap">
         <label for="lengthSec">Seconds (4–90)</label>
-        <input id="lengthSec" type="number" min="4" max="90" step="1" value="60" title="Editable when Custom seconds is selected."/>
+        <input id="lengthSec" type="number" min="4" max="90" step="1" value="15" title="Editable when Custom seconds is selected."/>
       </div>
       <div>
         <label for="shotCount">Shots</label>
-        <input id="shotCount" type="number" min="2" max="12" step="1" value="6"/>
+        <input id="shotCount" type="number" min="2" max="12" step="1" value="4"/>
       </div>
       <div>
         <label for="voice">Voice</label>
@@ -3861,6 +4001,55 @@ INDEX_HTML = r"""<!DOCTYPE html>
         <div class="opt" id="uploadBox">
           <label for="uploadFile">Video file</label>
           <input id="uploadFile" type="file" accept=".mp4,.mov,.webm,.avi,.mkv,video/mp4,video/quicktime,video/webm,video/x-msvideo,video/x-matroska"/>
+          <details id="userClipDetails">
+            <summary>Your upload</summary>
+            <video id="userClip" controls playsinline preload="metadata"></video>
+          </details>
+          <label for="uploadPublic">Visibility</label>
+          <select id="uploadPublic">
+            <option value="public" selected>public</option>
+            <option value="private">private</option>
+          </select>
+          <label for="uploadAllowed">Allowed users</label>
+          <input id="uploadAllowed" type="text" value="" placeholder="allowed users"/>
+          <label for="scenarioPreset">Scenarios for the VAST reasoner (1–3)</label>
+          <select id="scenarioPreset">
+            <option value="" selected>Add a pipeline preset…</option>
+            <option value="People, unusual behavior, safety hazards, abandoned objects, or crowds">Incident and safety</option>
+            <option value="Vehicles, traffic flow, pedestrians, congestion, or a near-miss">Traffic</option>
+            <option value="Dashcam road scene: vehicles, cyclists, pedestrians, signs, or a hazard">Live driving</option>
+            <option value="Forklifts, workers, PPE, spills, or dock activity">Warehouse</option>
+            <option value="Customer flow, product handling, queues, or staff activity">Retail</option>
+            <option value="First-person hands, tools, and the task being done">First-person</option>
+            <option value="People, objects, and the main action in the frame">General</option>
+          </select>
+          <input id="scenario1" type="text" value="" placeholder="Scenario 1, for example a person stepping into the road"/>
+          <input id="scenario2" type="text" value="" placeholder="Scenario 2 (optional)"/>
+          <input id="scenario3" type="text" value="" placeholder="Scenario 3 (optional)"/>
+          <label for="uploadTag">Tag</label>
+          <input id="uploadTag" type="text" value="" placeholder="upload tag"/>
+          <label for="uploadLocation">Location</label>
+          <input id="uploadLocation" type="text" value="" placeholder="location"/>
+          <label for="uploadCamera">Camera</label>
+          <input id="uploadCamera" type="text" value="" placeholder="camera id"/>
+          <label for="uploadCapture">Capture type</label>
+          <select id="uploadCapture">
+            <option value="" selected>optional</option>
+            <option value="traffic">traffic</option>
+            <option value="streets">streets</option>
+            <option value="crowds">crowds</option>
+            <option value="malls">malls</option>
+            <option value="general">general</option>
+            <option value="sports">sports</option>
+            <option value="robotics">robotics</option>
+            <option value="warehouse">warehouse</option>
+            <option value="retail">retail</option>
+          </select>
+          <p class="hint">Type 1 to 3 scenarios. Upload sends them as one analysis prompt, so the reasoner describes the clip against those scenarios. If a scenario states a shot count or a length, Recut follows that instead of the Shots and Seconds controls. Indexing usually takes a minute or two. Clips already in the archive keep their old descriptions until they are uploaded or re-ingested with these scenarios.</p>
+          <div class="actions">
+            <button id="uploadBtn" type="button">Upload</button>
+            <span class="status" id="uploadStatus"></span>
+          </div>
         </div>
         <div class="opt">
           <label class="row" for="seed">
@@ -3908,53 +4097,6 @@ INDEX_HTML = r"""<!DOCTYPE html>
           <p class="status" id="cut-empty">Click Recut to cut a reel the same length as your clip, with the VO burned in.</p>
           <video id="cut-video" class="hidden" controls playsinline></video>
         </div>
-        <details id="uploadSettings">
-          <summary>Upload settings</summary>
-          <div class="opt">
-          <details id="userClipDetails">
-            <summary>Your upload</summary>
-            <video id="userClip" controls playsinline preload="metadata"></video>
-          </details>
-          <label for="uploadPublic">Visibility</label>
-          <select id="uploadPublic">
-            <option value="public" selected>public</option>
-            <option value="private">private</option>
-          </select>
-          <label for="uploadAllowed">Allowed users</label>
-          <input id="uploadAllowed" type="text" value="" placeholder="allowed users"/>
-          <label for="uploadPrompt">Analysis prompt</label>
-          <select id="uploadPrompt">
-            <option value="" selected>default</option>
-            <option value="general">general</option>
-            <option value="custom">custom</option>
-          </select>
-          <textarea id="uploadCustom" rows="3" class="hidden" placeholder="custom analysis prompt"></textarea>
-          <label for="uploadTag">Tag</label>
-          <input id="uploadTag" type="text" value="" placeholder="upload tag"/>
-          <label for="uploadLocation">Location</label>
-          <input id="uploadLocation" type="text" value="" placeholder="location"/>
-          <label for="uploadCamera">Camera</label>
-          <input id="uploadCamera" type="text" value="" placeholder="camera id"/>
-          <label for="uploadCapture">Capture type</label>
-          <select id="uploadCapture">
-            <option value="" selected>optional</option>
-            <option value="traffic">traffic</option>
-            <option value="streets">streets</option>
-            <option value="crowds">crowds</option>
-            <option value="malls">malls</option>
-            <option value="general">general</option>
-            <option value="sports">sports</option>
-            <option value="robotics">robotics</option>
-            <option value="warehouse">warehouse</option>
-            <option value="retail">retail</option>
-          </select>
-          <p class="hint">Choose visibility and an analysis prompt, then upload. This does not start a recut. Indexing usually takes a minute or two.</p>
-          <div class="actions">
-            <button id="uploadBtn" type="button">Upload</button>
-            <span class="status" id="uploadStatus"></span>
-          </div>
-          </div>
-        </details>
         <div id="timeline" class="tl hidden"></div>
         <div id="feedback" class="fb hidden">
           <label>I like this shot, not that one</label>
@@ -4063,9 +4205,10 @@ async function runUpscale({ seed, health }) {
         voice: voiceValue,
         bed: bedValue,
         duration_sec: lengthMode === "custom" ? Number(lengthSec) : null,
-        shot_count: Math.min(12, Math.max(2, parseInt(shotCount, 10) || 6)),
+        shot_count: Math.min(12, Math.max(2, parseInt(shotCount, 10) || 4)),
         seed_from_upload: useSeed,
         upload_tag: ($("tag").value || "my-upload").trim(),
+        scenarios: scenarioLines(),
         health_safety: safetyKind || false,
         cc_broll: $("ccbroll").checked,
         use_form_brief: useForm,
@@ -4079,9 +4222,14 @@ async function runUpscale({ seed, health }) {
     state = data;
     active = 0;
     if (metaprompt) showExpanded(data);
-    $("lengthMode").value = lengthMode;
-    $("lengthSec").value = lengthSec;
-    $("shotCount").value = shotCount;
+    if (data.duration_sec) {
+      $("lengthMode").value = "custom";
+      $("lengthSec").value = String(data.duration_sec);
+    } else {
+      $("lengthMode").value = lengthMode;
+      $("lengthSec").value = lengthSec;
+    }
+    $("shotCount").value = data.shot_count ? String(data.shot_count) : shotCount;
     $("voice").value = voiceValue;
     $("bed").value = bedValue;
     $("metaprompt").value = metaprompt;
@@ -4238,8 +4386,6 @@ if ($("expandBtn")) {
           logline: $("logline").value,
           beats: $("beats").value,
           transcript: $("transcript").value,
-          shot_count: Math.min(12, Math.max(2, parseInt(shotCount, 10) || 6)),
-          duration_sec: lengthMode === "custom" ? Number(lengthSec) : null,
         }),
       });
       const raw = await res.text();
@@ -4273,13 +4419,30 @@ if ($("expandBtn")) {
   };
 }
 
-function syncUploadPrompt() {
-  const custom = $("uploadPrompt") && $("uploadPrompt").value === "custom";
-  if ($("uploadCustom")) $("uploadCustom").classList.toggle("hidden", !custom);
+function scenarioLines() {
+  return ["scenario1", "scenario2", "scenario3"]
+    .map((id) => (($(id) && $(id).value) || "").trim())
+    .filter(Boolean);
 }
-if ($("uploadPrompt")) {
-  $("uploadPrompt").onchange = syncUploadPrompt;
-  syncUploadPrompt();
+if ($("scenarioPreset")) {
+  $("scenarioPreset").onchange = () => {
+    const text = $("scenarioPreset").value;
+    if (!text) return;
+    const empty = ["scenario1", "scenario2", "scenario3"]
+      .map((id) => $(id))
+      .find((el) => el && !el.value.trim());
+    if (!empty) {
+      $("uploadStatus").className = "status err";
+      $("uploadStatus").textContent = "Three scenarios already filled.";
+    } else if (scenarioLines().includes(text)) {
+      $("uploadStatus").className = "status err";
+      $("uploadStatus").textContent = "That scenario is already listed.";
+    } else {
+      empty.value = text;
+      if ($("uploadStatus")) $("uploadStatus").textContent = "";
+    }
+    $("scenarioPreset").value = "";
+  };
 }
 function archiveFilename(data) {
   const key = String((data && data.object_key) || "");
@@ -4323,12 +4486,13 @@ if ($("uploadBtn")) {
     if (tag) body.append("tags", tag);
     const allowedUsers = ($("uploadAllowed").value || "").trim();
     if (allowedUsers) body.append("allowed_users", allowedUsers);
-    const prompt = $("uploadPrompt").value;
-    if (prompt === "general") body.append("scenario", "general");
-    if (prompt === "custom") {
-      const custom = ($("uploadCustom").value || "").trim();
-      if (custom) body.append("custom_prompt", custom);
+    const scenarios = scenarioLines();
+    if (scenarios.length > 3) {
+      status.className = "status err";
+      status.textContent = "Give 1 to 3 scenarios.";
+      return;
     }
+    scenarios.forEach((line, index) => body.append("scenario_" + (index + 1), line));
     const location = ($("uploadLocation").value || "").trim();
     if (location) body.append("location", location);
     const camera = ($("uploadCamera").value || "").trim();
