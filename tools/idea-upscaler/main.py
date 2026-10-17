@@ -671,6 +671,42 @@ def _render_same_length_cut(
     }
 
 
+FEEDBACK_PATH = Path("/tmp/idea-feedback.jsonl")
+
+
+@app.post("/api/feedback")
+def save_feedback():
+    payload = request.get_json(force=True, silent=True) or {}
+    verdict = payload.get("verdict") or ""
+    if verdict not in ("works", "close", "wrong"):
+        verdict = ""
+    clips = []
+    for item in (payload.get("clips") or [])[:8]:
+        if not isinstance(item, dict):
+            continue
+        mark = item.get("mark") if item.get("mark") in ("keep", "drop") else "keep"
+        clips.append({
+            "title": str(item.get("title") or "")[:80],
+            "filename": str(item.get("filename") or "")[:120],
+            "start_sec": item.get("start_sec"),
+            "end_sec": item.get("end_sec"),
+            "mark": mark,
+        })
+    row = {
+        "at": time.time(),
+        "cut_id": str(payload.get("cut_id") or "")[:16],
+        "verdict": verdict,
+        "note": str(payload.get("note") or "").strip()[:500],
+        "clips": clips,
+    }
+    if not row["verdict"] and not row["note"] and not any(c["mark"] == "drop" for c in clips):
+        return jsonify({"error": "mark the cut or leave a note"}), 400
+    FEEDBACK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with FEEDBACK_PATH.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(row) + "\n")
+    return jsonify({"ok": True})
+
+
 @app.get("/api/cuts/<cut_id>")
 def serve_cut(cut_id: str):
     if not re.fullmatch(r"[a-f0-9]{12}", cut_id or ""):
@@ -951,6 +987,10 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .tl { display: flex; width: 100%; height: 44px; margin-top: 10px; gap: 2px; }
   .tl button { flex: 1 1 0; min-width: 0; border: none; color: #f7f3ea; font: inherit; font-size: 0.72rem; padding: 4px; cursor: pointer; text-align: left; overflow: hidden; }
   .tl button small { display: block; opacity: 0.85; }
+  .fb { margin-top: 12px; display: grid; gap: 8px; }
+  .fb button.on { outline: 2px solid var(--ink); }
+  .marks { display: flex; flex-direction: column; gap: 4px; }
+  .marks label { text-transform: none; letter-spacing: 0; font-weight: 500; font-size: 0.85rem; color: var(--ink); display: flex; gap: 8px; align-items: center; }
 </style>
 </head>
 <body>
@@ -1021,6 +1061,20 @@ INDEX_HTML = r"""<!DOCTYPE html>
         <p class="status" id="cut-empty">Upscale shittyvideo to cut a reel the same length as your clip, with the VO burned in.</p>
         <video id="cut-video" class="hidden" controls playsinline></video>
         <div id="timeline" class="tl hidden"></div>
+        <div id="feedback" class="fb hidden">
+          <label>Feedback on this cut</label>
+          <div class="actions">
+            <button type="button" class="ghost" data-v="works">Works</button>
+            <button type="button" class="ghost" data-v="close">Close</button>
+            <button type="button" class="ghost" data-v="wrong">Wrong clips</button>
+          </div>
+          <div id="marks" class="marks"></div>
+          <textarea id="fbNote" placeholder="What should change on the next pass?"></textarea>
+          <div class="actions">
+            <button id="fbSend" type="button">Send feedback</button>
+            <span class="status" id="fbStatus"></span>
+          </div>
+        </div>
         <p class="status" id="cut-meta"></p>
         <ol id="cut-list" class="hidden"></ol>
       </div>
@@ -1042,6 +1096,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
 const $ = (id) => document.getElementById(id);
 let state = null;
 let active = 0;
+let verdict = "";
 
 function setProgress(steps, activeIdx) {
   const el = $("progress");
@@ -1136,6 +1191,48 @@ $("lengthMode").onchange = () => {
 };
 $("go").onclick = () => runUpscale({ seed: false });
 
+document.querySelectorAll("#feedback [data-v]").forEach(btn => {
+  btn.onclick = () => {
+    verdict = btn.dataset.v;
+    document.querySelectorAll("#feedback [data-v]").forEach(b => b.classList.toggle("on", b === btn));
+  };
+});
+$("fbSend").onclick = async () => {
+  const reel = state && state.rendered_cut;
+  if (!reel) return;
+  const rows = reel.timeline || [];
+  const clips = rows.map((row, i) => {
+    const sel = document.querySelector(`#marks select[data-i="${i}"]`);
+    return {
+      title: row.title,
+      filename: row.filename,
+      start_sec: row.start_sec,
+      end_sec: row.end_sec,
+      mark: sel ? sel.value : "keep",
+    };
+  });
+  $("fbStatus").className = "status";
+  $("fbStatus").textContent = "Sending…";
+  try {
+    const res = await fetch("/app/api/feedback", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({
+        cut_id: reel.id,
+        verdict,
+        note: $("fbNote").value,
+        clips,
+      }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || res.statusText);
+    $("fbStatus").textContent = "Saved. Next pass can use the drops.";
+  } catch (e) {
+    $("fbStatus").className = "status err";
+    $("fbStatus").textContent = String(e.message || e);
+  }
+};
+
 function render() {
   const results = $("results");
   results.classList.remove("hidden");
@@ -1189,9 +1286,21 @@ function render() {
       tl.innerHTML = "";
     }
     $("cut-meta").textContent = `${reel.target_duration_sec}s · ${reel.pieces} shots` + (reel.vo ? " · voice over quieter footage audio" : " · footage audio only");
+    const fb = $("feedback");
+    fb.classList.remove("hidden");
+    $("marks").innerHTML = rows.map((row, i) => `
+      <label><span>${escapeHtml(row.title)} ${fmtTime(row.start_sec)}–${fmtTime(row.end_sec)}</span>
+        <select data-i="${i}">
+          <option value="keep">Keep</option>
+          <option value="drop">Drop next time</option>
+        </select>
+      </label>`).join("");
+    $("fbStatus").textContent = "";
   } else {
     vid.classList.add("hidden");
     vid.removeAttribute("src");
+    $("timeline").classList.add("hidden");
+    $("feedback").classList.add("hidden");
     $("cut-meta").textContent = state.render_error || "";
   }
   const cut = state.directors_cut || [];
