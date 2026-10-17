@@ -1262,7 +1262,7 @@ def _assemble_level_crossing() -> tuple[list[dict[str, Any]], list[dict[str, Any
 # Cosmos3-Reason chat. The skill builds this URL when COSMOS3_REASON_URL is unset.
 _COSMOS_REASON_FALLBACK_URL = "http://166.19.38.112:8001"
 _cosmos_model_lock = threading.Lock()
-_cosmos_model_id: str | None = None
+_cached_cosmos_model: str | None = None
 
 
 def _resolve_cosmos_reason_url() -> str:
@@ -1310,7 +1310,7 @@ def _gpu_bearer() -> str:
 
 def _cosmos_model_id(url: str, token: str) -> str:
     """Model id from COSMOS3_REASON_MODEL, else the id /v1/models returns."""
-    global _cosmos_model_id
+    global _cached_cosmos_model
     configured = (os.environ.get("COSMOS3_REASON_MODEL") or "").strip()
     if not configured:
         try:
@@ -1325,8 +1325,8 @@ def _cosmos_model_id(url: str, token: str) -> str:
     if configured:
         return configured
     with _cosmos_model_lock:
-        if _cosmos_model_id:
-            return _cosmos_model_id
+        if _cached_cosmos_model:
+            return _cached_cosmos_model
         response = requests.get(
             f"{url}/v1/models",
             headers={"Authorization": f"Bearer {token}"},
@@ -1336,8 +1336,8 @@ def _cosmos_model_id(url: str, token: str) -> str:
         model_id = str((response.json().get("data") or [{}])[0].get("id") or "").strip()
         if not model_id:
             raise RuntimeError("cosmos model id missing")
-        _cosmos_model_id = model_id
-        return _cosmos_model_id
+        _cached_cosmos_model = model_id
+        return _cached_cosmos_model
 
 
 def _cosmos_chat(system_text: str, user_text: str) -> str | None:
@@ -1432,6 +1432,13 @@ def _matches_brief_place(match: dict[str, Any], *, level_crossing: bool, brief: 
             return bool(_RAIL_OK_RE.search(blob))
         return _archive_is_level_crossing(match)
     brief_l = brief.lower()
+    place = f"{match.get('location') or ''} {match.get('camera_id') or ''}".lower()
+    wants_sf = "san francisco" in brief_l
+    wants_ny = "new york" in brief_l or "nyc" in brief_l
+    if wants_sf and not wants_ny and any(token in place for token in ("new_york", "nyc_")):
+        return False
+    if wants_ny and not wants_sf and any(token in place for token in ("san_francisco", "sf_")):
+        return False
     streetish = any(word in brief_l for word in ("street", "crosswalk", "bike", "cyclist", "highway", "traffic"))
     warehouseish = any(word in brief_l for word in ("warehouse", "forklift", "aisle"))
     if streetish and not warehouseish and re.search(r"forklift|warehouse aisle", blob, re.I):
@@ -1506,9 +1513,13 @@ def _apply_cosmos_reason(
     if prebuilt is not None and len(prebuilt) != len(enriched):
         return enriched, prebuilt, transcript, "fallback"
     candidates = _cosmos_candidates(enriched, per_shot=1 if prebuilt is not None else 2)
+    brief = " ".join(part.strip() for part in (logline, beats) if part and part.strip())[:900]
+    candidates = [
+        cand for cand in candidates
+        if _matches_brief_place(cand["match"], level_crossing=level_crossing, brief=brief)
+    ]
     if not candidates:
         return enriched, prebuilt, transcript, "fallback"
-    brief = " ".join(part.strip() for part in (logline, beats) if part and part.strip())[:900]
     word_cap = 10 if duration_sec and duration_sec <= 15 else 16
     place_rule = (
         "This is a level-crossing safety film. Every chosen shot must be a railway level crossing. "
