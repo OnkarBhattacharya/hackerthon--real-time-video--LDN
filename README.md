@@ -1,68 +1,63 @@
-# LDN Video Ask
+# Near-miss investigation
 
-Hackathon app for the **VAST Builders Challenge**: ask the team’s indexed video archive in plain language, get a grounded answer, and play the evidence clips.
+Searches an indexed VAST video archive for close approaches between people and moving vehicles, ranks the hits, and shows the clips with an English report, a German report, and a ticket payload.
 
-Built on the **pre-running VSS stack** (skills: `retrieval/login`, `retrieval/agent-qa`, `retrieval/videos`, `retrieval/suggest-prompts`). No custom FFmpeg / YOLO / local ingest pipeline.
+The running VSS stack does the search. This app does not ingest video or run a local detector.
 
-## What it does
+## How it works
 
-1. Logs into the team VSS backend with env credentials
-2. Calls `POST /api/v1/agent/search-and-answer` for Q&A + chunk evidence
-3. Streams matching segments via `GET /api/v1/videos/stream` (proxied)
-4. Seeds the UI with `GET /api/v1/suggestions` and browse via `GET /api/v1/videos/explore`
+An investigation job searches each indexed camera, keeps the strongest segments, scores severity from the description and detections, then attaches the previous, event, and next clips plus privacy flags.
 
-## App code
+## Architecture
 
 ```text
-tools/video-ask/
-├── main.py          # Flask UI + /api/ask|suggestions|explore|stream
-├── vss_client.py    # JWT login + VSS calls
-├── index.html
-├── app.js
-├── style.css
-└── requirements.txt
+Browser (frontend/, relative URLs)
+   -> FastAPI (backend/main.py, also at ingress /app)
+        investigate job -> vss.py (login, search, explore, stream)
+                        -> ranking.py (W&B JSON, or rules if unset)
+                        -> evidence.py (neighbour clips, privacy flags)
+        reports.py (English report, German text, ticket payload)
+VAST VSS archive: search, segment fields, clips
 ```
 
-## Deploy (required deliverable)
-
-Per `deployment/deploy-app-no-registry`, the app runs on the team Kubernetes namespace at Ingress path `/app`.
+## Run locally
 
 ```bash
-# from repo root, with /config/<team>.config and kubeconfig present
-export KUBECONFIG=/config/${USERNAME}-k8s.yaml
-APP_DIR=tools/video-ask
-APP_NAME=hackathon-app
-NS="$USERNAME"
-TEAM_N="${USERNAME#team-}"
-APP_HOST="video-lab-team-${TEAM_N}.cosmos.vastdata.com"
-
-kubectl -n "$NS" create configmap "${APP_NAME}-code" \
-  --from-file="$APP_DIR" \
-  --dry-run=client -o yaml | kubectl apply -f -
-
-# Prefer the in-cluster backend — pods often cannot resolve the public Ingress DNS.
-kubectl -n "$NS" create secret generic "${APP_NAME}-vss-creds" \
-  --from-literal=VSS_URL="http://video-backend-service:8000" \
-  --from-literal=VSS_USERNAME="$USERNAME" \
-  --from-literal=VSS_PASSWORD="$PASSWORD" \
-  --dry-run=client -o yaml | kubectl apply -f -
+uv venv .venv
+uv pip install --python .venv/bin/python -r requirements.txt
+# Live archive
+export VSS_URL="$INGRESS_URL"   # or the in-cluster video-backend URL
+export VSS_USERNAME="$USERNAME"
+export VSS_PASSWORD="$PASSWORD"
+# Optional: WANDB_API_KEY, WANDB_BASE_URL, WANDB_MODEL, TICKET_WEBHOOK_URL
+PORT=8080 .venv/bin/python -m backend.main
 ```
 
-Then apply Deployment / Service / Ingress from the deploy skill (path `/app`, rewrite to `/`).
-
-**Open the app:** [https://workshop.thecosmoslabs.com](https://workshop.thecosmoslabs.com) → **App** (not `$INGRESS_URL`).
-
-## Local smoke (optional)
+Without archive credentials, the same server can use the labelled sample set:
 
 ```bash
-cd tools/video-ask
-pip install -r requirements.txt
-# uses INGRESS_URL / USERNAME / PASSWORD already in the VM env
-PORT=8080 python main.py
+VSS_USE_FIXTURE=1 PORT=8080 .venv/bin/python -m backend.main
 ```
 
-## Out of scope (by design)
+Open `/`. Behind the team ingress the same routes are served at `/app` because the app does not hard-code that prefix.
 
-- Rebuilding ingest / embed / YOLO locally
-- Internet / YouTube video upload
-- Heavy Node frontend (ConfigMap size limit ~1 MiB)
+`pytest` uses the fixture and does not call the archive:
+
+```bash
+.venv/bin/python -m pytest
+```
+
+## Deploy
+
+Not deployed from this machine. The team kubeconfig, `INGRESS_URL`, and login variables are not present here. On the team VM, follow `deployment/deploy-app-no-registry`: team namespace, no image build, ingress path `/app`. Until that is done, run the server on the VM and open the local port.
+
+`tools/video-ask/` is the earlier ask UI and is unchanged.
+
+## Limits
+
+- Crop is unavailable. Cards show clips only.
+- Audio transcripts are out of scope.
+- With no `WANDB_API_KEY`, severity is rule-based and the German report is a template. Both say so.
+- With no `TICKET_WEBHOOK_URL`, Create ticket returns JSON for download and does not POST.
+- Neighbour clips are omitted, and labelled, when the archive does not return them.
+- Fixture mode is sample data, not the indexed archive.
