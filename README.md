@@ -1,100 +1,68 @@
-# Hackerthon — Real-Time Video (LDN)
+# LDN Video Ask
 
-**Repository:** [github.com/ahmedm87/hackerthon--real-time-video--LDN](https://github.com/ahmedm87/hackerthon--real-time-video--LDN)
+Hackathon app for the **VAST Builders Challenge**: ask the team’s indexed video archive in plain language, get a grounded answer, and play the evidence clips.
+
+Built on the **pre-running VSS stack** (skills: `retrieval/login`, `retrieval/agent-qa`, `retrieval/videos`, `retrieval/suggest-prompts`). No custom FFmpeg / YOLO / local ingest pipeline.
+
+## What it does
+
+1. Logs into the team VSS backend with env credentials
+2. Calls `POST /api/v1/agent/search-and-answer` for Q&A + chunk evidence
+3. Streams matching segments via `GET /api/v1/videos/stream` (proxied)
+4. Seeds the UI with `GET /api/v1/suggestions` and browse via `GET /api/v1/videos/explore`
+
+## App code
+
+```text
+tools/video-ask/
+├── main.py          # Flask UI + /api/ask|suggestions|explore|stream
+├── vss_client.py    # JWT login + VSS calls
+├── index.html
+├── app.js
+├── style.css
+└── requirements.txt
+```
+
+## Deploy (required deliverable)
+
+Per `deployment/deploy-app-no-registry`, the app runs on the team Kubernetes namespace at Ingress path `/app`.
 
 ```bash
-git clone https://github.com/ahmedm87/hackerthon--real-time-video--LDN.git
-cd hackerthon--real-time-video--LDN
+# from repo root, with /config/<team>.config and kubeconfig present
+export KUBECONFIG=/config/${USERNAME}-k8s.yaml
+APP_DIR=tools/video-ask
+APP_NAME=hackathon-app
+NS="$USERNAME"
+TEAM_N="${USERNAME#team-}"
+APP_HOST="video-lab-team-${TEAM_N}.cosmos.vastdata.com"
+
+kubectl -n "$NS" create configmap "${APP_NAME}-code" \
+  --from-file="$APP_DIR" \
+  --dry-run=client -o yaml | kubectl apply -f -
+
+# Prefer the in-cluster backend — pods often cannot resolve the public Ingress DNS.
+kubectl -n "$NS" create secret generic "${APP_NAME}-vss-creds" \
+  --from-literal=VSS_URL="http://video-backend-service:8000" \
+  --from-literal=VSS_USERNAME="$USERNAME" \
+  --from-literal=VSS_PASSWORD="$PASSWORD" \
+  --dry-run=client -o yaml | kubectl apply -f -
 ```
 
-Browser UI (**Vite + TypeScript → `web/dist/`**, served by FastAPI) over a video ingest, indexing, agent, and localization pipeline.
+Then apply Deployment / Service / Ingress from the deploy skill (path `/app`, rewrite to `/`).
 
-## Architecture
+**Open the app:** [https://workshop.thecosmoslabs.com](https://workshop.thecosmoslabs.com) → **App** (not `$INGRESS_URL`).
 
-```
-Browser (Vite TS → dist/)
-  POST /api/ask, /api/localize, /api/ingest
-  GET  /api/status/{vid}, /media/*
-        ↓
-FastAPI (app/main.py)
-├── IngestService (ingest.py, BackgroundTasks)
-│     → FfmpegService (ffmpeg.py)
-│     → ModelClient (models.py)
-│     → YoloService (yolo.py)
-│     → MomentStore (store.py → data/<vid>/index.json)
-├── AgentService (agent.py)
-│     → tools: search_moments, query_detections, ask_vision, localize_moment
-└── LocalizeService (localize.py)
-      → clip + ASR + translate + VTT (+ optional TTS dub)
-```
-
-Processed assets live under `data/<vid>/` (`chunks/`, `frames/`, `dubs/`, `index.json`) and are exposed read-only at `/media`.
-
-## Requirements
-
-- Python 3.11+
-- Node 20+
-- `ffmpeg` / `ffprobe` on `PATH`
-
-Optional (see `requirements-ml.txt`):
-
-- `ultralytics` — in-process YOLO
-- `faster-whisper` — ASR
-- `edge-tts` — German TTS dubs
-
-## Setup
+## Local smoke (optional)
 
 ```bash
-python3 -m venv .venv   # on Debian: sudo apt install python3-venv
-source .venv/bin/activate
+cd tools/video-ask
 pip install -r requirements.txt
-# optional ML stack:
-# pip install -r requirements-ml.txt
-
-cd web && npm install && npm run build && cd ..
+# uses INGRESS_URL / USERNAME / PASSWORD already in the VM env
+PORT=8080 python main.py
 ```
 
-Copy `.env.example` to `.env` and add keys when you want live models (mock fallbacks work without keys).
+## Out of scope (by design)
 
-## Run
-
-**Production-style (static UI + API on one port):**
-
-```bash
-source .venv/bin/activate
-./scripts/dev.sh
-# or: uvicorn app.main:app --host 0.0.0.0 --port 8765
-```
-
-Open http://127.0.0.1:8765
-
-**Frontend hot reload (proxied to API):**
-
-```bash
-# terminal 1
-uvicorn app.main:app --port 8765 --reload
-# terminal 2
-cd web && npm run dev   # http://127.0.0.1:4317
-```
-
-## API
-
-| Method | Path | Description |
-|--------|------|-------------|
-| POST | `/api/ingest` | Multipart `file` and/or form `source_url`, optional `vid` |
-| GET | `/api/status/{vid}` | Ingest progress + index counts |
-| POST | `/api/ask` | JSON `{ "vid", "question" }` — agent tool loop |
-| POST | `/api/localize` | JSON `{ "vid", "moment_id", "target_lang" }` |
-| GET | `/api/localize/{vid}/{moment_id}` | Localization job status |
-| GET | `/media/{vid}/...` | Static processed media |
-
-## Environment
-
-| Variable | Purpose |
-|----------|---------|
-| `ANTHROPIC_API_KEY` | Vision captions, LLM agent, translation |
-| `OPENAI_API_KEY` | Text embeddings for moment search |
-| `DATA_DIR` | Default `data/` |
-| `ENABLE_YOLO` | `true`/`false` (default true) |
-| `ENABLE_WHISPER` | ASR for localization |
-| `ENABLE_TTS` | Edge TTS dub track |
+- Rebuilding ingest / embed / YOLO locally
+- Internet / YouTube video upload
+- Heavy Node frontend (ConfigMap size limit ~1 MiB)

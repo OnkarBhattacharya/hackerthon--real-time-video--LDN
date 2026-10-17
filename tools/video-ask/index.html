@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>LDN Video Ask</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,600;9..144,700&family=Sora:wght@400;600&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header>
+        <h1 class="brand">LDN Video Ask</h1>
+        <p class="tag">
+          Ask the team&rsquo;s indexed footage in plain language. Get a grounded answer and jump to the matching clips.
+        </p>
+      </header>
+
+      <section class="ask-block" aria-label="Ask">
+        <div class="ask-row">
+          <textarea
+            id="question"
+            placeholder="e.g. pedestrians crossing near a delivery truck"
+          ></textarea>
+          <button class="primary" id="askBtn" type="button">Ask</button>
+        </div>
+        <div class="chips" id="chips" aria-label="Suggested prompts"></div>
+        <p class="status" id="status" role="status"></p>
+      </section>
+
+      <section class="layout">
+        <article class="panel">
+          <h2>Answer</h2>
+          <p class="answer" id="answer">Ask something to search the archive.</p>
+          <div class="clips" id="clips"></div>
+        </article>
+        <aside class="panel">
+          <h2>In the index</h2>
+          <div class="explore-grid" id="explore"></div>
+        </aside>
+      </section>
+
+      <p class="tiny">
+        Backed by VSS search-and-answer · evidence clips streamed from the team index · no custom ingest pipeline
+      </p>
+    </main>
+    <script src="./app.js"></script>
+  </body>
+</html>
