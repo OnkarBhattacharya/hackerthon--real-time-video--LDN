@@ -684,7 +684,8 @@ def save_feedback():
     for item in (payload.get("clips") or [])[:8]:
         if not isinstance(item, dict):
             continue
-        mark = item.get("mark") if item.get("mark") in ("keep", "drop") else "keep"
+        raw_mark = item.get("mark")
+        mark = "like" if raw_mark in ("like", "keep") else "no" if raw_mark in ("no", "drop") else ""
         clips.append({
             "title": str(item.get("title") or "")[:80],
             "filename": str(item.get("filename") or "")[:120],
@@ -699,8 +700,8 @@ def save_feedback():
         "note": str(payload.get("note") or "").strip()[:500],
         "clips": clips,
     }
-    if not row["verdict"] and not row["note"] and not any(c["mark"] == "drop" for c in clips):
-        return jsonify({"error": "mark the cut or leave a note"}), 400
+    if not row["note"] and not any(c["mark"] for c in clips):
+        return jsonify({"error": "say which shots you like"}), 400
     FEEDBACK_PATH.parent.mkdir(parents=True, exist_ok=True)
     with FEEDBACK_PATH.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(row) + "\n")
@@ -989,8 +990,10 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .tl button small { display: block; opacity: 0.85; }
   .fb { margin-top: 12px; display: grid; gap: 8px; }
   .fb button.on { outline: 2px solid var(--ink); }
-  .marks { display: flex; flex-direction: column; gap: 4px; }
-  .marks label { text-transform: none; letter-spacing: 0; font-weight: 500; font-size: 0.85rem; color: var(--ink); display: flex; gap: 8px; align-items: center; }
+  .marks { display: flex; flex-direction: column; gap: 6px; }
+  .shot-fb { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+  .shot-fb span { flex: 1 1 140px; font-size: 0.85rem; }
+  .shot-fb button.on { outline: 2px solid var(--ink); background: #fff; }
 </style>
 </head>
 <body>
@@ -1062,14 +1065,9 @@ INDEX_HTML = r"""<!DOCTYPE html>
         <video id="cut-video" class="hidden" controls playsinline></video>
         <div id="timeline" class="tl hidden"></div>
         <div id="feedback" class="fb hidden">
-          <label>Feedback on this cut</label>
-          <div class="actions">
-            <button type="button" class="ghost" data-v="works">Works</button>
-            <button type="button" class="ghost" data-v="close">Close</button>
-            <button type="button" class="ghost" data-v="wrong">Wrong clips</button>
-          </div>
+          <label>I like this shot, not that one</label>
           <div id="marks" class="marks"></div>
-          <textarea id="fbNote" placeholder="What should change on the next pass?"></textarea>
+          <textarea id="fbNote" placeholder="Optional. Why that shot and not the other."></textarea>
           <div class="actions">
             <button id="fbSend" type="button">Send feedback</button>
             <span class="status" id="fbStatus"></span>
@@ -1202,13 +1200,13 @@ $("fbSend").onclick = async () => {
   if (!reel) return;
   const rows = reel.timeline || [];
   const clips = rows.map((row, i) => {
-    const sel = document.querySelector(`#marks select[data-i="${i}"]`);
+    const on = document.querySelector(`#marks .shot-fb[data-i="${i}"] button.on`);
     return {
       title: row.title,
       filename: row.filename,
       start_sec: row.start_sec,
       end_sec: row.end_sec,
-      mark: sel ? sel.value : "keep",
+      mark: on ? on.dataset.mark : "",
     };
   });
   $("fbStatus").className = "status";
@@ -1226,7 +1224,9 @@ $("fbSend").onclick = async () => {
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || res.statusText);
-    $("fbStatus").textContent = "Saved. Next pass can use the drops.";
+    const liked = clips.filter(c => c.mark === "like").map(c => c.title);
+    const nope = clips.filter(c => c.mark === "no").map(c => c.title);
+    $("fbStatus").textContent = `Saved. Like: ${liked.join(", ") || "none"}. Not this one: ${nope.join(", ") || "none"}.`;
   } catch (e) {
     $("fbStatus").className = "status err";
     $("fbStatus").textContent = String(e.message || e);
@@ -1289,12 +1289,17 @@ function render() {
     const fb = $("feedback");
     fb.classList.remove("hidden");
     $("marks").innerHTML = rows.map((row, i) => `
-      <label><span>${escapeHtml(row.title)} ${fmtTime(row.start_sec)}–${fmtTime(row.end_sec)}</span>
-        <select data-i="${i}">
-          <option value="keep">Keep</option>
-          <option value="drop">Drop next time</option>
-        </select>
-      </label>`).join("");
+      <div class="shot-fb" data-i="${i}">
+        <span>${escapeHtml(row.title)} ${fmtTime(row.start_sec)}–${fmtTime(row.end_sec)}</span>
+        <button type="button" class="ghost" data-mark="like">I like this</button>
+        <button type="button" class="ghost" data-mark="no">Not this one</button>
+      </div>`).join("");
+    $("marks").querySelectorAll("button").forEach(btn => {
+      btn.onclick = () => {
+        const row = btn.parentElement;
+        row.querySelectorAll("button").forEach(b => b.classList.toggle("on", b === btn));
+      };
+    });
     $("fbStatus").textContent = "";
   } else {
     vid.classList.add("hidden");
