@@ -1,5 +1,26 @@
 # Progress
 
+## Stage 6
+
+Click-through on `http://127.0.0.1:8090` with `VSS_USE_FIXTURE=1` (the server that was already running).
+
+- Empty state says what Investigate does. The status line showed 7 indexed segments and the snapshot time `2026-10-17T11:29:04.892078+00:00`.
+- Investigate with the default query. The button stayed disabled while the steps updated: searching `wh-cam-1`, `road-cam-2`, and `yard-cam-3`, then ranking 7 candidates and assembling evidence.
+- Six hits in three groups: Warehouse aisle 2 / `wh-cam-1`, Street east / `road-cam-2`, Yard gate / `yard-cam-3`. Badges show the number and the word. Rule-based hits say the score did not come from the model. The event player has a dark outline. `seg-road-2` shows "No after segment for this video."
+- Before, Event, and After reached `readyState` 4 and played. Nothing autoplays.
+- English report for `seg-wh-1` downloaded as `seg-wh-1-en.txt`. The German report cites `seg-wh-1` and includes "Zur manuellen Prüfung; keine Rechtsberatung." The ticket downloaded as `seg-wh-1-ticket.json` with `posted: false`.
+- A blank query sent `person close to a moving vehicle`.
+- At 390px the page did not overflow. Buttons stayed 44px tall and stacked. Videos stayed inside the viewport.
+- Reload showed the new last-run time `2026-10-17T11:41:08.993940+00:00`.
+
+Fixed while matching the spec: query placeholder, blank input sends the default, API paths follow the current directory (including `/index.html` and a prefix such as `/app`), skipped cameras come from the job payload and the step text, report and ticket failures stay on the card, and the query box and buttons use a visible focus outline.
+
+Copy in this embedded browser falls back to "Select the text to copy" because the document is not focused (`NotAllowedError`). The report text stays in the panel. A focused window uses the clipboard API.
+
+This fixture run did not skip a camera. The page still prints a camera named in `skipped_cameras` or in a "Skipping camera …" step.
+
+Crop and audio are off. Ranking and German text use the template fallback because `WANDB_API_KEY` is unset. Tickets are download-only.
+
 ## Stage 5–6 on `feat/stage-5-api`
 
 The investigation API and one-page UI are implemented. Stages 1–4 are the `backend/` modules the job calls (`vss.py`, `candidates.py`, `ranking.py`, `evidence.py`, `reports.py`). They were not present when this branch started.

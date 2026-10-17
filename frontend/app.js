@@ -7,6 +7,8 @@ const skippedEl = document.getElementById("skipped");
 const emptyEl = document.getElementById("empty");
 const resultsEl = document.getElementById("results");
 
+const DEFAULT_QUERY = "person close to a moving vehicle";
+
 const SEVERITY = {
   1: "none",
   2: "distant",
@@ -24,8 +26,22 @@ const ROLES = [
 let pollToken = 0;
 
 function apiUrl(path) {
-  const base = window.location.pathname.replace(/\/?$/, "/");
-  return base + String(path || "").replace(/^\//, "");
+  const relative = String(path || "").replace(/^\//, "");
+  let dir = window.location.pathname;
+  const leaf = dir.split("/").pop() || "";
+  if (!dir.endsWith("/")) {
+    if (/\.[a-z0-9]+$/i.test(leaf)) {
+      dir = dir.slice(0, dir.lastIndexOf("/") + 1);
+    } else {
+      dir += "/";
+    }
+  }
+  return dir + relative;
+}
+
+function queryText() {
+  const text = queryEl.value.trim();
+  return text || DEFAULT_QUERY;
 }
 
 function sleep(ms) {
@@ -71,7 +87,15 @@ function showError(error, hint) {
   const title = document.createElement("p");
   title.textContent = error || "The investigation failed.";
   const next = document.createElement("p");
-  next.textContent = (hint || "Run Investigate again.") + " You can run Investigate again.";
+  const hintText = String(hint || "").trim();
+  const retry = "You can run Investigate again.";
+  if (!hintText) {
+    next.textContent = retry;
+  } else if (hintText.toLowerCase().indexOf("investigate again") === -1) {
+    next.textContent = hintText + " " + retry;
+  } else {
+    next.textContent = hintText;
+  }
   errorEl.appendChild(title);
   errorEl.appendChild(next);
 }
@@ -90,15 +114,35 @@ function renderSteps(steps) {
   }
 }
 
-function renderSkipped(steps) {
-  const skipped = steps.filter((step) => step.indexOf("Skipping camera ") === 0);
-  if (!skipped.length) {
+function skippedCameras(job) {
+  const found = [];
+  const seen = new Set();
+  const add = (name) => {
+    const id = String(name || "").trim();
+    if (!id || seen.has(id)) return;
+    seen.add(id);
+    found.push(id);
+  };
+  for (const id of job.skipped_cameras || []) add(id);
+  for (const step of job.steps || []) {
+    if (step.indexOf("Skipping camera ") === 0) {
+      add(step.slice("Skipping camera ".length).split(";")[0]);
+    }
+  }
+  return found;
+}
+
+function renderSkipped(job) {
+  const names = skippedCameras(job);
+  if (!names.length) {
     skippedEl.hidden = true;
     skippedEl.textContent = "";
     return;
   }
   skippedEl.hidden = false;
-  skippedEl.textContent = skipped.join(" ");
+  skippedEl.textContent = names
+    .map((id) => id + " is not indexed and was skipped.")
+    .join(" ");
 }
 
 function safeClipUrl(url) {
@@ -277,30 +321,41 @@ function actionButton(card, hit, label, lang) {
 }
 
 async function openReport(card, hit, lang) {
-  const response = await fetch(apiUrl("api/hits/" + encodeURIComponent(hit.segment_id) + "/report?lang=" + lang), {
-    method: "POST",
-  });
-  const body = await response.json();
-  if (!response.ok) {
-    showPanel(card, lang === "de" ? "Bericht (Deutsch)" : "Report (English)", (body.error || "Report failed.") + "\n" + (body.hint || ""), safeName(hit.segment_id) + "-" + lang + ".txt", "text/plain");
-    return;
+  const title = lang === "de" ? "Bericht (Deutsch)" : "Report (English)";
+  const filename = safeName(hit.segment_id) + "-" + lang + ".txt";
+  try {
+    const response = await fetch(apiUrl("api/hits/" + encodeURIComponent(hit.segment_id) + "/report?lang=" + lang), {
+      method: "POST",
+    });
+    const body = await response.json();
+    if (!response.ok) {
+      showPanel(card, title, (body.error || "Report failed.") + "\n" + (body.hint || ""), filename, "text/plain");
+      return;
+    }
+    const heading = title + (body.source === "template" && lang === "de" ? " · template" : "");
+    showPanel(card, heading, body.text || "", filename, "text/plain");
+  } catch (_err) {
+    showPanel(card, title, "The report request failed.\nCheck that the server is running and try again.", filename, "text/plain");
   }
-  const title = (lang === "de" ? "Bericht (Deutsch)" : "Report (English)") + (body.source === "template" && lang === "de" ? " · template" : "");
-  showPanel(card, title, body.text || "", safeName(hit.segment_id) + "-" + lang + ".txt", "text/plain");
 }
 
 async function openTicket(card, hit) {
-  const response = await fetch(apiUrl("api/hits/" + encodeURIComponent(hit.segment_id) + "/ticket"), {
-    method: "POST",
-  });
-  const body = await response.json();
-  if (!response.ok) {
-    showPanel(card, "Create ticket", (body.error || "Ticket failed.") + "\n" + (body.hint || ""), safeName(hit.segment_id) + "-ticket.txt", "text/plain");
-    return;
+  const filename = safeName(hit.segment_id) + "-ticket.json";
+  try {
+    const response = await fetch(apiUrl("api/hits/" + encodeURIComponent(hit.segment_id) + "/ticket"), {
+      method: "POST",
+    });
+    const body = await response.json();
+    if (!response.ok) {
+      showPanel(card, "Create ticket", (body.error || "Ticket failed.") + "\n" + (body.hint || ""), filename, "application/json");
+      return;
+    }
+    const text = JSON.stringify(body, null, 2);
+    const title = body.posted ? "Ticket posted" : "Ticket payload";
+    showPanel(card, title, text, filename, "application/json");
+  } catch (_err) {
+    showPanel(card, "Create ticket", "The ticket request failed.\nCheck that the server is running and try again.", filename, "application/json");
   }
-  const text = JSON.stringify(body, null, 2);
-  const title = body.posted ? "Ticket posted" : "Ticket payload";
-  showPanel(card, title, text, safeName(hit.segment_id) + "-ticket.json", "application/json");
 }
 
 function renderHits(hits) {
@@ -339,12 +394,13 @@ async function investigate() {
   emptyEl.hidden = true;
   clearNode(resultsEl);
   clearNode(stepsEl);
+  renderSkipped({});
   investigateBtn.disabled = true;
   try {
     const response = await fetch(apiUrl("api/investigate"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ query: queryEl.value }),
+      body: JSON.stringify({ query: queryText() }),
     });
     const body = await response.json();
     if (!response.ok) {
@@ -359,7 +415,7 @@ async function investigate() {
         return;
       }
       renderSteps(job.steps || []);
-      renderSkipped(job.steps || []);
+      renderSkipped(job);
       if (job.status === "succeeded") {
         renderHits(job.hits || []);
         await loadStatus();
