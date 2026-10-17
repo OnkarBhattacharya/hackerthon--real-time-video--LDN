@@ -632,6 +632,10 @@ NEURAL_VOICES = {
 }
 VOICE_ALIASES = {espeak: neural for neural, espeak in NEURAL_VOICES.items()}
 DEFAULT_VOICE = "en-US-JennyNeural"
+# The shot control drives the cut. 6 × 10s is the one-minute demo, not a hard cap.
+MIN_SHOT_COUNT = 2
+MAX_SHOT_COUNT = 12
+DEFAULT_SHOT_COUNT = 6
 
 COMMONS_API = "https://commons.wikimedia.org/w/api.php"
 COMMONS_UA = "IdeaUpscaler/1.0 (educational video cut; VAST builders challenge)"
@@ -1652,6 +1656,15 @@ def _parse_direction_plan(
     return {"logline": logline, "beats": clean_beats, "voice_lines": clean_lines}
 
 
+def _clamp_shot_count(value: Any, default: int = DEFAULT_SHOT_COUNT) -> int:
+    """The number the user asked for, inside the range the cutter can render."""
+    try:
+        count = int(value) if value not in (None, "") else default
+    except (TypeError, ValueError):
+        count = default
+    return max(MIN_SHOT_COUNT, min(MAX_SHOT_COUNT, count))
+
+
 def _heuristic_direction(line: str, shot_count: int) -> dict[str, Any]:
     """No model. The typed line is the logline, split into the shot count."""
     raw = re.sub(r"\s+", " ", line or "").strip()
@@ -1667,6 +1680,7 @@ def _heuristic_direction(line: str, shot_count: int) -> dict[str, Any]:
             "pedestrians beside night traffic in New York",
             "dusk traffic along a Manhattan avenue",
             "a stop on a New York sidewalk after dark",
+            "the next block of the New York night ride",
         ]
         voices = [
             "A nighttime ride through New York.",
@@ -1674,12 +1688,14 @@ def _heuristic_direction(line: str, shot_count: int) -> dict[str, Any]:
             "People are still out.",
             "The traffic keeps moving.",
             "We stop on the sidewalk.",
+            "The next block is still lit.",
         ]
-        return {
-            "logline": logline,
-            "beats": beats[:shot_count],
-            "voice_lines": voices[:shot_count],
-        }
+        if shot_count <= len(beats):
+            return {
+                "logline": logline,
+                "beats": beats[:shot_count],
+                "voice_lines": voices[:shot_count],
+            }
     words = raw.split() or ["city street"]
     if len(words) >= shot_count:
         size = max(1, len(words) // shot_count)
@@ -1692,18 +1708,64 @@ def _heuristic_direction(line: str, shot_count: int) -> dict[str, Any]:
             start = end
     else:
         chunks = [raw or logline for _ in range(shot_count)]
-    roles = ["wide street", "the movement", "people nearby", "traffic passing", "a stop"]
+    roles = [
+        "wide street",
+        "the movement",
+        "people nearby",
+        "traffic passing",
+        "a stop",
+        "the next block",
+    ]
     return {
         "logline": logline,
-        "beats": [f"{chunk} {roles[i]}".strip()[:240] for i, chunk in enumerate(chunks)],
+        "beats": [f"{chunk} {roles[i % len(roles)]}".strip()[:240] for i, chunk in enumerate(chunks)],
         "voice_lines": [_one_sentence(chunk) or logline for chunk in chunks],
     }
 
 
+def _fit_to_shot_count(lines: list[str], shot_count: int, fallback: str, *, kind: str) -> list[str]:
+    """Exactly shot_count lines. A longer brief is trimmed. A shorter one is re-split."""
+    clean = [ln.strip() for ln in lines if ln and str(ln).strip()]
+    limit = 240 if kind == "beat" else 180
+    if len(clean) >= shot_count:
+        return [ln[:limit] for ln in clean[:shot_count]]
+    text = " ".join(clean) if clean else (fallback or "A city street.")
+    plan = _heuristic_direction(text, shot_count)
+    key = "beats" if kind == "beat" else "voice_lines"
+    fitted = [str(item).strip()[:limit] for item in (plan.get(key) or []) if str(item).strip()]
+    if len(fitted) < shot_count:
+        seed = fitted or clean or [text]
+        fitted = [seed[i % len(seed)][:limit] for i in range(shot_count)]
+    return fitted[:shot_count]
+
+
+def _beat_search_query(logline: str, beat: str) -> str:
+    """"{logline}. {beat}" so a later shot cannot drop the film premise.
+
+    An empty logline leaves the beat as today's query.
+    """
+    premise = _collapse_query(logline).strip()
+    text = _collapse_query(beat).strip()
+    if not premise:
+        return text
+    if not text:
+        return premise
+    head = premise.rstrip(" .!?").strip()
+    if not head:
+        return text
+    if text.lower().startswith(head.lower()):
+        return text
+    return f"{head}. {text}"
+
+
 def _shots_from_plan(plan: dict[str, Any]) -> list[dict[str, Any]]:
-    """Beats are the archive search queries. Voice lines are what is spoken."""
+    """Beats are the archive search queries. Voice lines are what is spoken.
+
+    Every beat is searched with the logline in front of that beat's own text.
+    """
     types = ["wide establishing", "tracking medium", "medium", "close-up", "closing wide"]
     moods = ["night urban", "kinetic", "observational", "quiet", "resolute"]
+    logline = str(plan.get("logline") or "")
     shots = []
     for i, (beat, line) in enumerate(zip(plan["beats"], plan["voice_lines"])):
         shots.append(
@@ -1715,10 +1777,26 @@ def _shots_from_plan(plan: dict[str, Any]) -> list[dict[str, Any]]:
                 "mood": moods[i % len(moods)],
                 "action": beat[:200],
                 "dialogue_beat": line[:200],
-                "search_query": _collapse_query(beat),
+                "search_query": _beat_search_query(logline, beat),
             }
         )
     return shots
+
+
+def _fit_shot_list(shots: list[dict[str, Any]], shot_count: int) -> list[dict[str, Any]]:
+    """Keep exactly shot_count shots. Do not drop the tail and stretch what remains."""
+    if shot_count < 1:
+        return []
+    if not shots:
+        return []
+    if len(shots) >= shot_count:
+        fitted = [dict(shot) for shot in shots[:shot_count]]
+    else:
+        fitted = [dict(shots[i % len(shots)]) for i in range(shot_count)]
+    for i, shot in enumerate(fitted):
+        shot["id"] = i + 1
+        shot["title"] = f"Shot {i + 1}"
+    return fitted
 
 
 def _wandb_chat(system_text: str, user_text: str, timeout: int = 45) -> str | None:
@@ -1845,6 +1923,7 @@ def _cosmos_candidates(
 ) -> list[dict[str, Any]]:
     found: list[dict[str, Any]] = []
     seen: set[str] = set()
+    limit = min(24, max(8, per_shot * max(1, len(enriched))))
     for shot_index, shot in enumerate(enriched):
         taken = 0
         for match in shot.get("matches") or []:
@@ -1871,7 +1950,7 @@ def _cosmos_candidates(
                 }
             )
             taken += 1
-            if len(found) >= 8:
+            if len(found) >= limit:
                 return found
     return found
 
@@ -1910,6 +1989,7 @@ def _parse_cosmos_order(
     *,
     level_crossing: bool,
     brief: str,
+    shot_count: int | None = None,
 ) -> dict[str, Any] | None:
     cleaned = re.sub(r"<think>.*?</think>", " ", text or "", flags=re.I | re.S)
     cleaned = cleaned.replace("```json", " ").replace("```", " ").strip()
@@ -1944,9 +2024,12 @@ def _parse_cosmos_order(
             continue
         picked_i.append(index)
         picked_lines.append(re.sub(r"\s+", " ", line).strip()[:220])
-        if len(picked_i) >= 5:
+        cap = shot_count if shot_count and shot_count > 0 else 5
+        if len(picked_i) >= cap:
             break
     if not picked_i:
+        return None
+    if shot_count and len(picked_i) != shot_count:
         return None
     return {
         "order": picked_i,
@@ -1964,6 +2047,7 @@ def _apply_cosmos_reason(
     *,
     level_crossing: bool,
     duration_sec: float | None,
+    shot_count: int | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]] | None, str, Any]:
     """One Cosmos Reason call for voice lines and shot order. Falls back without failing the cut."""
     if prebuilt is not None and len(prebuilt) != len(enriched):
@@ -1986,12 +2070,19 @@ def _apply_cosmos_reason(
         "Do not mix in a forklift or a warehouse when the brief is about a street, "
         "and do not use a different city than the one the brief names."
     )
+    if shot_count:
+        count_rule = (
+            f"Choose exactly {shot_count} shots. "
+            f"order and voice_lines must each have length {shot_count}. "
+        )
+    else:
+        count_rule = "Use 3 to 5 shots when that many candidates match the brief, otherwise every matching candidate. "
     system = (
         "You write the spoken voiceover and choose the shot order from indexed Cosmos descriptions. "
         "Return ONLY JSON, no markdown, with keys voice_lines, order, and why. "
         "order is indexes into the candidate list. "
-        "Use 3 to 5 shots when that many candidates match the brief, otherwise every matching candidate. "
-        f"voice_lines has one short spoken sentence per chosen shot, under {word_cap} words, "
+        + count_rule
+        + f"voice_lines has one short spoken sentence per chosen shot, under {word_cap} words, "
         "and the same length as order. why is one sentence. One coherent story. "
         + place_rule
     )
@@ -2011,6 +2102,7 @@ def _apply_cosmos_reason(
         [cand["match"] for cand in candidates],
         level_crossing=level_crossing,
         brief=brief,
+        shot_count=shot_count,
     )
     if not parsed:
         return enriched, prebuilt, transcript, "fallback"
@@ -2339,6 +2431,55 @@ def _fetch_cc_clip(query: str, dest_dir: Path) -> tuple[dict[str, Any] | None, s
     )
 
 
+def _equal_shot_spans(target: float, count: int) -> list[tuple[float, float]]:
+    """N slices that add up to target.
+
+    The requested shot count sets N. Fewer source clips must not widen the slices
+    (that was 4 clips stretched across a 60s cut, 15s each, instead of 6 × 10s).
+    """
+    count = max(1, int(count))
+    target = float(target)
+    slice_len = target / count
+    spans: list[tuple[float, float]] = []
+    for i in range(count):
+        start = round(i * slice_len, 2)
+        end = round(target if i == count - 1 else (i + 1) * slice_len, 2)
+        if end <= start:
+            end = round(start + slice_len, 2)
+        spans.append((start, end))
+    return spans
+
+
+def _select_cut_sources(match_sources: list[Any], count: int) -> list[dict[str, Any]]:
+    """Take `count` sources. Cycle a short list so the timeline still has `count` shots."""
+    count = max(1, int(count))
+    unique: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in match_sources:
+        if isinstance(item, str):
+            item = {"source": item, "title": "", "filename": item.rsplit("/", 1)[-1]}
+        if not isinstance(item, dict):
+            continue
+        src = item.get("source") or ""
+        local = item.get("local_path") or ""
+        key = src or local
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        unique.append(item)
+        if len(unique) >= count:
+            break
+    if not unique:
+        return []
+    if len(unique) >= count:
+        return [dict(item) for item in unique[:count]]
+    chosen = [dict(unique[i % len(unique)]) for i in range(count)]
+    for i, item in enumerate(chosen):
+        if i >= len(unique) or not item.get("title"):
+            item["title"] = f"Shot {i + 1}"
+    return chosen
+
+
 def _render_same_length_cut(
     source_clips: list[dict[str, Any]],
     match_sources: list[str],
@@ -2348,24 +2489,15 @@ def _render_same_length_cut(
     duration_sec: float | None = None,
     *,
     preset: str = "veryfast",
-    max_pieces: int = 4,
+    max_pieces: int = DEFAULT_SHOT_COUNT,
     fast: bool = False,
 ) -> dict[str, Any]:
-    """Concat archive matches and keep their audio. Speak each VO line inside its caption window."""
-    picks: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for item in match_sources:
-        if isinstance(item, str):
-            item = {"source": item, "title": "", "filename": item.rsplit("/", 1)[-1]}
-        src = item.get("source") or ""
-        local = item.get("local_path") or ""
-        key = src or local
-        if not key or key in seen:
-            continue
-        seen.add(key)
-        picks.append(item)
-        if len(picks) >= max_pieces:
-            break
+    """Concat archive matches and keep their audio. Speak each VO line inside its caption window.
+
+    `max_pieces` is the requested shot count. The timeline is that many equal slices
+    of the target duration, not fewer clips stretched to fill the minute.
+    """
+    picks = _select_cut_sources(match_sources, max_pieces)
     if not picks:
         raise RuntimeError("no archive matches to cut together")
 
@@ -2384,7 +2516,7 @@ def _render_same_length_cut(
         if target < 0.5:
             target = 4.0 * len(picks)
 
-    slice_len = target / len(picks)
+    spans = _equal_shot_spans(target, len(picks))
     fast_lines = [ln.strip() for ln in re.split(r"\n+", transcript or "") if ln.strip()]
     burn_fast = bool(fast and fast_lines and len(fast_lines) == len(picks))
     voice_box: dict[str, Any] = {}
@@ -2429,8 +2561,8 @@ def _render_same_length_cut(
     timeline: list[dict[str, Any]] = []
     trimmed: list[Path] = []
     for i, item in enumerate(picks):
-        start = round(i * slice_len, 2)
-        end = round(target if i == len(picks) - 1 else (i + 1) * slice_len, 2)
+        start, end = spans[i]
+        slice_len = max(0.05, end - start)
         src = item.get("source") or ""
         row: dict[str, Any] = {
             "title": item.get("title") or f"Shot {i + 1}",
@@ -2913,11 +3045,21 @@ def expand_brief():
         "beats": str(payload.get("beats") or "").strip()[:2000],
         "transcript": str(payload.get("transcript") or "").strip()[:2000],
     }
+    shot_count = _clamp_shot_count(payload.get("shot_count"))
+    duration_sec = None
+    if payload.get("duration_sec") not in (None, "", 0, "0"):
+        try:
+            duration_sec = float(payload.get("duration_sec"))
+        except (TypeError, ValueError):
+            duration_sec = None
+        else:
+            if duration_sec < 4 or duration_sec > 90:
+                duration_sec = None
     try:
         plan, note, _engine = _expand_direction(
             line,
-            4,
-            None,
+            shot_count,
+            duration_sec,
             context=context,
             allow_heuristic=False,
         )
@@ -2969,11 +3111,7 @@ def upscale():
                 return jsonify({"error": "cut length must be a number of seconds"}), 400
             if duration_sec < 4 or duration_sec > 90:
                 return jsonify({"error": "cut length must be between 4 and 90 seconds"}), 400
-        try:
-            shot_count = int(payload.get("shot_count") if payload.get("shot_count") not in (None, "") else 4)
-        except (TypeError, ValueError):
-            shot_count = 4
-        shot_count = max(2, min(5, shot_count))
+        shot_count = _clamp_shot_count(payload.get("shot_count"))
         seed_from_upload = bool(payload.get("seed_from_upload"))
         upload_tag = (payload.get("upload_tag") or "my-upload").strip() or "my-upload"
 
@@ -2985,13 +3123,13 @@ def upscale():
         form_beats = [ln.strip() for ln in beats.splitlines() if ln.strip()]
         form_lines = [ln.strip() for ln in transcript.splitlines() if ln.strip()]
         if metaprompt and use_form and logline and len(form_beats) >= 2 and len(form_lines) >= 2:
-            # Fill the brief already wrote these. Recut uses them and does not call the model again.
+            # Fill the brief already wrote these. The requested shot count still wins:
+            # a 4-line brief must not shrink a 6-shot minute into four stretched clips.
             level_crossing = False
-            count = min(shot_count, len(form_beats), len(form_lines))
             plan = {
                 "logline": logline[:280],
-                "beats": [beat[:240] for beat in form_beats[:count]],
-                "voice_lines": [line[:180] for line in form_lines[:count]],
+                "beats": _fit_to_shot_count(form_beats, shot_count, logline, kind="beat"),
+                "voice_lines": _fit_to_shot_count(form_lines, shot_count, logline, kind="voice"),
             }
             beats_list = list(plan["beats"])
             voice_lines = list(plan["voice_lines"])
@@ -3092,7 +3230,7 @@ def upscale():
                 if not shots:
                     splitter = "heuristic"
                     shots = _heuristic_shots(logline, beats, transcript)
-            shots = shots[:shot_count]
+            shots = _fit_shot_list(shots, shot_count)
 
             # Bias queries toward cinematic archive when seeding from a rough upload.
             if seed_from_upload and plan is None:
@@ -3126,18 +3264,23 @@ def upscale():
                     beats,
                     level_crossing=level_crossing,
                     duration_sec=duration_sec,
+                    shot_count=None if level_crossing else shot_count,
                 )
             except Exception:
                 cosmos_reason = "fallback"
 
-        if not level_crossing and len(enriched) > shot_count:
-            enriched = enriched[:shot_count]
-            if isinstance(prebuilt, list):
-                prebuilt = prebuilt[:shot_count]
-            if isinstance(cosmos_reason, dict):
-                spoken_lines = [ln for ln in (transcript or "").split("\n") if ln.strip()]
-                if len(spoken_lines) > shot_count:
-                    transcript = "\n".join(spoken_lines[:shot_count])
+        if not level_crossing and enriched:
+            enriched = _fit_shot_list(enriched, shot_count)
+            if isinstance(prebuilt, list) and prebuilt:
+                if len(prebuilt) >= shot_count:
+                    prebuilt = [dict(item) for item in prebuilt[:shot_count]]
+                else:
+                    prebuilt = [dict(prebuilt[i % len(prebuilt)]) for i in range(shot_count)]
+            spoken_lines = [ln for ln in (transcript or "").split("\n") if ln.strip()]
+            if len(spoken_lines) != shot_count:
+                transcript = "\n".join(
+                    _fit_to_shot_count(spoken_lines, shot_count, logline, kind="voice")
+                )
 
         directors_cut = []
         ordered: list[dict[str, Any] | None] = []
@@ -3546,6 +3689,23 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .direction-box .actions { margin-top: 10px; }
   #userClipDetails { margin-top: 8px; }
   #userClipDetails summary { cursor: pointer; font-weight: 600; }
+  #uploadSettings {
+    margin-top: 12px;
+    padding: 12px;
+    border-radius: 14px;
+    background: var(--panel-2);
+    border: 1px solid var(--line);
+  }
+  #uploadSettings > summary {
+    cursor: pointer;
+    font-weight: 600;
+    color: var(--ink);
+  }
+  #uploadSettings > .opt {
+    margin-top: 10px;
+    padding: 0;
+    background: transparent;
+  }
   #userClip {
     width: 100%;
     margin-top: 8px;
@@ -3658,16 +3818,16 @@ INDEX_HTML = r"""<!DOCTYPE html>
         <label for="lengthMode">Cut length</label>
         <select id="lengthMode">
           <option value="auto">Automatic</option>
-          <option value="custom">Custom seconds</option>
+          <option value="custom" selected>Custom seconds</option>
         </select>
       </div>
       <div id="lengthWrap">
         <label for="lengthSec">Seconds (4–90)</label>
-        <input id="lengthSec" type="number" min="4" max="90" step="1" value="15" title="Editable when Custom seconds is selected."/>
+        <input id="lengthSec" type="number" min="4" max="90" step="1" value="60" title="Editable when Custom seconds is selected."/>
       </div>
       <div>
         <label for="shotCount">Shots</label>
-        <input id="shotCount" type="number" min="2" max="5" step="1" value="4"/>
+        <input id="shotCount" type="number" min="2" max="12" step="1" value="6"/>
       </div>
       <div>
         <label for="voice">Voice</label>
@@ -3701,48 +3861,6 @@ INDEX_HTML = r"""<!DOCTYPE html>
         <div class="opt" id="uploadBox">
           <label for="uploadFile">Video file</label>
           <input id="uploadFile" type="file" accept=".mp4,.mov,.webm,.avi,.mkv,video/mp4,video/quicktime,video/webm,video/x-msvideo,video/x-matroska"/>
-          <details id="userClipDetails">
-            <summary>Your upload</summary>
-            <video id="userClip" controls playsinline preload="metadata"></video>
-          </details>
-          <label for="uploadPublic">Visibility</label>
-          <select id="uploadPublic">
-            <option value="public" selected>public</option>
-            <option value="private">private</option>
-          </select>
-          <label for="uploadAllowed">Allowed users</label>
-          <input id="uploadAllowed" type="text" value="" placeholder="allowed users"/>
-          <label for="uploadPrompt">Analysis prompt</label>
-          <select id="uploadPrompt">
-            <option value="" selected>default</option>
-            <option value="general">general</option>
-            <option value="custom">custom</option>
-          </select>
-          <textarea id="uploadCustom" rows="3" class="hidden" placeholder="custom analysis prompt"></textarea>
-          <label for="uploadTag">Tag</label>
-          <input id="uploadTag" type="text" value="" placeholder="upload tag"/>
-          <label for="uploadLocation">Location</label>
-          <input id="uploadLocation" type="text" value="" placeholder="location"/>
-          <label for="uploadCamera">Camera</label>
-          <input id="uploadCamera" type="text" value="" placeholder="camera id"/>
-          <label for="uploadCapture">Capture type</label>
-          <select id="uploadCapture">
-            <option value="" selected>optional</option>
-            <option value="traffic">traffic</option>
-            <option value="streets">streets</option>
-            <option value="crowds">crowds</option>
-            <option value="malls">malls</option>
-            <option value="general">general</option>
-            <option value="sports">sports</option>
-            <option value="robotics">robotics</option>
-            <option value="warehouse">warehouse</option>
-            <option value="retail">retail</option>
-          </select>
-          <p class="hint">Choose visibility and an analysis prompt, then upload. This does not start a recut. Indexing usually takes a minute or two.</p>
-          <div class="actions">
-            <button id="uploadBtn" type="button">Upload</button>
-            <span class="status" id="uploadStatus"></span>
-          </div>
         </div>
         <div class="opt">
           <label class="row" for="seed">
@@ -3790,6 +3908,53 @@ INDEX_HTML = r"""<!DOCTYPE html>
           <p class="status" id="cut-empty">Click Recut to cut a reel the same length as your clip, with the VO burned in.</p>
           <video id="cut-video" class="hidden" controls playsinline></video>
         </div>
+        <details id="uploadSettings">
+          <summary>Upload settings</summary>
+          <div class="opt">
+          <details id="userClipDetails">
+            <summary>Your upload</summary>
+            <video id="userClip" controls playsinline preload="metadata"></video>
+          </details>
+          <label for="uploadPublic">Visibility</label>
+          <select id="uploadPublic">
+            <option value="public" selected>public</option>
+            <option value="private">private</option>
+          </select>
+          <label for="uploadAllowed">Allowed users</label>
+          <input id="uploadAllowed" type="text" value="" placeholder="allowed users"/>
+          <label for="uploadPrompt">Analysis prompt</label>
+          <select id="uploadPrompt">
+            <option value="" selected>default</option>
+            <option value="general">general</option>
+            <option value="custom">custom</option>
+          </select>
+          <textarea id="uploadCustom" rows="3" class="hidden" placeholder="custom analysis prompt"></textarea>
+          <label for="uploadTag">Tag</label>
+          <input id="uploadTag" type="text" value="" placeholder="upload tag"/>
+          <label for="uploadLocation">Location</label>
+          <input id="uploadLocation" type="text" value="" placeholder="location"/>
+          <label for="uploadCamera">Camera</label>
+          <input id="uploadCamera" type="text" value="" placeholder="camera id"/>
+          <label for="uploadCapture">Capture type</label>
+          <select id="uploadCapture">
+            <option value="" selected>optional</option>
+            <option value="traffic">traffic</option>
+            <option value="streets">streets</option>
+            <option value="crowds">crowds</option>
+            <option value="malls">malls</option>
+            <option value="general">general</option>
+            <option value="sports">sports</option>
+            <option value="robotics">robotics</option>
+            <option value="warehouse">warehouse</option>
+            <option value="retail">retail</option>
+          </select>
+          <p class="hint">Choose visibility and an analysis prompt, then upload. This does not start a recut. Indexing usually takes a minute or two.</p>
+          <div class="actions">
+            <button id="uploadBtn" type="button">Upload</button>
+            <span class="status" id="uploadStatus"></span>
+          </div>
+          </div>
+        </details>
         <div id="timeline" class="tl hidden"></div>
         <div id="feedback" class="fb hidden">
           <label>I like this shot, not that one</label>
@@ -3898,7 +4063,7 @@ async function runUpscale({ seed, health }) {
         voice: voiceValue,
         bed: bedValue,
         duration_sec: lengthMode === "custom" ? Number(lengthSec) : null,
-        shot_count: Math.min(5, Math.max(2, parseInt(shotCount, 10) || 4)),
+        shot_count: Math.min(12, Math.max(2, parseInt(shotCount, 10) || 6)),
         seed_from_upload: useSeed,
         upload_tag: ($("tag").value || "my-upload").trim(),
         health_safety: safetyKind || false,
@@ -4073,6 +4238,8 @@ if ($("expandBtn")) {
           logline: $("logline").value,
           beats: $("beats").value,
           transcript: $("transcript").value,
+          shot_count: Math.min(12, Math.max(2, parseInt(shotCount, 10) || 6)),
+          duration_sec: lengthMode === "custom" ? Number(lengthSec) : null,
         }),
       });
       const raw = await res.text();

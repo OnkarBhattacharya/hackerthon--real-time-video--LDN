@@ -723,10 +723,10 @@ PAGE = """<!DOCTYPE html>
   button.pick.on { border-color: var(--accent); }
   button.pick:disabled { opacity: 0.55; cursor: default; }
   .choices { display:grid; gap:8px; }
-  .bar { position:relative; height:14px; background:#2a343d; margin-top:8px; }
-  .window { position:absolute; top:0; bottom:0; background:rgba(240,180,41,.85); }
-  .playhead { position:absolute; top:-3px; bottom:-3px; width:2px; background:#fff; }
-  .mark { position:absolute; top:-4px; width:8px; height:22px; margin-left:-4px; background:#7dcea0; }
+  .bar { position:relative; height:22px; background:#2a343d; margin-top:8px; cursor:pointer; touch-action:none; }
+  .window { position:absolute; top:0; bottom:0; background:rgba(240,180,41,.85); pointer-events:none; }
+  .playhead { position:absolute; top:0; bottom:0; width:2px; background:#fff; pointer-events:none; }
+  .mark { position:absolute; top:0; width:8px; height:22px; margin-left:-4px; background:#7dcea0; pointer-events:none; }
   .panel { background:var(--panel); border:1px solid var(--line); padding:14px; margin-top:14px; }
   .status { color: var(--muted); }
   .err { color: #ffb4a8; }
@@ -738,7 +738,7 @@ PAGE = """<!DOCTYPE html>
     <p><a href="/app/">All apps</a></p>
     <h1>Hazard perception</h1>
     <p class="lead">Pick a mode, then mark the hazard as the clip plays. The second pass boxes one main hazard and asks what you should do.</p>
-    <p class="hint" id="keys">Space marks a hazard at the current time. 1 Slow down, 2 Brake, 3 Wait, 4 Steer away, 5 Continue. Enter opens the second pass or submits.</p>
+    <p class="hint" id="keys">Space marks a hazard at the current time. Drag the bar or use the arrow keys to move through the clip. 1 Slow down, 2 Brake, 3 Wait, 4 Steer away, 5 Continue. Enter opens the second pass or submits.</p>
     <div id="modes" class="modes">
       <button class="mode" type="button" data-mode="driving"><strong>Driving</strong><span>Streets and traffic. A person, a cyclist, or a close vehicle.</span></button>
       <button class="mode" type="button" data-mode="forklift"><strong>Forklift driver</strong><span>Warehouse aisle. A person, another vehicle, or a rack the forks are approaching.</span></button>
@@ -753,7 +753,7 @@ PAGE = """<!DOCTYPE html>
         <div id="banner" class="hidden"></div>
         <div id="count" class="hidden"></div>
       </div>
-      <div id="timeline" class="bar hidden" aria-hidden="true"></div>
+      <div id="timeline" class="bar hidden" role="slider" aria-label="Clip time" aria-valuemin="0" aria-valuemax="0" aria-valuenow="0" aria-hidden="true" tabindex="-1"></div>
       <div class="row">
         <button id="hazardBtn" class="act" type="button" disabled>I see a hazard</button>
         <button id="again" class="ghost hidden" type="button">Another clip</button>
@@ -792,6 +792,7 @@ let counting = false;
 let advancing = false;
 let playToken = 0;
 let boxPack = null;
+let seekGuard = false;
 
 function showError(msg) {
   $("err").textContent = msg;
@@ -818,17 +819,48 @@ function renderClicks() {
   $("clicks").textContent = count + choice;
 }
 
+function durationOf() {
+  const raw = vid.duration || (clipData && clipData.duration) || 0;
+  return Number.isFinite(raw) ? raw : 0;
+}
+
 function drawBar() {
   const bar = $("timeline");
-  const dur = Math.max(0.1, vid.duration || (clipData && clipData.duration) || 5);
+  const dur = Math.max(0.1, durationOf() || 5);
   const marks = clicks.map((mark) => `<i class="mark" style="left:${Math.min(100, (mark.t / dur) * 100)}%"></i>`).join("");
   let hazard = "";
-  if (boxPack && Number.isFinite(boxPack.time)) {
+  if (pass === 2 && boxPack && Number.isFinite(boxPack.time)) {
     const left = Math.min(98, Math.max(0, (boxPack.time / dur) * 100));
     hazard = `<i class="window" style="left:${left}%;width:2%"></i>`;
   }
   bar.innerHTML = `${hazard}<i class="playhead" id="head"></i>${marks}`;
   bar.classList.remove("hidden");
+  bar.setAttribute("aria-hidden", "false");
+  bar.tabIndex = 0;
+  moveHead();
+}
+
+function moveHead() {
+  const head = document.getElementById("head");
+  const dur = durationOf();
+  const bar = $("timeline");
+  if (head && dur > 0) head.style.left = Math.min(100, ((vid.currentTime || 0) / dur) * 100) + "%";
+  if (bar && dur > 0 && !bar.classList.contains("hidden")) {
+    bar.setAttribute("aria-valuemax", String(Math.round(dur)));
+    bar.setAttribute("aria-valuenow", String(Math.round(vid.currentTime || 0)));
+  }
+}
+
+function seekTo(seconds) {
+  const dur = durationOf();
+  if (!(dur > 0)) return;
+  const t = Math.min(dur, Math.max(0, seconds));
+  seekGuard = true;
+  clearTimeout(seekTo.timer);
+  seekTo.timer = setTimeout(() => { seekGuard = false; }, 250);
+  try { vid.currentTime = t; } catch (e) { seekGuard = false; }
+  moveHead();
+  if (pass >= 1) paint();
 }
 
 function contentRect() {
@@ -860,7 +892,8 @@ function paint() {
     overlay.height = Math.max(1, Math.round(rect.rh));
   }
   ctx.clearRect(0, 0, overlay.width, overlay.height);
-  if (pass !== 2) return;
+  if (pass < 1) return;
+  if (pass === 2) {
   const boxes = boxesAt(vid.currentTime || 0);
   ctx.lineWidth = 3;
   ctx.font = "600 16px sans-serif";
@@ -873,6 +906,7 @@ function paint() {
     ctx.strokeRect(x, y, w, h);
     ctx.fillStyle = "#f0b429";
     ctx.fillText(box.label || "", x + 4, Math.max(18, y - 6));
+  }
   }
   clicks.forEach((mark, i) => {
     const x = mark.x == null ? rect.x + rect.w * 0.5 : rect.x + mark.x * rect.w;
@@ -897,12 +931,15 @@ function resetPass() {
   answered = false;
   advancing = false;
   boxPack = null;
+  seekGuard = false;
   renderClicks();
   $("ask").classList.add("hidden");
   $("rating").textContent = "";
   $("banner").classList.add("hidden");
   $("again").classList.add("hidden");
   $("timeline").classList.add("hidden");
+  $("timeline").setAttribute("aria-hidden", "true");
+  $("timeline").innerHTML = "";
   $("hit").classList.add("on");
   $("hit").textContent = "Start the clip";
   $("hazardBtn").disabled = true;
@@ -975,15 +1012,17 @@ function startPass(which) {
       b.classList.toggle("on", b.dataset.id === pending);
     });
     $("hazardBtn").disabled = true;
-    drawBar();
     $("meta").textContent = "Second pass. " + note + " Press 1 to 5, then Enter.";
   } else {
     $("hazardBtn").disabled = false;
-    $("meta").textContent = clipData.mode_name + ". Space marks a hazard. Enter opens the second pass.";
+    $("meta").textContent = clipData.mode_name + ". Space marks a hazard. Drag the bar to scrub. Enter opens the second pass.";
     fetch("api/prime?id=" + encodeURIComponent(clipData.id)).catch(() => {});
   }
+  seekGuard = false;
   playToken += 1;
   try { vid.currentTime = 0; } catch (e) {}
+  drawBar();
+  paint();
   const playing = vid.play();
   if (playing && playing.catch) playing.catch(() => {});
   focusClip();
@@ -1026,10 +1065,10 @@ function noteClick(ev) {
   let x = null;
   let y = null;
   if (ev && ev.clientX != null) {
-    const bounds = vid.getBoundingClientRect();
+    const base = overlay.getBoundingClientRect();
     const rect = contentRect();
-    const px = ev.clientX - bounds.left;
-    const py = ev.clientY - bounds.top;
+    const px = ev.clientX - base.left;
+    const py = ev.clientY - base.top;
     x = (px - rect.x) / rect.w;
     y = (py - rect.y) / rect.h;
     if (!(x >= 0 && x <= 1 && y >= 0 && y <= 1)) {
@@ -1039,6 +1078,8 @@ function noteClick(ev) {
   }
   clicks.push({t: Math.round(vid.currentTime * 100) / 100, x, y});
   renderClicks();
+  drawBar();
+  paint();
 }
 
 function selectAction(id) {
@@ -1083,6 +1124,14 @@ document.querySelectorAll("#choices button").forEach((btn) => {
 document.addEventListener("keydown", (ev) => {
   if (!clipFocused()) return;
   const key = ev.key;
+  const nudge = key === "ArrowLeft" ? -1 : key === "ArrowRight" ? 1 : 0;
+  if (nudge) {
+    if (pass < 1 || counting) return;
+    ev.preventDefault();
+    ev.stopPropagation();
+    seekTo((vid.currentTime || 0) + nudge);
+    return;
+  }
   const marking = key === " " || key === "Spacebar";
   const action = KEYS[key];
   const enter = key === "Enter";
@@ -1104,9 +1153,8 @@ document.addEventListener("keydown", (ev) => {
 }, true);
 
 vid.ontimeupdate = () => {
-  const head = document.getElementById("head");
-  if (head && vid.duration) head.style.left = Math.min(100, (vid.currentTime / vid.duration) * 100) + "%";
-  if (pass === 2) paint();
+  moveHead();
+  if (pass >= 1) paint();
 };
 
 async function beginSecond() {
@@ -1145,8 +1193,37 @@ async function beginSecond() {
 }
 
 vid.onended = () => {
+  if (seekGuard) {
+    seekGuard = false;
+    clearTimeout(seekTo.timer);
+    return;
+  }
   if (pass === 1) beginSecond();
 };
+
+(function bindScrub() {
+  const bar = $("timeline");
+  let dragging = false;
+  function fraction(ev) {
+    const bounds = bar.getBoundingClientRect();
+    if (!(bounds.width > 0)) return 0;
+    return Math.min(1, Math.max(0, (ev.clientX - bounds.left) / bounds.width));
+  }
+  bar.addEventListener("pointerdown", (ev) => {
+    if (pass < 1 || counting) return;
+    dragging = true;
+    try { bar.setPointerCapture(ev.pointerId); } catch (e) {}
+    seekTo(fraction(ev) * durationOf());
+    ev.preventDefault();
+  });
+  bar.addEventListener("pointermove", (ev) => {
+    if (!dragging) return;
+    seekTo(fraction(ev) * durationOf());
+  });
+  function endDrag() { dragging = false; }
+  bar.addEventListener("pointerup", endDrag);
+  bar.addEventListener("pointercancel", endDrag);
+})();
 
 async function choose(id, btn) {
   if (pass < 2 || answered || !clipData) return;
@@ -1398,6 +1475,9 @@ def _self_check() -> None:
     assert _allows("driving", {"location": "warehouse3", "camera_id": "sdg_warehouse_cam-2", "capture_type": "warehouse"}) is False
     assert _allows("forklift", {"location": "new_york", "camera_id": "nyc_streets_cam-1", "capture_type": "streets"}) is False
     assert "Driving" in PAGE and "Forklift" in PAGE and "Space" in PAGE
+    assert "function seekTo" in PAGE and "bindScrub" in PAGE and "seekGuard" in PAGE
+    assert "if (pass === 2)" in PAGE and "if (pass < 1) return" in PAGE
+    assert "Drag the bar" in PAGE
 
 
 if __name__ == "__main__":
