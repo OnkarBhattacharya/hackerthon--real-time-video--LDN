@@ -1,0 +1,4 @@
+-r requirements.txt
+ultralytics>=8.3.0
+faster-whisper>=1.0.0
+edge-tts>=6.1.0

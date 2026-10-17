@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+data/
+web/node_modules/
+web/dist/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.DS_Store
