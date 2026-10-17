@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import html
 import json
 import os
 import re
@@ -11,6 +13,7 @@ import sys
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -277,45 +280,81 @@ def _row_to_match(row: dict[str, Any], *, chunk: bool = False) -> dict[str, Any]
     }
 
 
+# Keep the request threshold. The embedder sometimes still returns weaker rows.
+MIN_SIMILARITY = 0.2
+
+
+def _score_ok(match: dict[str, Any]) -> bool:
+    score = match.get("similarity_score")
+    if score is None or score == "":
+        return True
+    try:
+        return float(score) >= MIN_SIMILARITY
+    except (TypeError, ValueError):
+        return True
+
+
+def _collect_matches(
+    data: dict[str, Any],
+    *,
+    exclude: set[str],
+    top_k: int,
+) -> list[dict[str, Any]]:
+    matches: list[dict[str, Any]] = []
+    for row in data.get("results") or []:
+        m = _row_to_match(row)
+        if not m or m["source"] in exclude or not _score_ok(m):
+            continue
+        matches.append(m)
+        if len(matches) >= top_k:
+            return matches
+    if matches:
+        return matches
+    for ch in data.get("chunk_results") or []:
+        m = _row_to_match(ch, chunk=True)
+        if not m or m["source"] in exclude or not _score_ok(m):
+            continue
+        matches.append(m)
+        if len(matches) >= top_k:
+            break
+    return matches
+
+
 def _search_shot(
     shot: dict[str, Any],
     top_k: int = 5,
     *,
     tags: list[str] | None = None,
     exclude_sources: set[str] | None = None,
+    metadata_filters: dict[str, Any] | None = None,
+    fallback: bool = True,
 ) -> list[dict[str, Any]]:
     query = re.sub(r"\s+", " ", (shot.get("search_query") or "")).replace("—", "-").replace("–", "-").strip()
-    body: dict[str, Any] = {
-        "query": query[:400],
-        "top_k": top_k,
-        "llm_top_n": 1,  # API requires >= 1
-        "min_similarity": 0.2,
-        "include_public": True,
-        "time_filter": "all",
-    }
-    if tags:
-        body["tags"] = tags
-    r = _vss("POST", "/api/v1/search", json=body)
-    if r.status_code >= 400:
-        raise RuntimeError(f"search HTTP {r.status_code}: {r.text[:240]}")
-    data = r.json()
+    filters = metadata_filters if metadata_filters is not None else shot.get("metadata_filters") or None
     exclude = exclude_sources or set()
-    matches: list[dict[str, Any]] = []
-    for row in data.get("results") or []:
-        m = _row_to_match(row)
-        if not m or m["source"] in exclude:
-            continue
-        matches.append(m)
-        if len(matches) >= top_k:
-            break
-    if not matches:
-        for ch in data.get("chunk_results") or []:
-            m = _row_to_match(ch, chunk=True)
-            if not m or m["source"] in exclude:
-                continue
-            matches.append(m)
-            if len(matches) >= top_k:
-                break
+
+    def call(filt: dict[str, Any] | None) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "query": query[:400],
+            "top_k": top_k,
+            "llm_top_n": 1,  # API requires >= 1
+            "min_similarity": MIN_SIMILARITY,
+            "include_public": True,
+            "time_filter": "all",
+        }
+        if tags:
+            body["tags"] = tags
+        if filt:
+            body["metadata_filters"] = filt
+        r = _vss("POST", "/api/v1/search", json=body)
+        if r.status_code >= 400:
+            raise RuntimeError(f"search HTTP {r.status_code}: {r.text[:240]}")
+        return r.json()
+
+    data = call(filters if filters else None)
+    matches = _collect_matches(data, exclude=exclude, top_k=top_k)
+    if not matches and filters and fallback:
+        matches = _collect_matches(call(None), exclude=exclude, top_k=top_k)
     return matches
 
 
@@ -505,11 +544,31 @@ def _run_ffmpeg(args: list[str], cwd: Path | None = None) -> None:
         raise RuntimeError((proc.stderr or proc.stdout or "ffmpeg failed")[-500:])
 
 
-VOICES = {
-    "en-us+f3": "US female",
-    "en-us+m3": "US male",
-    "en-gb+f2": "UK female",
-    "en-gb+m3": "UK male",
+# UI values and older espeak ids both map onto Microsoft neural voices.
+NEURAL_VOICES = {
+    "en-US-JennyNeural": "en-us+f3",
+    "en-US-GuyNeural": "en-us+m3",
+    "en-GB-SoniaNeural": "en-gb+f2",
+    "en-GB-RyanNeural": "en-gb+m3",
+}
+VOICE_ALIASES = {espeak: neural for neural, espeak in NEURAL_VOICES.items()}
+DEFAULT_VOICE = "en-US-JennyNeural"
+
+COMMONS_API = "https://commons.wikimedia.org/w/api.php"
+COMMONS_UA = "IdeaUpscaler/1.0 (educational video cut; VAST builders challenge)"
+MAX_CC_BYTES = 40 * 1024 * 1024
+MAX_CC_SECONDS = 75.0
+# Search still keeps hits at 0.2. The CC toggle only replaces one shot that
+# the archive does not really have: no hit, or a weak neighbor under this score.
+CC_GAP_BELOW = 0.35
+_CC_OK_RE = re.compile(
+    r"(creative\s+commons|\bcc(?:0|[- ]by)\b|public\s+domain)",
+    re.I,
+)
+_CC_BAD_RE = re.compile(r"(all rights reserved|non-free|fair use)", re.I)
+_CC_STOP = {
+    "cinematic", "the", "a", "an", "of", "and", "with", "near", "in", "on",
+    "to", "for", "from", "shot", "wide", "medium", "close", "this", "that",
 }
 
 
@@ -521,24 +580,799 @@ def _has_audio(path: Path) -> bool:
     return bool(proc.stdout.strip())
 
 
+class LevelCrossingFootageError(RuntimeError):
+    """Commons could not supply a real railway clip. Do not substitute a crosswalk."""
+
+
+# A city crosswalk, highway, or warehouse is not a level crossing.
+_NON_RAIL_CAPTURE = {"streets", "street", "highway", "indoor", "warehouse"}
+_NON_RAIL_PLACE = (
+    "warehouse", "forklift", "san_francisco", "crosswalk", "sdg_warehouse",
+    "nyc", "new_york", "london",
+)
+_RAIL_BAD_RE = re.compile(
+    r"forklift|warehouse|crosswalk|zebra crossing|bike lane|airport barrier|highway traffic",
+    re.I,
+)
+_RAIL_OK_RE = re.compile(
+    r"level crossing|railroad crossing|railway crossing|grade crossing|"
+    r"bahnübergang|\boverweg\b|ж\.?\s*д|"
+    r"\b(railroads?|railways?|locomotive|boom gate)\b",
+    re.I,
+)
+
+LEVEL_CROSSING_LOGLINE = (
+    "You are helping people avoid a level crossing incident. "
+    "One railway crossing, from the approach to the rule."
+)
+LEVEL_CROSSING_BEATS = (
+    "Approach the railway level crossing\n"
+    "Warning lights and the barrier come down\n"
+    "Someone misuses the crossing\n"
+    "The train does not slow — a near miss\n"
+    "The rule: wait until the lights are out and the barrier is fully raised"
+)
+LEVEL_CROSSING_LINES = [
+    "You are helping people avoid a level crossing incident. Walk them up to the railway crossing and stop.",
+    "Show them the warning lights and the barrier. Those come down because a train is coming.",
+    "If they try to beat the barrier, or cross while the lights are still on, that is the misuse.",
+    "The train will not slow down for them. A near miss is not a safe gap.",
+    "The rule you give them is simple. Wait until the lights are out and the barrier is fully raised.",
+]
+MAX_RAIL_CC_SECONDS = 180.0
+
+
+def _level_crossing_shots() -> list[dict[str, Any]]:
+    """Five beats in the order of a level-crossing safety film. One subject only."""
+    specs = [
+        {
+            "title": "The approach",
+            "intent": "Arrive at a railway level crossing and stop before the rails.",
+            "shot_type": "wide establishing",
+            "mood": "watchful",
+            "action": "Road or path arriving at a railway level crossing",
+            "dialogue_beat": LEVEL_CROSSING_LINES[0],
+            "search_query": "railway level crossing ahead of the rails, no cars on a city crosswalk",
+            "commons_files": [
+                "File:Railway crossing in Halton Hills - 20210307.webm",
+                "File:Level crossing in Japan - Tokyo - near Ebaramachi Station - 2022 Oct 24.ogg",
+                "File:Padangbesa 1.webm",
+                "File:20260720 183051 Xuetian Road Level Crossing.webm",
+            ],
+            "commons_queries": [
+                "railway crossing level crossing filetype:video",
+                "level crossing road approach filetype:video",
+            ],
+        },
+        {
+            "title": "The warning",
+            "intent": "Warning lights or the barrier come down because a train is coming.",
+            "shot_type": "medium",
+            "mood": "alert",
+            "action": "Level crossing barrier lowering or warning lights at the rails",
+            "dialogue_beat": LEVEL_CROSSING_LINES[1],
+            "search_query": "railway level crossing barrier lowering and warning lights",
+            "commons_files": [
+                "File:Gillingham Level Crossing barriers going down.webm",
+                "File:Malfunctioning railway crossing warning lights.ogv",
+            ],
+            "commons_queries": [
+                "level crossing barriers going down filetype:video",
+                "railway crossing warning lights filetype:video",
+            ],
+        },
+        {
+            "title": "The misuse",
+            "intent": "Someone is on the railway crossing while they should be waiting.",
+            "shot_type": "medium",
+            "mood": "tense",
+            "action": "Person or traffic on a railway level crossing as a train is due",
+            "dialogue_beat": LEVEL_CROSSING_LINES[2],
+            "search_query": "pedestrian on a railway level crossing while a train passes",
+            "commons_files": [
+                "File:Петрозаводск, ул.Новосулажгорская, ж.д. переход.webm",
+                "File:Gevaarlijke overweg-520537.ogv",
+                "File:Weggebruikers attentie.... onbewaakte overweg-524524.ogv",
+            ],
+            "commons_queries": [
+                "pedestrian railway crossing train filetype:video",
+                "unguarded railway crossing overweg filetype:video",
+            ],
+        },
+        {
+            "title": "The near miss",
+            "intent": "The train takes the crossing and does not slow down.",
+            "shot_type": "wide",
+            "mood": "severe",
+            "action": "Train passing through a level crossing at speed",
+            "dialogue_beat": LEVEL_CROSSING_LINES[3],
+            "search_query": "train passing through a railway level crossing without slowing",
+            "commons_files": [
+                "File:Bahnübergang Nackenheim - Güterzug.webm",
+                "File:Caltrain locomotive 905 passing by San Mateo.gk.webm",
+                "File:GO Train at level crossing.webm",
+                "File:MaineNarrowGaugeRailroadApril2011.ogv",
+            ],
+            "commons_queries": [
+                "train passing level crossing filetype:video",
+                "locomotive railroad crossing filetype:video",
+            ],
+        },
+        {
+            "title": "The rule",
+            "intent": "Wait until the lights are out and the barrier is fully raised.",
+            "shot_type": "close-up",
+            "mood": "resolute",
+            "action": "Level crossing warning lights or a barrier that must be fully raised",
+            "dialogue_beat": LEVEL_CROSSING_LINES[4],
+            "search_query": "railway crossing warning lights and barrier fully raised before anyone crosses",
+            "commons_files": [
+                "File:Malfunctioning railway crossing warning lights.ogv",
+                "File:Gevaarlijke overweg-520537.ogv",
+                "File:Gillingham Level Crossing barriers going down.webm",
+            ],
+            "commons_queries": [
+                "railway crossing warning lights filetype:video",
+                "level crossing barrier lights filetype:video",
+            ],
+        },
+    ]
+    return [{"id": i + 1, **spec} for i, spec in enumerate(specs)]
+
+
+def _text_is_railway(*parts: str) -> bool:
+    blob = " ".join(p for p in parts if p)
+    if not blob.strip():
+        return False
+    if _RAIL_BAD_RE.search(blob) and not _RAIL_OK_RE.search(blob):
+        return False
+    if _RAIL_BAD_RE.search(blob) and not re.search(
+        r"level crossing|railway|railroad|overweg|bahnübergang|ж\.?\s*д", blob, re.I
+    ):
+        return False
+    return bool(_RAIL_OK_RE.search(blob))
+
+
+def _archive_is_level_crossing(match: dict[str, Any]) -> bool:
+    """True only for a real railway crossing. Streets and the warehouse never qualify."""
+    capture = str(match.get("capture_type") or "").strip().lower()
+    location = str(match.get("location") or "").strip().lower()
+    camera = str(match.get("camera_id") or "").strip().lower()
+    if capture in _NON_RAIL_CAPTURE:
+        return False
+    place = f"{location} {camera}"
+    if any(token in place for token in _NON_RAIL_PLACE):
+        return False
+    if any(token in place for token in ("street", "highway", "indoor")):
+        return False
+    return _text_is_railway(
+        capture,
+        location,
+        camera,
+        str(match.get("filename") or ""),
+        str(match.get("reasoning") or ""),
+        str(match.get("original_video") or ""),
+    )
+
+
+def _search_level_crossing_archive() -> list[dict[str, Any]]:
+    """Archive first, but drop anything that is not actually a railway crossing."""
+    queries = [
+        "railway level crossing barrier and train",
+        "railroad crossing warning lights locomotive at the rails",
+    ]
+
+    def one(query: str) -> list[dict[str, Any]]:
+        try:
+            token = _login()
+            r = requests.post(
+                f"{VSS_URL}/api/v1/search",
+                headers={"Authorization": f"Bearer {token}"},
+                json={
+                    "query": query,
+                    "top_k": 6,
+                    "llm_top_n": 1,
+                    "min_similarity": MIN_SIMILARITY,
+                    "include_public": True,
+                    "time_filter": "all",
+                },
+                timeout=12,
+            )
+            if r.status_code >= 400:
+                return []
+            return _collect_matches(r.json(), exclude=set(), top_k=6)
+        except Exception:
+            return []
+
+    found: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        groups = pool.map(one, queries)
+    for group in groups:
+        for match in group:
+            src = match.get("source") or ""
+            if not src or src in seen or not _archive_is_level_crossing(match):
+                continue
+            seen.add(src)
+            found.append(match)
+    if found:
+        return found
+    # The first pass was the wrong place (streets, highway, warehouse). Ask once more,
+    # tighter, and still refuse a non-railway hit.
+    tighter = one("locomotive passing a railroad grade crossing with the barrier down")
+    for match in tighter:
+        src = match.get("source") or ""
+        if src and src not in seen and _archive_is_level_crossing(match):
+            found.append(match)
+    return found
+
+
+def _commons_api(params: dict[str, Any]) -> dict[str, Any]:
+    last: Exception | None = None
+    for attempt in range(3):
+        try:
+            resp = requests.get(
+                COMMONS_API,
+                params={"format": "json", "formatversion": "2", **params},
+                headers={"User-Agent": COMMONS_UA},
+                timeout=25,
+            )
+            if resp.status_code == 429:
+                time.sleep(1.2 * (attempt + 1))
+                last = RuntimeError("Commons rate limited")
+                continue
+            resp.raise_for_status()
+            return resp.json()
+        except requests.RequestException as exc:
+            last = exc
+            time.sleep(0.8 * (attempt + 1))
+    raise LevelCrossingFootageError(
+        "Level crossing film stopped: Wikimedia Commons is unreachable "
+        f"({type(last).__name__ if last else 'error'}). "
+        "No street crosswalk or warehouse clip was used."
+    )
+
+
+def _commons_meta_text(meta: dict[str, Any], key: str) -> str:
+    return _plain_text(_extmeta(meta, key))
+
+
+def _commons_clip_record(title: str, info: dict[str, Any]) -> dict[str, Any] | None:
+    mime = str(info.get("mime") or "").lower()
+    mediatype = str(info.get("mediatype") or "").upper()
+    if mime.startswith("audio/") or mediatype == "IMAGE":
+        return None
+    if mediatype not in {"VIDEO", ""} and not mime.startswith("video/") and mime not in {"application/ogg", "video/ogg"}:
+        return None
+    try:
+        size = int(info.get("size") or 0)
+    except (TypeError, ValueError):
+        size = 0
+    if size <= 0 or size > MAX_CC_BYTES:
+        return None
+    try:
+        dur = float(info["duration"]) if info.get("duration") is not None else None
+    except (TypeError, ValueError):
+        dur = None
+    if dur is not None and (dur > MAX_RAIL_CC_SECONDS or dur < 0.8):
+        return None
+    meta = info.get("extmetadata") or {}
+    short = _commons_meta_text(meta, "LicenseShortName")
+    usage = _commons_meta_text(meta, "UsageTerms") or _commons_meta_text(meta, "License")
+    lic_url = _commons_meta_text(meta, "LicenseUrl")
+    desc = _commons_meta_text(meta, "ImageDescription")
+    pretty = title.split(":", 1)[1].strip() if title.lower().startswith("file:") else title
+    if not _license_ok(short, usage, lic_url):
+        return None
+    if not _text_is_railway(pretty, desc):
+        return None
+    url = info.get("url") or ""
+    if not url:
+        return None
+    if not lic_url:
+        if re.search(r"public domain|cc0", short, re.I):
+            lic_url = "https://creativecommons.org/publicdomain/zero/1.0/"
+        else:
+            lic_url = "https://commons.wikimedia.org/wiki/File:" + quote(pretty.replace(" ", "_"))
+    author = _commons_meta_text(meta, "Artist") or _commons_meta_text(meta, "Credit") or "unknown"
+    ext = {
+        "video/webm": ".webm",
+        "video/mp4": ".mp4",
+        "video/ogg": ".ogv",
+        "application/ogg": ".ogv",
+        "video/x-matroska": ".mkv",
+    }.get(mime, Path(url.split("?", 1)[0]).suffix or ".bin")
+    return {
+        "title": pretty[:180],
+        "author": author[:180],
+        "license": short or usage or "Creative Commons",
+        "license_url": lic_url,
+        "url": url,
+        "ext": ext,
+        "size": size,
+    }
+
+
+def _commons_lookup_titles(titles: list[str]) -> dict[str, dict[str, Any]]:
+    if not titles:
+        return {}
+    data = _commons_api({
+        "action": "query",
+        "titles": "|".join(titles),
+        "prop": "imageinfo",
+        "iiprop": "url|size|mime|mediatype|extmetadata|canonicaltitle",
+        "iiextmetadatafilter": "LicenseShortName|LicenseUrl|Artist|Credit|UsageTerms|License|ImageDescription",
+    })
+    found: dict[str, dict[str, Any]] = {}
+    for page in (data.get("query") or {}).get("pages") or []:
+        if page.get("missing"):
+            continue
+        title = str(page.get("title") or "")
+        info = (page.get("imageinfo") or [None])[0] or {}
+        record = _commons_clip_record(title, info)
+        if record:
+            found[title] = record
+    return found
+
+
+def _commons_search_railway(query: str, used: set[str]) -> dict[str, Any] | None:
+    data = _commons_api({
+        "action": "query",
+        "generator": "search",
+        "gsrsearch": query,
+        "gsrnamespace": 6,
+        "gsrlimit": 8,
+        "prop": "imageinfo",
+        "iiprop": "url|size|mime|mediatype|extmetadata|canonicaltitle",
+        "iiextmetadatafilter": "LicenseShortName|LicenseUrl|Artist|Credit|UsageTerms|License|ImageDescription",
+    })
+    for page in (data.get("query") or {}).get("pages") or []:
+        title = str(page.get("title") or "")
+        pretty = title.split(":", 1)[1].strip() if title.lower().startswith("file:") else title
+        if pretty in used or title in used:
+            continue
+        info = (page.get("imageinfo") or [None])[0] or {}
+        record = _commons_clip_record(title, info)
+        if record and record["title"] not in used:
+            return record
+    return None
+
+
+def _download_commons_record(record: dict[str, Any], dest_dir: Path) -> dict[str, Any]:
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / f"{uuid.uuid4().hex[:10]}{record['ext']}"
+    _download_capped(record["url"], dest)
+    try:
+        got = _probe_duration(dest)
+    except Exception as exc:
+        dest.unlink(missing_ok=True)
+        raise RuntimeError(f"could not read duration ({type(exc).__name__})") from exc
+    if got > MAX_RAIL_CC_SECONDS or got < 0.5:
+        dest.unlink(missing_ok=True)
+        raise RuntimeError(f"clip duration {got:.1f}s is outside 0.5–{MAX_RAIL_CC_SECONDS:.0f}s")
+    return {
+        "path": str(dest),
+        "title": record["title"],
+        "author": record["author"],
+        "license": record["license"],
+        "license_url": record["license_url"],
+    }
+
+
+def _pick_level_crossing_clips(shots: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """One distinct real level-crossing clip per beat. Never a street crosswalk."""
+    titles: list[str] = []
+    for shot in shots:
+        for name in shot.get("commons_files") or []:
+            if name not in titles:
+                titles.append(name)
+    try:
+        catalog = _commons_lookup_titles(titles)
+    except LevelCrossingFootageError:
+        raise
+    except Exception as exc:
+        raise LevelCrossingFootageError(
+            "Level crossing film stopped: Wikimedia Commons failed "
+            f"({type(exc).__name__}). No street crosswalk or warehouse clip was used."
+        ) from exc
+
+    chosen: list[dict[str, Any] | None] = [None] * len(shots)
+    used: set[str] = set()
+    for i, shot in enumerate(shots):
+        for name in shot.get("commons_files") or []:
+            record = catalog.get(name)
+            if not record or record["title"] in used:
+                continue
+            chosen[i] = record
+            used.add(record["title"])
+            break
+    for i, shot in enumerate(shots):
+        if chosen[i]:
+            continue
+        last_err = "no railway clip in the first search"
+        for query in shot.get("commons_queries") or []:
+            try:
+                record = _commons_search_railway(query, used)
+            except LevelCrossingFootageError:
+                raise
+            except Exception as exc:
+                last_err = f"Commons search failed ({type(exc).__name__})"
+                continue
+            if record:
+                chosen[i] = record
+                used.add(record["title"])
+                break
+            last_err = f"tighter search “{query}” returned no railway clip"
+        if not chosen[i]:
+            raise LevelCrossingFootageError(
+                "Level crossing film stopped: Commons had no real railway clip for "
+                f"“{shot.get('title') or 'a beat'}” ({last_err}). "
+                "A city crosswalk was not used."
+            )
+
+    dest_dir = CUTS_DIR / "cc-incoming"
+
+    def fetch(record: dict[str, Any]) -> dict[str, Any]:
+        return _download_commons_record(record, dest_dir)
+
+    clips: list[dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        futures = [pool.submit(fetch, record) for record in chosen if record]
+        for shot, record, future in zip(shots, chosen, futures):
+            try:
+                clips.append(future.result())
+            except Exception as exc:
+                raise LevelCrossingFootageError(
+                    "Level crossing film stopped: could not download the Commons clip "
+                    f"“{(record or {}).get('title') or shot.get('title')}” ({exc}). "
+                    "No street crosswalk was substituted."
+                ) from exc
+    if len(clips) != len(shots):
+        raise LevelCrossingFootageError(
+            "Level crossing film stopped: a beat was left without railway footage."
+        )
+    return clips
+
+
+def _assemble_level_crossing() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    shots = _level_crossing_shots()
+    archive = _search_level_crossing_archive()
+    archive = [m for m in archive if _archive_is_level_crossing(m)]
+    # Prefer Commons for every beat when the archive has no railway. If it does,
+    # use those hits first and only then fill the remaining beats from Commons.
+    cc_needed = shots[len(archive):]
+    cc_clips = _pick_level_crossing_clips(cc_needed) if cc_needed else []
+    enriched: list[dict[str, Any]] = []
+    ordered: list[dict[str, Any]] = []
+    for i, shot in enumerate(shots):
+        clean = {k: v for k, v in shot.items() if k not in {"commons_files", "commons_queries"}}
+        if i < len(archive):
+            match = archive[i]
+            enriched.append({**clean, "matches": [match], "footage": "archive"})
+            ordered.append({
+                "source": match.get("source") or "",
+                "title": shot["title"],
+                "filename": match.get("filename") or "",
+                "location": match.get("location") or "",
+                "camera_id": match.get("camera_id") or "",
+                "capture_type": match.get("capture_type") or "",
+                "origin": "archive",
+            })
+            continue
+        clip = cc_clips[i - len(archive)]
+        credit = {
+            "title": clip["title"],
+            "author": clip["author"],
+            "license": clip["license"],
+            "license_url": clip["license_url"],
+        }
+        note = (
+            f"CC B-roll: {credit['title']} · {credit['author']} · {credit['license']} · {credit['license_url']}"
+        )
+        synthetic = {
+            "source": "",
+            "filename": clip["title"],
+            "location": "wikimedia-commons",
+            "camera_id": "",
+            "capture_type": "level_crossing",
+            "reasoning": note,
+            "similarity_score": None,
+            "playback_url": "",
+            "cc": credit,
+        }
+        enriched.append({**clean, "matches": [synthetic], "footage": "commons"})
+        ordered.append({
+            "source": "",
+            "local_path": clip["path"],
+            "title": shot["title"],
+            "filename": clip["title"],
+            "location": "wikimedia-commons",
+            "camera_id": "",
+            "capture_type": "level_crossing",
+            "origin": "commons",
+            "cc": credit,
+        })
+    return enriched, ordered
+
+
+def _caption_windows(lines: list[str], target: float) -> list[tuple[float, float, str]]:
+    if not lines or target <= 0:
+        return []
+    step = target / len(lines)
+    windows: list[tuple[float, float, str]] = []
+    for i, line in enumerate(lines):
+        start = i * step
+        end = target if i == len(lines) - 1 else (i + 1) * step
+        windows.append((start, end, line))
+    return windows
+
+
+def _canonical_voice(voice: str | None) -> str | None:
+    key = (voice or "").strip()
+    if not key or key == "off":
+        return None
+    if key in NEURAL_VOICES:
+        return key
+    return VOICE_ALIASES.get(key)
+
+
+def _edge_tts_mp3(text: str, neural: str, dest: Path) -> None:
+    import edge_tts
+
+    async def _save() -> None:
+        comm = edge_tts.Communicate(text, neural)
+        await asyncio.wait_for(comm.save(str(dest)), timeout=30)
+
+    asyncio.run(_save())
+    if not dest.is_file() or dest.stat().st_size < 200:
+        raise RuntimeError("edge-tts wrote no audio")
+
+
+def _espeak_wav(text: str, espeak_voice: str, dest: Path) -> None:
+    """Fallback only. The mixed track uses this when the neural voice cannot be reached."""
+    proc = subprocess.run(
+        ["espeak-ng", "-v", espeak_voice, "-s", "150", "-w", str(dest), text],
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0 or not dest.is_file():
+        raise RuntimeError((proc.stderr or "espeak-ng failed")[-400:])
+
+
+def _fit_to_window(src: Path, dest: Path, window: float) -> float:
+    """Pad one line with silence so it occupies the caption window.
+
+    If the speech is longer than the window, speed it up just enough to finish
+    inside that window, then trim. It does not run into the next caption.
+    """
+    window = max(0.35, float(window))
+    dur = _probe_duration(src)
+    chain = []
+    budget = window * 0.92
+    if dur > budget > 0:
+        tempo = min(1.85, dur / budget)
+        chain.append(f"atempo={tempo:.4f}")
+        dur = dur / tempo
+    chain.append(f"apad=whole_dur={window:.3f}")
+    chain.append(f"atrim=0:{window:.3f}")
+    chain.append("asetpts=PTS-STARTPTS")
+    _run_ffmpeg([
+        "ffmpeg", "-y", "-i", str(src),
+        "-af", ",".join(chain),
+        "-ar", "44100", "-ac", "2", "-c:a", "pcm_s16le",
+        str(dest),
+    ])
+    return dur
+
+
+def _vo_line_parts(
+    windows: list[tuple[float, float, str]],
+    neural: str,
+    work: Path,
+    *,
+    engine: str,
+) -> list[dict[str, Any]]:
+    parts: list[dict[str, Any]] = []
+    espeak_voice = NEURAL_VOICES.get(neural, "en-us+f3")
+    for i, (start, end, line) in enumerate(windows):
+        window = end - start
+        if engine == "edge-tts":
+            raw = work / f"line_{i}_raw.mp3"
+            _edge_tts_mp3(line, neural, raw)
+        else:
+            raw = work / f"line_{i}_raw.wav"
+            _espeak_wav(line, espeak_voice, raw)
+        part = work / f"line_{i}.wav"
+        speech = _fit_to_window(raw, part, window)
+        parts.append({
+            "path": part,
+            "line": line[:180],
+            "start_sec": round(start, 3),
+            "end_sec": round(end, 3),
+            "speech_sec": round(min(speech, window), 3),
+            "fitted": speech <= window + 0.05,
+            "engine": engine,
+        })
+    return parts
+
+
+def _plain_text(value: str) -> str:
+    text = re.sub(r"<[^>]+>", " ", value or "")
+    text = html.unescape(text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _cc_keywords(query: str) -> str:
+    words = re.findall(r"[A-Za-z0-9]+", query or "")
+    kept = [w for w in words if w.lower() not in _CC_STOP]
+    return " ".join(kept[:8]) or "city street"
+
+
+def _license_ok(short: str, usage: str, url: str) -> bool:
+    blob = " ".join([short or "", usage or "", url or ""])
+    if _CC_BAD_RE.search(blob) and not _CC_OK_RE.search(blob):
+        return False
+    return bool(_CC_OK_RE.search(blob))
+
+
+def _extmeta(meta: dict[str, Any], key: str) -> str:
+    item = meta.get(key) or {}
+    if isinstance(item, dict):
+        return str(item.get("value") or "")
+    return str(item or "")
+
+
+def _download_capped(url: str, dest: Path) -> None:
+    with requests.get(url, stream=True, timeout=60, headers={"User-Agent": COMMONS_UA}) as resp:
+        resp.raise_for_status()
+        total = 0
+        with dest.open("wb") as fh:
+            for chunk in resp.iter_content(64 * 1024):
+                if not chunk:
+                    continue
+                total += len(chunk)
+                if total > MAX_CC_BYTES:
+                    raise RuntimeError("over 40MB")
+                fh.write(chunk)
+
+
+def _fetch_cc_clip(query: str, dest_dir: Path) -> tuple[dict[str, Any] | None, str | None]:
+    """One short CC or public-domain Commons video, or a note explaining the skip."""
+    try:
+        keywords = _cc_keywords(query)
+        resp = requests.get(
+            COMMONS_API,
+            params={
+                "action": "query",
+                "format": "json",
+                "formatversion": "2",
+                "generator": "search",
+                "gsrsearch": f"{keywords} filetype:video",
+                "gsrnamespace": 6,
+                "gsrlimit": 8,
+                "prop": "imageinfo",
+                "iiprop": "url|size|mime|mediatype|extmetadata|canonicaltitle",
+                "iiextmetadatafilter": "LicenseShortName|LicenseUrl|Artist|Credit|UsageTerms|License",
+            },
+            headers={"User-Agent": COMMONS_UA},
+            timeout=25,
+        )
+        resp.raise_for_status()
+        pages = (resp.json().get("query") or {}).get("pages") or []
+    except requests.RequestException as exc:
+        return None, (
+            "Creative Commons B-roll skipped: Commons unreachable "
+            f"({type(exc).__name__}). Rendered from the archive."
+        )
+    except Exception as exc:
+        return None, (
+            "Creative Commons B-roll skipped: "
+            f"{type(exc).__name__}. Rendered from the archive."
+        )
+    if not pages:
+        return None, "Creative Commons B-roll skipped: Commons returned no video. Rendered from the archive."
+
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    saw_network_failure = False
+    for page in pages:
+        info = (page.get("imageinfo") or [None])[0] or {}
+        mime = str(info.get("mime") or "").lower()
+        mediatype = str(info.get("mediatype") or "").upper()
+        if mime.startswith("audio/"):
+            continue
+        if mediatype not in {"VIDEO", ""} and not mime.startswith("video/") and mime != "application/ogg":
+            continue
+        meta = info.get("extmetadata") or {}
+        short = _plain_text(_extmeta(meta, "LicenseShortName"))
+        usage = _plain_text(_extmeta(meta, "UsageTerms") or _extmeta(meta, "License"))
+        lic_url = _plain_text(_extmeta(meta, "LicenseUrl"))
+        if not _license_ok(short, usage, lic_url):
+            continue
+        try:
+            size = int(info.get("size") or 0)
+        except (TypeError, ValueError):
+            size = 0
+        if size <= 0 or size > MAX_CC_BYTES:
+            continue
+        dur = info.get("duration")
+        try:
+            dur_f = float(dur) if dur is not None else None
+        except (TypeError, ValueError):
+            dur_f = None
+        if dur_f is not None and (dur_f > MAX_CC_SECONDS or dur_f < 1):
+            continue
+        url = info.get("url") or ""
+        if not url:
+            continue
+        title = str(page.get("title") or "Commons video")
+        if title.lower().startswith("file:"):
+            title = title.split(":", 1)[1].strip()
+        ext = {
+            "video/webm": ".webm",
+            "video/mp4": ".mp4",
+            "video/ogg": ".ogv",
+            "application/ogg": ".ogv",
+            "video/x-matroska": ".mkv",
+        }.get(mime, Path(url.split("?", 1)[0]).suffix or ".bin")
+        dest = dest_dir / f"{uuid.uuid4().hex[:10]}{ext}"
+        try:
+            _download_capped(url, dest)
+        except requests.RequestException:
+            dest.unlink(missing_ok=True)
+            saw_network_failure = True
+            continue
+        except RuntimeError:
+            dest.unlink(missing_ok=True)
+            continue
+        try:
+            got = _probe_duration(dest)
+        except Exception:
+            dest.unlink(missing_ok=True)
+            continue
+        if got > MAX_CC_SECONDS or got < 0.5:
+            dest.unlink(missing_ok=True)
+            continue
+        author = _plain_text(_extmeta(meta, "Artist") or _extmeta(meta, "Credit")) or "unknown"
+        if not lic_url:
+            if re.search(r"public domain", short, re.I):
+                lic_url = "https://creativecommons.org/publicdomain/mark/1.0/"
+            else:
+                lic_url = "https://commons.wikimedia.org/wiki/File:" + quote(title.replace(" ", "_"))
+        return {
+            "path": str(dest),
+            "title": title[:180],
+            "author": author[:180],
+            "license": short or usage or "Creative Commons",
+            "license_url": lic_url,
+        }, None
+    if saw_network_failure:
+        return None, "Creative Commons B-roll skipped: Commons unreachable. Rendered from the archive."
+    return None, (
+        "Creative Commons B-roll skipped: no short CC or public-domain video under 40MB. "
+        "Rendered from the archive."
+    )
+
+
 def _render_same_length_cut(
     source_clips: list[dict[str, Any]],
     match_sources: list[str],
     transcript: str,
-    voice: str | None = "en-us+f3",
-    bed: float = 0.22,
+    voice: str | None = DEFAULT_VOICE,
+    bed: float = 0.18,
     duration_sec: float | None = None,
 ) -> dict[str, Any]:
-    """Concat archive matches and keep their audio. Speak the VO over a quieter bed."""
+    """Concat archive matches and keep their audio. Speak each VO line inside its caption window."""
     picks: list[dict[str, Any]] = []
     seen: set[str] = set()
     for item in match_sources:
         if isinstance(item, str):
             item = {"source": item, "title": "", "filename": item.rsplit("/", 1)[-1]}
         src = item.get("source") or ""
-        if not src or src in seen:
+        local = item.get("local_path") or ""
+        key = src or local
+        if not key or key in seen:
             continue
-        seen.add(src)
+        seen.add(key)
         picks.append(item)
         if len(picks) >= 4:
             break
@@ -564,17 +1398,32 @@ def _render_same_length_cut(
     timeline: list[dict[str, Any]] = []
     trimmed: list[Path] = []
     for i, item in enumerate(picks):
-        src = item["source"]
         start = round(i * slice_len, 2)
         end = round(target if i == len(picks) - 1 else (i + 1) * slice_len, 2)
-        timeline.append({
+        src = item.get("source") or ""
+        row: dict[str, Any] = {
             "title": item.get("title") or f"Shot {i + 1}",
-            "filename": item.get("filename") or src.rsplit("/", 1)[-1],
+            "filename": item.get("filename") or (src.rsplit("/", 1)[-1] if src else ""),
             "start_sec": start,
             "end_sec": end,
-        })
-        raw = work / f"raw_{i}.mp4"
-        _download_mp4(src, raw)
+        }
+        if item.get("cc"):
+            row["cc"] = item["cc"]
+            credit = item["cc"]
+            row["note"] = (
+                f"CC B-roll: {credit.get('title') or row['filename']}"
+                f" · {credit.get('author') or 'unknown'}"
+                f" · {credit.get('license') or 'CC'}"
+                f" · {credit.get('license_url') or ''}"
+            )
+        timeline.append(row)
+        local = item.get("local_path") or ""
+        suffix = Path(local or src).suffix or ".mp4"
+        raw = work / f"raw_{i}{suffix}"
+        if local:
+            raw.write_bytes(Path(local).read_bytes())
+        else:
+            _download_mp4(src, raw)
         norm = work / f"norm_{i}.mp4"
         scale = "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=24"
         if _has_audio(raw):
@@ -617,40 +1466,80 @@ def _render_same_length_cut(
 
     vf = f"trim=duration={target:.3f},setpts=PTS-STARTPTS"
     lines = [ln.strip() for ln in re.split(r"\n+", transcript or "") if ln.strip()]
-    if lines:
-        step = target / len(lines)
+    windows = _caption_windows(lines, target)
+    vo_windows: list[dict[str, Any]] = []
+    if windows:
         blocks = []
-        for i, line in enumerate(lines):
-            blocks.append(
-                f"{i+1}\n{_srt_time(i * step)} --> {_srt_time(min(target, (i + 1) * step))}\n{line}\n"
-            )
+        for i, (start, end, line) in enumerate(windows):
+            blocks.append(f"{i+1}\n{_srt_time(start)} --> {_srt_time(end)}\n{line}\n")
         (work / "vo.srt").write_text("\n".join(blocks), encoding="utf-8")
         vf += (
             ",subtitles=vo.srt:force_style="
             "'FontName=DejaVu Sans,FontSize=28,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=2,Alignment=2'"
         )
 
-    spoken = voice in VOICES and bool(lines)
-    if spoken:
-        text = ". ".join(lines)
-        wav = work / "vo.wav"
-        proc = subprocess.run(
-            ["espeak-ng", "-v", voice, "-s", "150", "-w", str(wav), text],
-            capture_output=True, text=True,
-        )
-        if proc.returncode != 0:
-            raise RuntimeError((proc.stderr or "espeak-ng failed")[-400:])
-        bed_v = min(0.8, max(0.05, bed))
-        _run_ffmpeg([
-            "ffmpeg", "-y", "-i", str(concat), "-i", str(wav),
-            "-filter_complex",
-            f"[0:a]volume={bed_v:.2f}[bed];[1:a]apad,volume=1.0[vo];[bed][vo]amix=inputs=2:duration=first:dropout_transition=0[a]",
-            "-map", "0:v", "-map", "[a]",
-            "-vf", vf, "-t", f"{target:.3f}",
-            "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
-            "-c:a", "aac", "-ar", "44100", "-ac", "2",
-            str(work / "cut.mp4"),
-        ], cwd=work)
+    neural = _canonical_voice(voice)
+    spoken = bool(neural) and bool(windows)
+    voice_note = None
+    voice_engine = None
+    if spoken and neural:
+        try:
+            built = _vo_line_parts(windows, neural, work, engine="edge-tts")
+            voice_engine = "edge-tts"
+        except Exception as exc:
+            voice_note = (
+                f"Neural voice unavailable ({type(exc).__name__}). Used an espeak fallback."
+            )
+            try:
+                built = _vo_line_parts(windows, neural, work, engine="espeak")
+                voice_engine = "espeak"
+            except Exception as exc2:
+                spoken = False
+                built = []
+                voice_engine = "off"
+                voice_note = (
+                    f"Voiceover skipped: neural voice failed ({type(exc).__name__}) "
+                    f"and espeak failed ({type(exc2).__name__})."
+                )
+        if spoken and built:
+            vo_windows = [
+                {k: v for k, v in info.items() if k != "path"} for info in built
+            ]
+            listing_vo = work / "vo_list.txt"
+            listing_vo.write_text(
+                "".join(f"file '{info['path'].resolve()}'\n" for info in built),
+                encoding="utf-8",
+            )
+            wav = work / "vo.wav"
+            _run_ffmpeg([
+                "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(listing_vo),
+                "-c", "copy", str(wav),
+            ])
+            bed_v = min(0.8, max(0.05, float(bed)))
+            _run_ffmpeg([
+                "ffmpeg", "-y", "-i", str(concat), "-i", str(wav),
+                "-filter_complex",
+                (
+                    f"[0:a]volume={bed_v:.2f}[bed];"
+                    "[1:a]volume=1.15[vo];"
+                    "[bed][vo]amix=inputs=2:duration=first:dropout_transition=0:normalize=0,"
+                    "alimiter=limit=0.95[a]"
+                ),
+                "-map", "0:v", "-map", "[a]",
+                "-vf", vf, "-t", f"{target:.3f}",
+                "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-ar", "44100", "-ac", "2",
+                str(work / "cut.mp4"),
+            ], cwd=work)
+        else:
+            spoken = False
+            _run_ffmpeg([
+                "ffmpeg", "-y", "-i", str(concat),
+                "-vf", vf, "-t", f"{target:.3f}",
+                "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-ar", "44100", "-ac", "2",
+                str(work / "cut.mp4"),
+            ], cwd=work)
     else:
         _run_ffmpeg([
             "ffmpeg", "-y", "-i", str(concat),
@@ -665,9 +1554,12 @@ def _render_same_length_cut(
         "target_duration_sec": round(target, 2),
         "pieces": len(trimmed),
         "vo": spoken,
-        "voice": voice if spoken else "off",
+        "voice": neural if spoken else "off",
+        "voice_engine": voice_engine if spoken else "off",
+        "voice_note": voice_note,
         "bed": bed,
         "timeline": timeline,
+        "vo_windows": vo_windows,
     }
 
 
@@ -746,13 +1638,14 @@ def upscale():
         logline = (payload.get("logline") or "").strip()
         beats = (payload.get("beats") or "").strip()
         transcript = (payload.get("transcript") or "").strip()
-        voice = (payload.get("voice") or "en-us+f3").strip()
-        if voice != "off" and voice not in VOICES:
-            voice = "en-us+f3"
+        raw_voice = (payload.get("voice") or DEFAULT_VOICE).strip()
+        voice = None if raw_voice == "off" else (_canonical_voice(raw_voice) or DEFAULT_VOICE)
         try:
-            bed = float(payload.get("bed") if payload.get("bed") is not None else 0.22)
+            bed = float(payload.get("bed") if payload.get("bed") is not None else 0.18)
         except (TypeError, ValueError):
-            bed = 0.22
+            bed = 0.18
+        health_safety = bool(payload.get("health_safety"))
+        cc_broll = bool(payload.get("cc_broll"))
         duration_sec = None
         if payload.get("duration_sec") not in (None, "", 0, "0"):
             try:
@@ -799,33 +1692,41 @@ def upscale():
                 }
             ), 400
 
-        splitter = "wandb"
-        shots = _wandb_shots(logline, beats, transcript)
-        if not shots:
-            splitter = "heuristic"
-            shots = _heuristic_shots(logline, beats, transcript)
+        if health_safety:
+            splitter = "health_safety"
+            shots = _health_safety_shots()
+        else:
+            splitter = "wandb"
+            shots = _wandb_shots(logline, beats, transcript)
+            if not shots:
+                splitter = "heuristic"
+                shots = _heuristic_shots(logline, beats, transcript)
         shots = shots[:4]
 
-        # Bias queries toward cinematic archive when seeding from a rough upload
-        if seed_from_upload:
+        # Bias queries toward cinematic archive when seeding from a rough upload.
+        # Health & safety keeps its own single-line queries.
+        if seed_from_upload and not health_safety:
             for shot in shots:
                 q = shot.get("search_query") or ""
                 shot["search_query"] = (
-                    f"cinematic polished production value — {q} — "
+                    f"cinematic polished production value - {q} - "
                     "urban streets traffic pedestrians vehicles dramatic light"
                 )
 
         enriched = []
+        used_sources = set(exclude)
         for shot in shots:
             try:
-                matches = _search_shot(shot, exclude_sources=exclude)
+                matches = _search_shot(shot, exclude_sources=used_sources)
             except Exception as e:
                 matches = []
                 shot = {**shot, "search_error": str(e)}
+            if matches and matches[0].get("source"):
+                used_sources.add(matches[0]["source"])
             enriched.append({**shot, "matches": matches})
 
         directors_cut = []
-        match_sources: list[dict[str, Any]] = []
+        ordered: list[dict[str, Any] | None] = []
         for shot in enriched:
             best = shot["matches"][0] if shot["matches"] else None
             directors_cut.append(
@@ -839,11 +1740,78 @@ def upscale():
                 }
             )
             if best and best.get("source"):
-                match_sources.append({
+                ordered.append({
                     "source": best["source"],
                     "title": shot.get("title") or "",
                     "filename": best.get("filename") or "",
                 })
+            else:
+                ordered.append(None)
+
+        cc_note = None
+        cc_meta = None
+        if cc_broll:
+            spoken = {
+                ln.strip().lower()
+                for ln in re.split(r"\n+", transcript or "")
+                if ln.strip()
+            }
+            weak_rows: list[tuple[float, int, bool]] = []
+            for i, item in enumerate(ordered):
+                score = None
+                matches = enriched[i].get("matches") or []
+                if matches:
+                    try:
+                        score = float(matches[0].get("similarity_score"))
+                    except (TypeError, ValueError):
+                        score = None
+                weak = item is None or (score is not None and score < CC_GAP_BELOW)
+                if not weak:
+                    continue
+                phrase = (
+                    enriched[i].get("action")
+                    or enriched[i].get("intent")
+                    or ""
+                ).strip().lower()
+                rank = -1.0 if item is None or score is None else score
+                weak_rows.append((rank, i, phrase in spoken))
+            visual = [row for row in weak_rows if not row[2]]
+            pool = visual or weak_rows
+            pool.sort()
+            gap = pool[0][1] if pool else None
+            if gap is None:
+                cc_note = "Archive already had a shot for every beat, so no Commons clip was used."
+            else:
+                phrase = (
+                    enriched[gap].get("action")
+                    or enriched[gap].get("intent")
+                    or ""
+                ).strip()
+                if phrase.lower() in spoken:
+                    query = logline or phrase or "city street"
+                else:
+                    query = phrase or enriched[gap].get("search_query") or logline or "city street"
+                clip, note = _fetch_cc_clip(query, CUTS_DIR / "cc-incoming")
+                if clip:
+                    cc_meta = {
+                        "title": clip["title"],
+                        "author": clip["author"],
+                        "license": clip["license"],
+                        "license_url": clip["license_url"],
+                    }
+                    ordered[gap] = {
+                        "source": "",
+                        "local_path": clip["path"],
+                        "title": enriched[gap].get("title") or "B-roll",
+                        "filename": clip["title"],
+                        "cc": cc_meta,
+                    }
+                    cc_note = (
+                        f"CC B-roll: {clip['title']} · {clip['author']} · {clip['license']}"
+                    )
+                else:
+                    cc_note = note
+        match_sources = [item for item in ordered if item]
 
         rendered = None
         render_error = None
@@ -853,16 +1821,30 @@ def upscale():
                     (source_upload or {}).get("clips") or [],
                     match_sources,
                     transcript,
-                    None if voice == "off" else voice,
+                    voice,
                     bed,
                     duration_sec,
                 )
             except Exception as e:
                 render_error = str(e)
+        if rendered is not None:
+            bits = [rendered.get("voice_note"), cc_note]
+            merged = " ".join(bit for bit in bits if bit)
+            if merged:
+                rendered["note"] = merged
+            if cc_meta:
+                rendered["cc"] = cc_meta
+        elif cc_note:
+            if render_error:
+                render_error = f"{render_error} {cc_note}"
+            else:
+                render_error = cc_note
 
         return jsonify(
             {
                 "splitter": splitter,
+                "health_safety": health_safety,
+                "cc_broll": cc_broll,
                 "logline": logline,
                 "seed_from_upload": seed_from_upload,
                 "upload_tag": upload_tag if seed_from_upload else None,
@@ -891,117 +1873,117 @@ INDEX_HTML = r"""<!DOCTYPE html>
 <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,700&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet"/>
 <style>
   :root {
-    --bg: #e8e2d6;
-    --ink: #1a1f24;
-    --muted: #5a6570;
-    --panel: #f7f3ea;
-    --line: #c9c0b0;
-    --accent: #0d6e6e;
-    --accent-2: #c45c26;
-    --good: #1f6b3a;
+    color-scheme: dark;
+    --bg: #121614;
+    --ink: #f3f1ea;
+    --muted: #a8b0a6;
+    --panel: #1c221e;
+    --panel-2: #242b26;
+    --line: #343c36;
+    --accent: #e7ff6a;
+    --accent-ink: #17200a;
+    --good: #b6e3a8;
   }
   * { box-sizing: border-box; }
-  html, body { margin: 0; min-height: 100%; }
+  html, body { margin: 0; min-height: 100%; background: #121614; }
   body {
-    font-family: "IBM Plex Sans", sans-serif;
+    font-family: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
     color: var(--ink);
     background:
-      radial-gradient(ellipse 80% 50% at 10% -10%, #dfecec 0%, transparent 55%),
-      radial-gradient(ellipse 60% 40% at 100% 0%, #f0dcc8 0%, transparent 50%),
+      radial-gradient(ellipse 70% 40% at 100% 0%, #2a3324 0%, transparent 55%),
       var(--bg);
   }
-  .wrap { max-width: 1180px; margin: 0 auto; padding: 28px 20px 64px; }
+  a { color: var(--accent); }
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 32px 20px 72px; }
   header h1 {
-    font-family: Fraunces, serif;
-    font-size: clamp(2rem, 4vw, 2.8rem);
-    font-weight: 700;
-    margin: 0 0 6px;
-    letter-spacing: -0.02em;
+    font-family: Fraunces, Georgia, serif;
+    font-size: clamp(2.4rem, 5vw, 3.6rem);
+    font-weight: 500;
+    margin: 6px 0 8px;
+    letter-spacing: -0.03em;
+    line-height: 0.95;
   }
-  header p { margin: 0 0 22px; color: var(--muted); max-width: 42rem; line-height: 1.45; }
-  .grid { display: grid; gap: 18px; }
-  @media (min-width: 900px) {
-    .grid.compose { grid-template-columns: 1.05fr 1fr; align-items: start; }
-    .grid.results { grid-template-columns: 260px 1fr; min-height: 420px; }
+  header p.lead { margin: 0 0 28px; color: var(--muted); max-width: 38rem; line-height: 1.5; }
+  .kicker { margin: 0; font-size: 0.75rem; letter-spacing: 0.14em; text-transform: uppercase; color: var(--muted); }
+  .grid { display: grid; gap: 16px; }
+  @media (min-width: 980px) {
+    .grid.compose { grid-template-columns: 1.05fr 0.95fr; align-items: start; }
+    .grid.results { grid-template-columns: 240px 1fr; }
   }
-  label { display: block; font-size: 0.78rem; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: var(--muted); margin-bottom: 6px; }
-  select { font: inherit; padding: 8px 10px; border: 1px solid var(--line); background: var(--panel); color: var(--ink); }
+  label { display: block; font-size: 0.68rem; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); margin-bottom: 6px; }
+  select, input[type=number], input[type=text] {
+    font: inherit; width: 100%; padding: 10px 12px; border: 1px solid var(--line);
+    background: var(--bg); color: var(--ink); border-radius: 10px;
+  }
   textarea {
-    width: 100%; border: 1px solid var(--line); background: var(--panel);
-    border-radius: 2px; padding: 12px 14px; font: inherit; color: var(--ink);
-    resize: vertical; min-height: 88px;
+    width: 100%; border: 1px solid var(--line); background: var(--bg); color: var(--ink);
+    border-radius: 12px; padding: 12px 14px; font: inherit; resize: vertical; min-height: 76px;
   }
-  textarea:focus { outline: 2px solid color-mix(in srgb, var(--accent) 45%, transparent); border-color: var(--accent); }
-  .actions { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 14px; align-items: center; }
+  textarea:focus, select:focus, input:focus { outline: 2px solid color-mix(in srgb, var(--accent) 55%, transparent); border-color: transparent; }
+  .controls { display: grid; gap: 10px; margin-top: 14px; }
+  @media (min-width: 720px) { .controls { grid-template-columns: 1fr 1fr; } }
+  .actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 16px; align-items: center; }
   button {
     font: inherit; font-weight: 600; border: none; cursor: pointer;
-    background: var(--accent); color: #f4fffe; padding: 12px 18px; border-radius: 2px;
+    background: var(--accent); color: var(--accent-ink); padding: 11px 16px; border-radius: 999px;
   }
-  button:disabled { opacity: 0.55; cursor: wait; }
-  button.ghost { background: transparent; color: var(--ink); border: 1px solid var(--line); }
-  .status { font-size: 0.9rem; color: var(--muted); }
-  .status.err { color: #8b1e1e; }
-  .panel {
-    background: var(--panel); border: 1px solid var(--line); border-radius: 2px; padding: 14px;
+  button:disabled { opacity: 0.45; cursor: wait; }
+  button.ghost, button.chip {
+    background: transparent; color: var(--ink); border: 1px solid var(--line); border-radius: 999px;
+    padding: 8px 12px; font-weight: 500;
   }
+  button.chip:hover, button.ghost:hover { border-color: var(--accent); color: var(--accent); }
+  button.chip.health { border-color: var(--accent); color: var(--accent); }
+  .status { font-size: 0.88rem; color: var(--muted); }
+  .status.err { color: #ffb4a8; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 18px; padding: 18px; }
   .shot-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
   .shot-list button {
     width: 100%; text-align: left; background: transparent; color: var(--ink);
-    border: 1px solid transparent; padding: 10px 12px;
+    border: 1px solid transparent; border-radius: 12px; padding: 10px 12px;
   }
-  .shot-list button:hover { border-color: var(--line); background: #fff; }
-  .shot-list button.active { border-color: var(--accent); background: #fff; }
-  .shot-list .meta { display: block; font-size: 0.75rem; color: var(--muted); margin-top: 2px; }
-  .match {
-    border-top: 1px solid var(--line); padding: 14px 0; display: grid; gap: 10px;
-  }
-  @media (min-width: 700px) {
-    .match { grid-template-columns: 280px 1fr; }
-  }
-  video { width: 100%; background: #111; border-radius: 2px; aspect-ratio: 16/9; }
-  .score { color: var(--accent-2); font-weight: 600; font-size: 0.85rem; }
-  .reason { font-size: 0.92rem; line-height: 1.45; color: var(--ink); }
-  .cut ol { margin: 8px 0 0; padding-left: 1.2rem; }
-  .cut li { margin-bottom: 10px; line-height: 1.4; }
-  .tag { display: inline-block; font-size: 0.72rem; padding: 2px 7px; border: 1px solid var(--line); margin-right: 4px; color: var(--muted); }
-  h2 { font-family: Fraunces, serif; font-size: 1.25rem; margin: 0 0 10px; }
+  .shot-list button:hover { border-color: var(--line); background: var(--panel-2); }
+  .shot-list button.active { border-color: var(--accent); background: var(--panel-2); }
+  .shot-list .meta { display: block; font-size: 0.75rem; color: var(--muted); margin-top: 2px; font-weight: 400; }
+  .match { border-top: 1px solid var(--line); padding: 14px 0; display: grid; gap: 12px; }
+  @media (min-width: 700px) { .match { grid-template-columns: 280px 1fr; } }
+  video { width: 100%; background: #000; border-radius: 14px; aspect-ratio: 16/9; }
+  .score { color: var(--accent); font-weight: 600; font-size: 0.85rem; }
+  .reason { font-size: 0.92rem; line-height: 1.45; }
+  .cut ol { margin: 8px 0 0; padding-left: 1.1rem; }
+  .cut li { margin-bottom: 8px; line-height: 1.4; }
+  .tag { display: inline-block; font-size: 0.72rem; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--line); margin-right: 4px; color: var(--muted); }
+  h2 { font-family: Fraunces, Georgia, serif; font-weight: 500; font-size: 1.6rem; margin: 0 0 12px; }
   .hidden { display: none !important; }
-  .progress { margin: 12px 0 0; padding-left: 1.2rem; color: var(--muted); font-size: 0.88rem; }
+  .progress { margin: 14px 0 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 6px; color: var(--muted); font-size: 0.88rem; }
   .progress li.done { color: var(--good); }
-  .progress li.now { color: var(--accent); font-weight: 600; }
-  .opt {
-    margin-top: 14px; padding: 12px; border: 1px dashed var(--line); background: #fff;
-    display: grid; gap: 8px;
-  }
+  .progress li.now { color: var(--accent); }
+  .opt { margin-top: 14px; padding: 12px; border-radius: 14px; background: var(--panel-2); display: grid; gap: 8px; }
   .opt label.row {
-    display: flex; align-items: flex-start; gap: 10px; text-transform: none;
-    font-size: 0.95rem; font-weight: 500; letter-spacing: 0; color: var(--ink); cursor: pointer;
+    display: flex; align-items: center; gap: 10px; text-transform: none;
+    font-size: 0.95rem; font-weight: 500; letter-spacing: 0; color: var(--ink); cursor: pointer; margin: 0;
   }
-  .opt input[type=checkbox] { margin-top: 3px; width: 16px; height: 16px; }
-  .opt .hint { font-size: 0.82rem; color: var(--muted); line-height: 1.4; margin: 0 0 0 26px; }
-  .opt input[type=text] {
-    margin-left: 26px; width: calc(100% - 26px); max-width: 280px;
-    border: 1px solid var(--line); background: var(--panel); padding: 8px 10px; font: inherit;
+  .opt .hint { font-size: 0.82rem; color: var(--muted); line-height: 1.4; margin: 0; }
+  .tl { display: flex; width: 100%; min-height: 52px; margin-top: 12px; gap: 4px; }
+  .tl button {
+    flex: 1 1 0; min-width: 0; border: none; border-radius: 10px; color: #f7f3ea;
+    font-size: 0.78rem; font-weight: 600; padding: 8px 8px; text-align: left; overflow: hidden;
+    line-height: 1.25; text-shadow: 0 1px 2px rgba(0,0,0,.55);
   }
-  .source-box { margin-top: 14px; border-top: 1px solid var(--line); padding-top: 12px; }
-  .source-box video { max-width: 320px; }
-  .tl { display: flex; width: 100%; height: 44px; margin-top: 10px; gap: 2px; }
-  .tl button { flex: 1 1 0; min-width: 0; border: none; color: #f7f3ea; font: inherit; font-size: 0.72rem; padding: 4px; cursor: pointer; text-align: left; overflow: hidden; }
-  .tl button small { display: block; opacity: 0.85; }
-  .fb { margin-top: 12px; display: grid; gap: 8px; }
-  .fb button.on { outline: 2px solid var(--ink); }
-  .marks { display: flex; flex-direction: column; gap: 6px; }
+  .tl button small { display: block; font-weight: 500; opacity: 0.95; }
+  .fb { margin-top: 14px; display: grid; gap: 8px; }
+  .marks { display: flex; flex-direction: column; gap: 8px; }
   .shot-fb { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
-  .shot-fb span { flex: 1 1 140px; font-size: 0.85rem; }
-  .shot-fb button.on { outline: 2px solid var(--ink); background: #fff; }
+  .shot-fb span { flex: 1 1 160px; font-size: 0.88rem; }
+  .shot-fb button.on { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
 </style>
 </head>
 <body>
   <div class="wrap">
     <header>
-      <p class="status"><a href="/app/">All apps</a></p>
+      <p class="kicker"><a href="/app/">All apps</a></p>
       <h1>Idea Upscaler</h1>
-      <p>Start from boards and voice — not a text-to-video prompt. We turn intent into a shot list and pull cinematic matches from your indexed archive.</p>
+      <p class="lead">Boards and a voice line, cut from the archive. Streets and traffic are most of the footage. Indoor crowds and the synthetic warehouse are the smaller sets.</p>
     </header>
 
     <section class="grid compose">
@@ -1012,22 +1994,22 @@ INDEX_HTML = r"""<!DOCTYPE html>
         <textarea id="beats" placeholder="Wide city canyon at dusk&#10;Bike lane tracking, yellow jacket ahead&#10;Crosswalk pause, phone glow&#10;Night close on helmet reflection"></textarea>
         <label for="transcript" style="margin-top:12px">Director VO / dialogue (optional)</label>
         <textarea id="transcript" placeholder="I kept the camera rolling… we were already gone before we left."></textarea>
-        <div class="actions" style="margin-top:12px">
+        <div class="controls">
           <div>
             <label for="voice">Voice</label>
             <select id="voice">
-              <option value="en-us+f3">US female</option>
-              <option value="en-us+m3">US male</option>
-              <option value="en-gb+f2">UK female</option>
-              <option value="en-gb+m3">UK male</option>
+              <option value="en-US-JennyNeural">US female</option>
+              <option value="en-US-GuyNeural">US male</option>
+              <option value="en-GB-SoniaNeural">UK female</option>
+              <option value="en-GB-RyanNeural">UK male</option>
               <option value="off">No voiceover</option>
             </select>
           </div>
           <div>
             <label for="bed">Footage audio under the voice</label>
             <select id="bed">
-              <option value="0.22">Quiet</option>
-              <option value="0.40">Medium</option>
+              <option value="0.16" selected>Quiet</option>
+              <option value="0.22">Medium</option>
               <option value="0.65">Louder</option>
             </select>
           </div>
@@ -1051,13 +2033,21 @@ INDEX_HTML = r"""<!DOCTYPE html>
           <p class="hint">Reads your indexed clip (default tag <code>shittyvideo</code>) and searches the archive for a cinematic match. Mars/fantasy only works if similar footage is already indexed.</p>
           <input id="tag" type="text" value="shittyvideo" placeholder="tag"/>
         </div>
+        <div class="opt">
+          <label class="row" for="ccbroll">
+            <input id="ccbroll" type="checkbox"/>
+            CC B-roll
+          </label>
+          <p class="hint">If a beat is missing from the archive, add one short Creative Commons or public-domain clip from Wikimedia Commons. The timeline keeps the title, author, and license. If Commons is unreachable, the cut still uses the archive.</p>
+        </div>
         <ol class="progress hidden" id="progress"></ol>
         <div class="actions">
           <button id="go" type="button">Upscale idea</button>
-          <button id="demo" class="ghost" type="button">Streets · NYC bike</button>
-          <button id="shitty" class="ghost" type="button">Upscale shittyvideo</button>
+          <button id="demo" class="chip" type="button">Streets · NYC bike</button>
+          <button id="shitty" class="chip" type="button">My upload</button>
           <span class="status" id="status"></span>
         </div>
+        <p class="kicker" style="margin-top:16px">Briefs</p>
         <div class="actions" id="briefs"></div>
       </div>
       <div class="panel cut" id="cut-panel">
@@ -1075,6 +2065,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
           </div>
         </div>
         <p class="status" id="cut-meta"></p>
+        <div id="credits"></div>
         <ol id="cut-list" class="hidden"></ol>
       </div>
     </section>
@@ -1103,15 +2094,18 @@ function setProgress(steps, activeIdx) {
   el.innerHTML = steps.map((t, i) => `<li class="${i < activeIdx ? "done" : i === activeIdx ? "now" : ""}">${escapeHtml(t)}</li>`).join("");
 }
 
-async function runUpscale({ seed }) {
+async function runUpscale({ seed, health }) {
   const logline = $("logline").value.trim();
   const useSeed = seed || $("seed").checked;
+  const useHealth = health === true;
   if (!logline && !useSeed) {
     $("status").textContent = "Logline is required, or use Upscale shittyvideo.";
     $("status").className = "status err";
     return;
   }
-  const steps = useSeed
+  const steps = useHealth
+    ? ["Reading the safety brief", "Searching near-miss and forklift moments", "Cutting the training reel", "Timing the safety line to the captions"]
+    : useSeed
     ? ["Reading your clip", "Finding stand-in shots", "Cutting a reel to your duration", "Burning the voice line"]
     : ["Splitting the brief", "Searching the archive", "Cutting the shots together", "Burning the voice line"];
   $("go").disabled = true;
@@ -1138,6 +2132,8 @@ async function runUpscale({ seed }) {
         duration_sec: $("lengthMode").value === "custom" ? Number($("lengthSec").value) : null,
         seed_from_upload: useSeed,
         upload_tag: ($("tag").value || "shittyvideo").trim(),
+        health_safety: useHealth,
+        cc_broll: $("ccbroll").checked,
       }),
     });
     const raw = await res.text();
@@ -1178,6 +2174,14 @@ const BRIEFS = [
     seconds: 12,
   },
   {
+    label: "Health & safety",
+    health: true,
+    logline: "Spot the hazard before it closes. A pedestrian nears the lane, a person stands in the forklift aisle, then a gap opens that is actually safe.",
+    beats: "Pedestrian approaching a marked crosswalk with cars nearby\nPerson standing close to a forklift in a warehouse aisle\nPedestrians crossing the street while cars wait",
+    transcript: "Spot the hazard before you step closer.\nThat is a close call, not a gap.\nWait until the lane is clear, then move.",
+    seconds: 12,
+  },
+  {
     label: "Streets · SF crosswalk",
     logline: "People cross a San Francisco street while the cars wait.",
     beats: "Wide city intersection\nTwo people walking in the crosswalk\nCars held at the crossing",
@@ -1215,11 +2219,11 @@ function applyBrief(b, run) {
   $("lengthMode").value = "custom";
   $("lengthSec").value = String(b.seconds || 12);
   $("lengthWrap").classList.remove("hidden");
-  if (run) runUpscale({ seed: false });
+  if (run) runUpscale({ seed: false, health: !!b.health });
 }
 
 $("briefs").innerHTML = BRIEFS.slice(1).map((b, i) =>
-  `<button type="button" class="ghost" data-brief="${i + 1}">${b.label}</button>`
+  `<button type="button" class="chip${b.health ? " health" : ""}" data-brief="${i + 1}">${b.label}</button>`
 ).join("");
 $("briefs").querySelectorAll("button").forEach(btn => {
   btn.onclick = () => applyBrief(BRIEFS[Number(btn.dataset.brief)], true);
@@ -1326,9 +2330,9 @@ function render() {
     if (rows.length) {
       tl.classList.remove("hidden");
       tl.innerHTML = rows.map((row, i) => `
-        <button type="button" data-t="${row.start_sec}" style="background:${colors[i % colors.length]}">
+        <button type="button" data-t="${row.start_sec}" style="background:${colors[i % colors.length]}" title="${escapeHtml(row.note || row.title)}">
           ${escapeHtml(row.title)}
-          <small>${fmtTime(row.start_sec)}–${fmtTime(row.end_sec)}</small>
+          <small>${fmtTime(row.start_sec)}–${fmtTime(row.end_sec)}${row.cc ? " · " + escapeHtml(row.cc.license || "CC") : ""}</small>
         </button>`).join("");
       tl.querySelectorAll("button").forEach(btn => {
         btn.onclick = () => { vid.currentTime = Number(btn.dataset.t) || 0; vid.play(); };
@@ -1337,7 +2341,11 @@ function render() {
       tl.classList.add("hidden");
       tl.innerHTML = "";
     }
-    $("cut-meta").textContent = `${reel.target_duration_sec}s · ${reel.pieces} shots` + (reel.vo ? " · voice over quieter footage audio" : " · footage audio only");
+    const voiceNote = reel.vo ? " · voice lined up with the captions" : " · footage audio only";
+    $("cut-meta").textContent = `${reel.target_duration_sec}s · ${reel.pieces} shots` + voiceNote + (reel.note ? " · " + reel.note : "");
+    $("credits").innerHTML = rows.filter(row => row.cc).map(row =>
+      `<p class="status">CC: ${escapeHtml(row.cc.title)} · ${escapeHtml(row.cc.author || "unknown author")} · ${escapeHtml(row.cc.license || "")} · ${escapeHtml(row.cc.license_url || "")}</p>`
+    ).join("");
     const fb = $("feedback");
     fb.classList.remove("hidden");
     $("marks").innerHTML = rows.map((row, i) => `
@@ -1358,6 +2366,7 @@ function render() {
     vid.removeAttribute("src");
     $("timeline").classList.add("hidden");
     $("feedback").classList.add("hidden");
+    $("credits").innerHTML = "";
     $("cut-meta").textContent = state.render_error || "";
   }
   const cut = state.directors_cut || [];
